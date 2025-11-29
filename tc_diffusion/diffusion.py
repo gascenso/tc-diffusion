@@ -42,7 +42,8 @@ class Diffusion:
         # Gather alpha_bar_t for each sample in batch
         alpha_bar_t = tf.gather(self.alphas_cumprod, t)  # (B,)
         alpha_bar_t = tf.reshape(alpha_bar_t, (-1, 1, 1, 1))
-        return tf.sqrt(alpha_bar_t) * x0 + tf.sqrt(1.0 - alpha_bar_t) * noise
+        z_t = tf.sqrt(alpha_bar_t) * x0 + tf.sqrt(1.0 - alpha_bar_t) * noise
+        return z_t
 
     def loss(self, model, x0, cond):
         """
@@ -57,7 +58,7 @@ class Diffusion:
         )
         noise = tf.random.normal(shape=tf.shape(x0))
 
-        x_t = self.q_sample(x0, t, noise)
-        eps_pred = model([x_t, t, cond], training=True)
+        z_t = self.q_sample(x0, t, noise)
+        eps_pred = model([z_t, t, cond], training=True)
         loss = tf.reduce_mean((noise - eps_pred) ** 2)
         return loss
