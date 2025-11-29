@@ -1,4 +1,6 @@
 # scripts/train.py
+
+# usage (from inside tc-diffusion): python -m scripts.train --config configs/base.yaml
 import argparse
 from tc_diffusion.config import load_config
 from tc_diffusion.train_loop import train
