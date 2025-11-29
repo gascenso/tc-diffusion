@@ -20,6 +20,10 @@ datasets/
 scratch/
 outputs/
 
+# --- Model checkpoints ---
+runs/
+*.keras
+
 # --- OS / editor junk ---
 .DS_Store
 Thumbs.db
