@@ -24,40 +24,41 @@ def sinusoidal_time_embedding(t, dim):
 
 
 def build_unet(cfg):
-    """
-    Minimal-ish U-Net taking (x_t, t_scalar, cond_scalar) -> eps_hat.
-    For now, cond is just passed but not really used.
-    """
     image_size = int(cfg["data"]["image_size"])
     base_channels = int(cfg["model"]["base_channels"])
 
     # Inputs
     x_in = keras.Input(shape=(image_size, image_size, 1), name="x_t")
     t_in = keras.Input(shape=(), dtype=tf.int32, name="t")
-    cond_in = keras.Input(shape=(), dtype=tf.float32, name="cond")  # placeholder
+    cond_in = keras.Input(shape=(), dtype=tf.float32, name="cond")  # scalar per sample
 
     # Time embedding
     t_emb_dim = base_channels * 4
-    t_emb = layers.Lambda(lambda t: sinusoidal_time_embedding(t, t_emb_dim))(t_in)
+    t_emb = layers.Lambda(
+        lambda t: sinusoidal_time_embedding(t, t_emb_dim), name="t_sinusoidal_emb"
+    )(t_in)
     t_emb = layers.Dense(t_emb_dim, activation="swish")(t_emb)
     t_emb = layers.Dense(t_emb_dim, activation="swish")(t_emb)
 
-    # (Optional) simple cond embedding: we just pass it through a small MLP
-    c_emb = layers.Dense(t_emb_dim, activation="swish")(tf.expand_dims(cond_in, -1))
+    # ----- FIXED: cond embedding with a Lambda, no raw tf op on KerasTensor -----
+    cond_vec = layers.Lambda(
+        lambda c: tf.expand_dims(c, -1), name="cond_expand"
+    )(cond_in)  # (batch, 1)
+    c_emb = layers.Dense(t_emb_dim, activation="swish")(cond_vec)
     c_emb = layers.Dense(t_emb_dim, activation="swish")(c_emb)
+    # ---------------------------------------------------------------------------
 
     # Fuse time + cond
-    tc_emb = layers.Add()([t_emb, c_emb])  # (batch, t_emb_dim)
+    tc_emb = layers.Add(name="tc_emb")([t_emb, c_emb])  # (batch, t_emb_dim)
 
-    # Simple encoder
     def add_time_cond(x, emb):
-        # Project embedding to match channels, then add (broadcast over H,W)
         ch = x.shape[-1]
         h = layers.Dense(ch)(emb)
         h = layers.Activation("swish")(h)
-        h = tf.reshape(h, (-1, 1, 1, ch))
-        return x + h
+        h = layers.Reshape((1, 1, ch))(h)
+        return layers.Add()([x, h])
 
+    # Simple encoder
     x = x_in
     # Down 1
     x = layers.Conv2D(base_channels, 3, padding="same")(x)
@@ -100,9 +101,7 @@ def build_unet(cfg):
     x = layers.Conv2D(base_channels, 3, padding="same")(x)
     x = layers.Activation("swish")(x)
 
-    # Output: epsilon prediction same shape as input
     eps_out = layers.Conv2D(1, 3, padding="same", name="eps_out")(x)
 
     model = keras.Model(inputs=[x_in, t_in, cond_in], outputs=eps_out, name="unet_ddpm")
-    model.summary()
     return model
