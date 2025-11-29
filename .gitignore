@@ -1,0 +1,26 @@
+# --- Python cache ---
+__pycache__/
+*.py[cod]
+*.pyo
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+
+# --- Jupyter checkpoints ---
+.ipynb_checkpoints/
+
+# --- Data files
+*.nc
+*.npz
+*.npy
+data/
+datasets/
+scratch/
+outputs/
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+.vscode/
