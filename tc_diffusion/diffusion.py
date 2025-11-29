@@ -3,6 +3,16 @@ import numpy as np
 
 
 class Diffusion:
+    """
+    Implements the forward diffusion process and training loss for a diffusion model.
+
+    Args:
+        cfg (dict): Configuration dictionary containing diffusion parameters.
+
+    Methods:
+        q_sample: Samples from the forward process q(x_t | x_0).
+        loss: Computes the training loss for one diffusion step.
+    """
     def __init__(self, cfg):
         self.num_steps = int(cfg["diffusion"]["num_steps"])
         self.beta_schedule_name = cfg["diffusion"]["beta_schedule"]
