@@ -18,8 +18,8 @@ def parse_args():
         "--weights",
         type=str,
         default=None,
-        help="Path to weights .ckpt file. "
-             "If not provided, will try to find the latest in experiment.output_dir.",
+        help="Path to weights .weights.h5 file. "
+             "If not provided, will try to find the latest in experiment.output_dir (as defined in the config file).",
     )
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--out", type=str, default="samples/sample_grid.png")
@@ -27,7 +27,7 @@ def parse_args():
 
 
 def find_latest_weights(output_dir: str):
-    pattern = str(Path(output_dir) / "weights_epoch_*.ckpt.index")
+    pattern = str(Path(output_dir) / "weights_epoch_*.weights.h5")
     files = sorted(glob.glob(pattern))
     if not files:
         raise FileNotFoundError(f"No weight files found in {output_dir}")
