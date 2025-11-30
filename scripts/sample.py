@@ -2,6 +2,7 @@
 import argparse
 from pathlib import Path
 import glob
+import shutil
 
 import tensorflow as tf
 
@@ -19,15 +20,22 @@ def parse_args():
         type=str,
         default=None,
         help="Path to weights .weights.h5 file. "
-             "If not provided, will try to find the latest in experiment.output_dir (as defined in the config file).",
+             "If not provided, will try to find the latest in experiment.output_dir.",
     )
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--out", type=str, default="samples/sample_grid.png")
+    p.add_argument(
+        "--windows_out",
+        type=str,
+        default=None,
+        help="Optional path on Windows (e.g. /mnt/c/Users/guido/Desktop/sample.png) "
+             "to also copy the PNG to.",
+    )
     return p.parse_args()
 
 
 def find_latest_weights(output_dir: str):
-    pattern = str(Path(output_dir) / "weights_epoch_*.weights.h5")
+    pattern = str(Path(output_dir) / "weights_*.weights.h5")
     files = sorted(glob.glob(pattern))
     if not files:
         raise FileNotFoundError(f"No weight files found in {output_dir}")
@@ -77,3 +85,9 @@ if __name__ == "__main__":
         bt_max_k=float(cfg["data"]["bt_max_k"]),
     )
     print(f"Saved sample grid to {out_path}")
+
+    if args.windows_out is not None:
+        win_path = Path(args.windows_out)
+        win_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(out_path, win_path)
+        print(f"Copied sample grid to Windows path {win_path}")

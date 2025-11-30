@@ -4,7 +4,7 @@ experiment:
 
 data:
   gridsat_dir: "data/gridsat_sample"
-  batch_size: 2
+  batch_size: 8
   num_workers: 2
   image_size: 256
   bt_min_k: 117.0
@@ -27,7 +27,7 @@ diffusion:
   loss_type: "eps_mse"
 
 training:
-  num_epochs: 5               # tiny run for first test
+  num_epochs: 100               # tiny run for first test
   lr: 1e-4
   ema_decay: 0.9999
   log_interval_steps: 10
