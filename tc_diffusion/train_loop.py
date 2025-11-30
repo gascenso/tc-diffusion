@@ -48,6 +48,6 @@ def train(cfg):
         # Save simple checkpoint at end of epoch
         out_dir = Path(cfg["experiment"]["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = out_dir / f"model_epoch_{epoch+1:03d}.keras"
-        model.save(ckpt_path)
-        print(f"Saved model to {ckpt_path}")
+        ckpt_path = out_dir / f"weights_epoch_{epoch+1:03d}.ckpt"
+        model.save_weights(ckpt_path)
+        print(f"Saved weights to {ckpt_path}")
