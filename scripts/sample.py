@@ -31,9 +31,7 @@ def find_latest_weights(output_dir: str):
     files = sorted(glob.glob(pattern))
     if not files:
         raise FileNotFoundError(f"No weight files found in {output_dir}")
-    # strip the ".index"
-    latest_index = files[-1]
-    return latest_index.replace(".index", "")
+    return files[-1]
 
 
 if __name__ == "__main__":
