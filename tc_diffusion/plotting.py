@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def save_image_grid(x, path, bt_min_k=180.0, bt_max_k=320.0, ncols=4):
+def save_image_grid(x, path, bt_min_k, bt_max_k, ncols=4):
     """
     x: np.array or tf.Tensor of shape (B, H, W, 1) in [-1, 1].
     Save a grid of images to 'path' (PNG).
@@ -45,4 +45,3 @@ def save_image_grid(x, path, bt_min_k=180.0, bt_max_k=320.0, ncols=4):
     plt.tight_layout()
     plt.savefig(path, dpi=150)
     plt.close(fig)
-    
