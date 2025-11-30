@@ -1,6 +1,6 @@
 import tensorflow as tf
 import numpy as np
-
+from tqdm.auto import tqdm
 
 class Diffusion:
     """
@@ -103,24 +103,28 @@ class Diffusion:
 
         return x_prev
 
-    def sample(self, model, batch_size, image_size, cond_scalar=0.0):
+    def sample(self, model, batch_size, image_size, cond_scalar=0.0, show_progress=True):
         """
         Generate samples starting from pure noise.
 
-        For now:
-          - cond is a scalar float broadcast to all samples.
-        Returns:
-          x0: (B, H, W, C) in [-1, 1] (same scaling as training)
+        Returns x0: (B, H, W, C) in [-1, 1]
         """
-        # Start from standard normal noise
         x_t = tf.random.normal(
             shape=(batch_size, image_size, image_size, 1), dtype=tf.float32
         )
 
         cond = tf.fill([batch_size], tf.cast(cond_scalar, tf.float32))  # (B,)
 
-        # Reverse diffusion loop: T-1,...,0
-        for t_int in reversed(range(self.num_steps)):
+        t_iter = reversed(range(self.num_steps))
+        if show_progress:
+            t_iter = tqdm(
+                t_iter,
+                total=self.num_steps,
+                desc="Sampling diffusion steps",
+                leave=True,
+            )
+
+        for t_int in t_iter:
             x_t = self.p_sample_step(model, x_t, t_int, cond)
 
         return x_t
