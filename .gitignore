@@ -19,10 +19,12 @@ data/
 datasets/
 scratch/
 outputs/
+samples/
 
 # --- Model checkpoints ---
 runs/
 *.keras
+*.weights.h5
 
 # --- OS / editor junk ---
 .DS_Store
