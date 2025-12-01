@@ -11,6 +11,7 @@ data:
   bt_max_k: 348.0
 
 conditioning:
+  num_ss_classes: 6           # 0-5 Saffir-Simpson categories
   use_wind_speed: false       # we'll wire this later
   use_basin: false            # placeholder
 

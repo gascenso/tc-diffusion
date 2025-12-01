@@ -103,17 +103,20 @@ class Diffusion:
 
         return x_prev
 
-    def sample(self, model, batch_size, image_size, cond_scalar=0.0, show_progress=True):
+    def sample(self, model, batch_size, image_size, cond_value=0, show_progress=True):
         """
         Generate samples starting from pure noise.
 
-        Returns x0: (B, H, W, C) in [-1, 1]
+        cond_value: integer SS category index (0..5).
         """
         x_t = tf.random.normal(
             shape=(batch_size, image_size, image_size, 1), dtype=tf.float32
         )
 
-        cond = tf.fill([batch_size], tf.cast(cond_scalar, tf.float32))  # (B,)
+        cond = tf.fill(
+            [batch_size],
+            tf.cast(cond_value, tf.int32),
+        )  # (B,)
 
         t_iter = reversed(range(self.num_steps))
         if show_progress:

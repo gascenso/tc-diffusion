@@ -26,11 +26,12 @@ def sinusoidal_time_embedding(t, dim):
 def build_unet(cfg):
     image_size = int(cfg["data"]["image_size"])
     base_channels = int(cfg["model"]["base_channels"])
+    num_ss_classes = cfg.get("conditioning", {}).get("num_ss_classes", 6)
 
     # Inputs
     x_in = keras.Input(shape=(image_size, image_size, 1), name="x_t")
     t_in = keras.Input(shape=(), dtype=tf.int32, name="t")
-    cond_in = keras.Input(shape=(), dtype=tf.float32, name="cond")  # scalar per sample
+    cond_in = keras.Input(shape=(), dtype=tf.int32, name="ss_cat")  # scalar per sample
 
     # Time embedding
     t_emb_dim = base_channels * 4
@@ -40,16 +41,16 @@ def build_unet(cfg):
     t_emb = layers.Dense(t_emb_dim, activation="swish")(t_emb)
     t_emb = layers.Dense(t_emb_dim, activation="swish")(t_emb)
 
-    # ----- FIXED: cond embedding with a Lambda, no raw tf op on KerasTensor -----
-    cond_vec = layers.Lambda(
-        lambda c: tf.expand_dims(c, -1), name="cond_expand"
-    )(cond_in)  # (batch, 1)
-    c_emb = layers.Dense(t_emb_dim, activation="swish")(cond_vec)
-    c_emb = layers.Dense(t_emb_dim, activation="swish")(c_emb)
+    # SS category embedding
+    cond_emb = layers.Embedding(
+        input_dim=num_ss_classes,
+        output_dim=t_emb_dim,
+        name="ss_cat_embedding",
+    )(cond_in)  # (batch, t_emb_dim)
     # ---------------------------------------------------------------------------
 
     # Fuse time + cond
-    tc_emb = layers.Add(name="tc_emb")([t_emb, c_emb])  # (batch, t_emb_dim)
+    tc_emb = layers.Add(name="tc_emb")([t_emb, cond_emb])  # (batch, t_emb_dim)
 
     def add_time_cond(x, emb):
         ch = x.shape[-1]
