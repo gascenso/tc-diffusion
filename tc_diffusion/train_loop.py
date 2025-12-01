@@ -4,7 +4,7 @@ from pathlib import Path
 
 import tensorflow as tf
 from tensorflow import keras
-from tqdm.auto import tqdm  # NEW
+from tqdm.auto import tqdm
 
 from .data import create_dataset
 from .model_unet import build_unet
@@ -36,6 +36,10 @@ def train(cfg):
     best_epoch_loss = float("inf")
     global_step = 0
 
+    # --- history to be returned
+    steps_history = []
+    loss_history = []
+
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
 
@@ -57,6 +61,9 @@ def train(cfg):
             epoch_loss_sum += loss_value
             epoch_batches += 1
 
+            steps_history.append(global_step)
+            loss_history.append(loss_value)
+
             if global_step % log_interval == 0:
                 # update bar postfix instead of printing
                 pbar.set_postfix({"loss": f"{loss_value:.4f}"})
@@ -74,3 +81,8 @@ def train(cfg):
             print(f"  New best model, saved to {ckpt_path}")
         else:
             print("  (No improvement, not saving weights)")
+    return {
+        "steps": steps_history,
+        "loss": loss_history,
+        "best_epoch_loss": best_epoch_loss,
+    }

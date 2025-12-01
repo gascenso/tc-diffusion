@@ -15,7 +15,7 @@ conditioning:
   use_basin: false            # placeholder
 
 model:
-  base_channels: 8
+  base_channels: 16
   channel_mults: [1, 2, 4]
   num_res_blocks: 1
   attention_resolutions: []   # no attention yet
@@ -27,7 +27,7 @@ diffusion:
   loss_type: "eps_mse"
 
 training:
-  num_epochs: 100               # tiny run for first test
+  num_epochs: 50               # tiny run for first test
   lr: 1e-4
   ema_decay: 0.9999
   log_interval_steps: 10
