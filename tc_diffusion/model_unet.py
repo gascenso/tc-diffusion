@@ -1,108 +1,124 @@
+# tc_diffusion/model_unet.py
 import tensorflow as tf
 from tensorflow import keras
-from keras import layers
+from tensorflow.keras import layers
 
 
 def sinusoidal_time_embedding(t, dim):
-    """
-    t: (batch,) integer timesteps
-    Return: (batch, dim) sinusoidal embedding
-    """
     half_dim = dim // 2
-    # [batch, 1]
-    t = tf.cast(t, tf.float32)[:, None]
-    freqs = tf.exp(
-        tf.linspace(
-            tf.math.log(1.0),
-            tf.math.log(10000.0),
-            half_dim,
-        )
-    )[None, :]  # (1, half_dim)
-    args = t * freqs  # (batch, half_dim)
+    t = tf.cast(t, tf.float32)[:, None]          # (B, 1)
+    freqs = tf.exp(tf.linspace(tf.math.log(1.0), tf.math.log(10000.0), half_dim))[None, :]
+    args = t * freqs                             # (B, half_dim)
     emb = tf.concat([tf.sin(args), tf.cos(args)], axis=-1)
-    return emb  # (batch, dim)
+    return emb
+
+
+def make_res_block(x, emb, out_channels, name_prefix):
+    """
+    Simple ResNet-ish block with time/cond embedding added.
+    x: (B, H, W, C)
+    emb: (B, E)
+    """
+    in_channels = x.shape[-1]
+    h = x
+
+    # project embedding to channels and add
+    h_emb = layers.Dense(out_channels, name=f"{name_prefix}_emb_dense")(emb)
+    h_emb = layers.Activation("swish", name=f"{name_prefix}_emb_swish")(h_emb)
+    h_emb = layers.Reshape((1, 1, out_channels), name=f"{name_prefix}_emb_reshape")(h_emb)
+
+    # first conv
+    h = layers.Conv2D(out_channels, 3, padding="same", name=f"{name_prefix}_conv1")(h)
+    h = layers.Activation("swish", name=f"{name_prefix}_act1")(h)
+    h = layers.Add(name=f"{name_prefix}_add_emb")([h, h_emb])
+    h = layers.Conv2D(out_channels, 3, padding="same", name=f"{name_prefix}_conv2")(h)
+    h = layers.Activation("swish", name=f"{name_prefix}_act2")(h)
+
+    # skip connection if channels differ
+    if in_channels != out_channels:
+        x = layers.Conv2D(out_channels, 1, padding="same", name=f"{name_prefix}_skip")(x)
+
+    return layers.Add(name=f"{name_prefix}_residual")([x, h])
 
 
 def build_unet(cfg):
     image_size = int(cfg["data"]["image_size"])
     base_channels = int(cfg["model"]["base_channels"])
-    num_ss_classes = cfg.get("conditioning", {}).get("num_ss_classes", 6)
+    channel_mults = cfg["model"].get("channel_mults", [1, 2, 4])
+    num_res_blocks = int(cfg["model"].get("num_res_blocks", 2))
 
     # Inputs
     x_in = keras.Input(shape=(image_size, image_size, 1), name="x_t")
     t_in = keras.Input(shape=(), dtype=tf.int32, name="t")
-    cond_in = keras.Input(shape=(), dtype=tf.int32, name="ss_cat")  # scalar per sample
+    cond_in = keras.Input(shape=(), dtype=tf.float32, name="cond")  # scalar for now
 
-    # Time embedding
+    # ---- time embedding ----
     t_emb_dim = base_channels * 4
     t_emb = layers.Lambda(
-        lambda t: sinusoidal_time_embedding(t, t_emb_dim), name="t_sinusoidal_emb"
+        lambda t: sinusoidal_time_embedding(t, t_emb_dim),
+        name="t_sinusoidal_emb",
     )(t_in)
-    t_emb = layers.Dense(t_emb_dim, activation="swish")(t_emb)
-    t_emb = layers.Dense(t_emb_dim, activation="swish")(t_emb)
+    t_emb = layers.Dense(t_emb_dim, activation="swish", name="t_emb_dense1")(t_emb)
+    t_emb = layers.Dense(t_emb_dim, activation="swish", name="t_emb_dense2")(t_emb)
 
-    # SS category embedding
-    cond_emb = layers.Embedding(
-        input_dim=num_ss_classes,
-        output_dim=t_emb_dim,
-        name="ss_cat_embedding",
-    )(cond_in)  # (batch, t_emb_dim)
-    # ---------------------------------------------------------------------------
+    # ---- cond embedding (still scalar for now) ----
+    cond_vec = layers.Lambda(lambda c: tf.expand_dims(c, -1), name="cond_expand")(cond_in)
+    c_emb = layers.Dense(t_emb_dim, activation="swish", name="c_emb_dense1")(cond_vec)
+    c_emb = layers.Dense(t_emb_dim, activation="swish", name="c_emb_dense2")(c_emb)
 
-    # Fuse time + cond
-    tc_emb = layers.Add(name="tc_emb")([t_emb, cond_emb])  # (batch, t_emb_dim)
+    # fuse time + cond
+    tc_emb = layers.Add(name="tc_emb")([t_emb, c_emb])  # (B, t_emb_dim)
 
-    def add_time_cond(x, emb):
-        ch = x.shape[-1]
-        h = layers.Dense(ch)(emb)
-        h = layers.Activation("swish")(h)
-        h = layers.Reshape((1, 1, ch))(h)
-        return layers.Add()([x, h])
+    # ---- Downsampling path ----
+    hs = []  # skip connections
 
-    # Simple encoder
-    x = x_in
-    # Down 1
-    x = layers.Conv2D(base_channels, 3, padding="same")(x)
-    x = add_time_cond(x, tc_emb)
-    x = layers.Activation("swish")(x)
-    x = layers.Conv2D(base_channels, 3, padding="same")(x)
-    x = layers.Activation("swish")(x)
-    d1 = x
-    x = layers.MaxPool2D()(x)
+    h = layers.Conv2D(base_channels, 3, padding="same", name="in_conv")(x_in)
 
-    # Down 2
-    x = layers.Conv2D(base_channels * 2, 3, padding="same")(x)
-    x = add_time_cond(x, tc_emb)
-    x = layers.Activation("swish")(x)
-    x = layers.Conv2D(base_channels * 2, 3, padding="same")(x)
-    x = layers.Activation("swish")(x)
-    d2 = x
-    x = layers.MaxPool2D()(x)
+    # levels 0..(L-1)
+    in_ch = base_channels
+    for level, mult in enumerate(channel_mults):
+        out_ch = base_channels * mult
+        for b in range(num_res_blocks):
+            h = make_res_block(
+                h,
+                tc_emb,
+                out_ch,
+                name_prefix=f"down_l{level}_b{b}",
+            )
+        hs.append(h)  # store skip at this resolution
 
-    # Bottleneck
-    x = layers.Conv2D(base_channels * 4, 3, padding="same")(x)
-    x = add_time_cond(x, tc_emb)
-    x = layers.Activation("swish")(x)
-    x = layers.Conv2D(base_channels * 4, 3, padding="same")(x)
-    x = layers.Activation("swish")(x)
+        # don’t downsample after last level
+        if level != len(channel_mults) - 1:
+            h = layers.AveragePooling2D(pool_size=2, name=f"down_l{level}_pool")(h)
+        in_ch = out_ch
 
-    # Up 2
-    x = layers.UpSampling2D()(x)
-    x = layers.Concatenate()([x, d2])
-    x = layers.Conv2D(base_channels * 2, 3, padding="same")(x)
-    x = layers.Activation("swish")(x)
-    x = layers.Conv2D(base_channels * 2, 3, padding="same")(x)
-    x = layers.Activation("swish")(x)
+    # ---- Bottleneck ----
+    h = make_res_block(h, tc_emb, in_ch, name_prefix="bottleneck_0")
+    h = make_res_block(h, tc_emb, in_ch, name_prefix="bottleneck_1")
 
-    # Up 1
-    x = layers.UpSampling2D()(x)
-    x = layers.Concatenate()([x, d1])
-    x = layers.Conv2D(base_channels, 3, padding="same")(x)
-    x = layers.Activation("swish")(x)
-    x = layers.Conv2D(base_channels, 3, padding="same")(x)
-    x = layers.Activation("swish")(x)
+    # ---- Upsampling path ----
+    # walk back through channel_mults in reverse, popping skips
+    for level, mult in reversed(list(enumerate(channel_mults))):
+        skip = hs[level]  # this has the same H,W as h *after* upsampling
+        # upsample except at the highest-res level (level 0) – but we’ve stored skip before pool,
+        # so we first upsample then concat
+        if level != len(channel_mults) - 1:
+            h = layers.UpSampling2D(size=2, interpolation="nearest", name=f"up_l{level}_up")(h)
 
-    eps_out = layers.Conv2D(1, 3, padding="same", name="eps_out")(x)
+        # After upsampling, h should match skip spatial dims
+        h = layers.Concatenate(name=f"up_l{level}_concat")([h, skip])
+        out_ch = base_channels * mult
+
+        for b in range(num_res_blocks):
+            h = make_res_block(
+                h,
+                tc_emb,
+                out_ch,
+                name_prefix=f"up_l{level}_b{b}",
+            )
+
+    # ---- Output ----
+    eps_out = layers.Conv2D(1, 3, padding="same", name="eps_out")(h)
 
     model = keras.Model(inputs=[x_in, t_in, cond_in], outputs=eps_out, name="unet_ddpm")
     return model
