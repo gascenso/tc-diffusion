@@ -40,7 +40,7 @@ if __name__ == "__main__":
     # Save loss curve to Linux path (under experiment output_dir)
     out_dir = Path(cfg["experiment"]["output_dir"])
     loss_png = out_dir / "loss_curve.png"
-    save_loss_curve(history["steps"], history["loss"], str(loss_png))
+    save_loss_curve(history["epoch_losses"], str(loss_png))
     print(f"Saved loss curve to {loss_png}")
 
     # Optionally copy to Windows path

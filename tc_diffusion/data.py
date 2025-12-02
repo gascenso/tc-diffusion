@@ -88,7 +88,7 @@ def create_dataset(cfg, split="train"):
     image_size = int(cfg["data"]["image_size"])
     batch_size = int(cfg["data"]["batch_size"])
 
-    files = _list_nc_files(gridsat_dir)
+    files = _list_nc_files(gridsat_dir)[:10000]  # limit for testing, REMOVE LATER
 
     def generator():
         for path in files:
@@ -104,7 +104,8 @@ def create_dataset(cfg, split="train"):
     )
 
     ds = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
-    ds = ds.shuffle(buffer_size=min(len(files), 10000))
+    ds = ds.cache()
+    ds = ds.shuffle(buffer_size=min(len(files), 5000))
     ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
 

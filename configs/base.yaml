@@ -3,8 +3,8 @@ experiment:
   output_dir: "runs/baseline_ddpm_tc"
 
 data:
-  gridsat_dir: "data/gridsat_sample"
-  batch_size: 8
+  gridsat_dir: "data/gridsat_patches"
+  batch_size: 4
   num_workers: 2
   image_size: 256
   bt_min_k: 117.0
@@ -18,17 +18,17 @@ conditioning:
 model:
   base_channels: 16
   channel_mults: [1, 2, 4]
-  num_res_blocks: 1
+  num_res_blocks: 2
   attention_resolutions: []   # no attention yet
   dropout: 0.0
 
 diffusion:
   num_steps: 1000
-  beta_schedule: "linear"     # keep it simple for now
+  beta_schedule: "linear"
   loss_type: "eps_mse"
 
 training:
-  num_epochs: 50               # tiny run for first test
+  num_epochs: 25
   lr: 1e-4
   ema_decay: 0.9999
   log_interval_steps: 10
