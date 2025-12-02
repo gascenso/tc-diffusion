@@ -46,22 +46,14 @@ def save_image_grid(x, path, bt_min_k, bt_max_k, ncols=4):
     plt.savefig(path, dpi=150)
     plt.close(fig)
 
-def save_loss_curve(steps, loss, path):
-    """
-    steps: list/array of global step indices
-    loss:  list/array of loss values
-    path:  where to save the PNG
-    """
+def save_loss_curve(epoch_losses, path):
     Path(os.path.dirname(path)).mkdir(parents=True, exist_ok=True)
 
-    steps = np.asarray(steps)
-    loss = np.asarray(loss)
-
-    plt.figure(figsize=(6, 4))
-    plt.plot(steps, loss, linewidth=1.5)
-    plt.xlabel("Global step")
+    plt.figure(figsize=(6,4))
+    plt.plot(range(1, len(epoch_losses)+1), epoch_losses, marker="o")
+    plt.xlabel("Epoch")
     plt.ylabel("Training loss (epsilon MSE)")
-    plt.title("DDPM training loss")
+    plt.title("DDPM Training Loss")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(path, dpi=150)

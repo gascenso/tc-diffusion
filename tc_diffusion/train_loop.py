@@ -33,12 +33,9 @@ def train(cfg):
     out_dir = Path(cfg["experiment"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    epoch_losses = []
     best_epoch_loss = float("inf")
     global_step = 0
-
-    # --- history to be returned
-    steps_history = []
-    loss_history = []
 
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
@@ -61,9 +58,6 @@ def train(cfg):
             epoch_loss_sum += loss_value
             epoch_batches += 1
 
-            steps_history.append(global_step)
-            loss_history.append(loss_value)
-
             if global_step % log_interval == 0:
                 # update bar postfix instead of printing
                 pbar.set_postfix({"loss": f"{loss_value:.4f}"})
@@ -71,6 +65,7 @@ def train(cfg):
         pbar.close()
 
         epoch_loss = epoch_loss_sum / max(1, epoch_batches)
+        epoch_losses.append(epoch_loss)
         print(f"Epoch {epoch+1} mean loss: {epoch_loss:.6f}")
 
         # ---- save only if improved ----
@@ -82,7 +77,6 @@ def train(cfg):
         else:
             print("  (No improvement, not saving weights)")
     return {
-        "steps": steps_history,
-        "loss": loss_history,
+        "epoch_losses": epoch_losses,
         "best_epoch_loss": best_epoch_loss,
     }
