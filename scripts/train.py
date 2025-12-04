@@ -1,6 +1,4 @@
 # scripts/train.py
-
-# usage (from inside tc-diffusion): python -m scripts.train --config configs/base.yaml
 import argparse
 from pathlib import Path
 import shutil
@@ -22,7 +20,7 @@ def parse_args():
     p.add_argument(
         "--windows_loss_out",
         type=str,
-        default=None,
+        default="/mnt/c/Users/guido/Desktop/loss_curve.png",
         help=(
             "Optional path on Windows (e.g. /mnt/c/Users/guido/Desktop/loss_curve.png) "
             "to also copy the training loss plot."
@@ -37,13 +35,11 @@ if __name__ == "__main__":
 
     history = train(cfg)
 
-    # Save loss curve to Linux path (under experiment output_dir)
     out_dir = Path(cfg["experiment"]["output_dir"])
     loss_png = out_dir / "loss_curve.png"
-    save_loss_curve(history["epoch_losses"], str(loss_png))
+    save_loss_curve(history["epoch"], history["epoch_loss"], str(loss_png))
     print(f"Saved loss curve to {loss_png}")
 
-    # Optionally copy to Windows path
     if args.windows_loss_out is not None:
         win_path = Path(args.windows_loss_out)
         win_path.parent.mkdir(parents=True, exist_ok=True)
