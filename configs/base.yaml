@@ -4,7 +4,7 @@ experiment:
 
 data:
   gridsat_dir: "data/gridsat_patches"
-  batch_size: 4
+  batch_size: 8
   num_workers: 2
   image_size: 256
   bt_min_k: 117.0
@@ -16,7 +16,7 @@ conditioning:
   use_basin: false            # placeholder
 
 model:
-  base_channels: 16
+  base_channels: 32
   channel_mults: [1, 2, 4]
   num_res_blocks: 2
   attention_resolutions: []   # no attention yet
@@ -33,3 +33,8 @@ training:
   ema_decay: 0.9999
   log_interval_steps: 10
   mixed_precision: false
+
+  early_stopping:
+    enabled: true
+    patience_epochs: 10   # number of epochs with no improvement before stopping
+    min_delta: 1.0e-4     # minimum improvement in loss to count as "better"
