@@ -12,6 +12,7 @@ from .diffusion import Diffusion
 
 
 def train(cfg):
+    # GPU memory growth
     gpus = tf.config.list_physical_devices("GPU")
     if gpus:
         try:
@@ -33,9 +34,21 @@ def train(cfg):
     out_dir = Path(cfg["experiment"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    epoch_losses = []
+    # ----- early stopping config -----
+    es_cfg = cfg["training"].get("early_stopping", {})
+    es_enabled = bool(es_cfg.get("enabled", False))
+    patience_epochs = int(es_cfg.get("patience_epochs", 10))
+    min_delta = float(es_cfg.get("min_delta", 0.0))
+
     best_epoch_loss = float("inf")
+    best_epoch_idx = -1
+    epochs_without_improvement = 0
+
     global_step = 0
+
+    # epoch-wise history
+    epoch_indices = []
+    epoch_losses = []
 
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
@@ -43,7 +56,6 @@ def train(cfg):
         epoch_loss_sum = 0.0
         epoch_batches = 0
 
-        # ---- tqdm progress bar for the epoch ----
         pbar = tqdm(ds, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
 
         for batch, (x0, cond) in enumerate(pbar):
@@ -59,24 +71,45 @@ def train(cfg):
             epoch_batches += 1
 
             if global_step % log_interval == 0:
-                # update bar postfix instead of printing
                 pbar.set_postfix({"loss": f"{loss_value:.4f}"})
 
         pbar.close()
 
+        # compute mean loss for this epoch
         epoch_loss = epoch_loss_sum / max(1, epoch_batches)
+        epoch_indices.append(epoch + 1)
         epoch_losses.append(epoch_loss)
+
         print(f"Epoch {epoch+1} mean loss: {epoch_loss:.6f}")
 
-        # ---- save only if improved ----
-        if epoch_loss < best_epoch_loss:
+        # ----- check for improvement -----
+        if best_epoch_loss - epoch_loss > min_delta:
             best_epoch_loss = epoch_loss
+            best_epoch_idx = epoch + 1
+            epochs_without_improvement = 0
+
             ckpt_path = out_dir / "weights_best.weights.h5"
             model.save_weights(ckpt_path)
-            print(f"  New best model, saved to {ckpt_path}")
+            print(f"  New best model (epoch {best_epoch_idx}), saved to {ckpt_path}")
         else:
-            print("  (No improvement, not saving weights)")
+            epochs_without_improvement += 1
+            print(
+                f"  No significant improvement ({epochs_without_improvement}/{patience_epochs})"
+            )
+
+        # ----- early stopping -----
+        if es_enabled and epochs_without_improvement >= patience_epochs:
+            print(
+                f"\n Early stopping at epoch {epoch+1} "
+                f"(best epoch: {best_epoch_idx}, with loss {best_epoch_loss:.6f})"
+            )
+            break
+
+    # Return epoch-wise history
     return {
-        "epoch_losses": epoch_losses,
+        "epoch": epoch_indices,
+        "epoch_loss": epoch_losses,
+        "best_epoch": best_epoch_idx,
         "best_epoch_loss": best_epoch_loss,
+        "stopped_early": es_enabled and epochs_without_improvement >= patience_epochs,
     }
