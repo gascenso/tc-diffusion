@@ -46,11 +46,11 @@ def save_image_grid(x, path, bt_min_k, bt_max_k, ncols=4):
     plt.savefig(path, dpi=150)
     plt.close(fig)
 
-def save_loss_curve(epoch_losses, path):
+def save_loss_curve(x, loss, path):
     Path(os.path.dirname(path)).mkdir(parents=True, exist_ok=True)
 
     plt.figure(figsize=(6,4))
-    plt.plot(range(1, len(epoch_losses)+1), epoch_losses, marker="o")
+    plt.plot(x, loss, linewidth=1.5)
     plt.xlabel("Epoch")
     plt.ylabel("Training loss (epsilon MSE)")
     plt.title("DDPM Training Loss")
