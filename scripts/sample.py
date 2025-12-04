@@ -18,7 +18,7 @@ def parse_args():
     p.add_argument(
         "--weights",
         type=str,
-        default=None,
+        default="runs/baseline_ddpm_tc/weights_best.weights.h5",
         help="Path to weights .weights.h5 file. "
              "If not provided, will try to find the latest in experiment.output_dir.",
     )
@@ -27,7 +27,7 @@ def parse_args():
     p.add_argument(
         "--windows_out",
         type=str,
-        default=None,
+        default="/mnt/c/Users/guido/Desktop/sample.png",
         help="Optional path on Windows (e.g. /mnt/c/Users/guido/Desktop/sample.png) "
              "to also copy the PNG to.",
     )
