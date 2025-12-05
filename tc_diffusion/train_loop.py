@@ -25,9 +25,13 @@ def train(cfg):
     model = build_unet(cfg)
     diffusion = Diffusion(cfg)
 
+    ema_model = build_unet(cfg)
+    ema_model.set_weights(model.get_weights())
+
     lr = float(cfg["training"]["lr"])
     num_epochs = int(cfg["training"]["num_epochs"])
     log_interval = int(cfg["training"]["log_interval_steps"])
+    ema_decay = float(cfg["training"]["ema_decay"])
 
     optimizer = keras.optimizers.Adam(learning_rate=lr)
 
@@ -65,6 +69,10 @@ def train(cfg):
             grads = tape.gradient(loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
+            # ----- EMA update -----
+            for w_ema, w in zip(ema_model.weights, model.weights):
+                w_ema.assign(ema_decay * w_ema + (1.0 - ema_decay) * w)
+
             global_step += 1
             loss_value = float(loss.numpy())
             epoch_loss_sum += loss_value
@@ -89,7 +97,7 @@ def train(cfg):
             epochs_without_improvement = 0
 
             ckpt_path = out_dir / "weights_best.weights.h5"
-            model.save_weights(ckpt_path)
+            ema_model.save_weights(ckpt_path)
             print(f"  New best model (epoch {best_epoch_idx}), saved to {ckpt_path}")
         else:
             epochs_without_improvement += 1
