@@ -29,6 +29,15 @@ class Diffusion:
         if name == "linear":
             # Simple linear from 1e-4 to 0.02
             return np.linspace(1e-4, 2e-2, num_steps, dtype=np.float32)
+        elif name == "cosine":
+            # Nichol & Dhariwal cosine schedule
+            s = 0.008
+            steps = num_steps + 1
+            t = np.linspace(0, num_steps, steps, dtype=np.float64) / num_steps
+            alphas_bar = np.cos((t + s) / (1 + s) * np.pi / 2) ** 2
+            alphas_bar = alphas_bar / alphas_bar[0]
+            betas = 1.0 - (alphas_bar[1:] / alphas_bar[:-1])
+            return np.clip(betas, 1e-8, 0.999).astype(np.float32)
         else:
             raise NotImplementedError(f"Unknown beta_schedule {name}")
 

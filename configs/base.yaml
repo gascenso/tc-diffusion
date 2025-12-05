@@ -24,7 +24,7 @@ model:
 
 diffusion:
   num_steps: 1000
-  beta_schedule: "linear"
+  beta_schedule: "cosine"
   loss_type: "eps_mse"
 
 training:
