@@ -9,7 +9,7 @@ data:
   image_size: 256
   bt_min_k: 117.0
   bt_max_k: 348.0
-  max_files: 30000              # limit for testing, REMOVE LATER
+  max_files: 35000              # limit for testing, REMOVE LATER
 
 conditioning:
   num_ss_classes: 6           # 0-5 Saffir-Simpson categories
@@ -21,6 +21,7 @@ model:
   channel_mults: [1, 2, 4]
   num_res_blocks: 2
   attention_resolutions: []   # no attention yet
+  attn_num_heads: 4
   dropout: 0.0
 
 diffusion:
