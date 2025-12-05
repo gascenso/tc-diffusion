@@ -32,11 +32,11 @@ def parse_args():
              "to also copy the PNG to.",
     )
     p.add_argument(
-        "--ss_cat",
+        "--ss_class",
         type=int,
-        default=5,
+        default=2,
         help=(
-            "Saffir–Simpson category index to condition on:\n"
+            "Saffir–Simpson class index to condition on:\n"
             "0=TS (35–63 kt), 1=Cat1, 2=Cat2, 3=Cat3, 4=Cat4, 5=Cat5."
         ),
     )
@@ -83,7 +83,7 @@ if __name__ == "__main__":
         model=model,
         batch_size=args.batch_size,
         image_size=image_size,
-        cond_value=args.ss_cat,  # unconditional for now
+        cond_value=args.ss_class,  # unconditional for now
     )
 
     out_path = Path(args.out)
