@@ -1,6 +1,7 @@
 # tc_diffusion/data.py
 import os
 from glob import glob
+import random
 
 import numpy as np
 import xarray as xr
@@ -88,8 +89,10 @@ def create_dataset(cfg, split="train"):
     image_size = int(cfg["data"]["image_size"])
     batch_size = int(cfg["data"]["batch_size"])
 
-    files = _list_nc_files(gridsat_dir)[:cfg["data"]["max_files"]]  # limit for testing, REMOVE LATER
-
+    files = _list_nc_files(gridsat_dir)
+    random.shuffle(files)                          # limit for testing, REMOVE LATER
+    files = files[: int(cfg["data"]["max_files"])] # limit for testing, REMOVE LATER
+    
     def generator():
         for path in files:
             img, cond = _load_example_np(path, bt_min, bt_max, image_size)
