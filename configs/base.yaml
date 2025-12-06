@@ -9,7 +9,8 @@ data:
   image_size: 256
   bt_min_k: 117.0
   bt_max_k: 348.0
-
+  max_files: 10000            # limit for testing, REMOVE LATER
+  
 conditioning:
   num_ss_classes: 6           # 0-5 Saffir-Simpson categories
   use_wind_speed: false       # we'll wire this later
