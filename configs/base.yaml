@@ -4,7 +4,7 @@ experiment:
 
 data:
   gridsat_dir: "data/gridsat_patches"
-  batch_size: 8
+  batch_size: 4
   num_workers: 2
   image_size: 256
   bt_min_k: 117.0

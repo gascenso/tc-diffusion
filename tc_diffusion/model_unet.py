@@ -4,37 +4,110 @@ from tensorflow import keras
 from keras import layers
 
 
-def sinusoidal_time_embedding(t, dim):
-    half_dim = dim // 2
-    t = tf.cast(t, tf.float32)[:, None]          # (B, 1)
-    freqs = tf.exp(tf.linspace(tf.math.log(1.0), tf.math.log(10000.0), half_dim))[None, :]
-    args = t * freqs                             # (B, half_dim)
-    emb = tf.concat([tf.sin(args), tf.cos(args)], axis=-1)
-    return emb
+class SinusoidalTimeEmbedding(layers.Layer):
+    def __init__(self, dim, **kwargs):
+        super().__init__(**kwargs)
+        self.dim = int(dim)
 
+    def call(self, t):
+        # t: (B,) int32/float32
+        t = tf.cast(t, tf.float32)
+        half = self.dim // 2
 
-def make_res_block(x, emb, out_channels, name_prefix):
+        i = tf.cast(tf.range(half), tf.float32)
+        inv_freq = tf.exp(
+            -tf.math.log(10000.0) * i / tf.maximum(tf.cast(half - 1, tf.float32), 1.0)
+        )  # (half,)
+
+        args = t[:, None] * inv_freq[None, :]              # (B, half)
+        emb = tf.concat([tf.sin(args), tf.cos(args)], -1)  # (B, 2*half)
+
+        if self.dim % 2 == 1:
+            emb = tf.pad(emb, [[0, 0], [0, 1]])
+
+        return emb
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], self.dim)
+
+class GroupNorm(layers.Layer):
+    def __init__(self, groups=32, eps=1e-5, **kwargs):
+        super().__init__(**kwargs)
+        self.groups = groups
+        self.eps = eps
+
+    def build(self, input_shape):
+        channels = int(input_shape[-1])
+        self.groups = min(self.groups, channels)
+        self.gamma = self.add_weight(
+            name="gamma",
+            shape=(channels,),
+            initializer="ones",
+            trainable=True,
+        )
+        self.beta = self.add_weight(
+            name="beta",
+            shape=(channels,),
+            initializer="zeros",
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        # x: (B,H,W,C)
+        B, H, W = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2]
+        C = x.shape[-1]
+        G = self.groups
+
+        x = tf.reshape(x, [B, H, W, G, C // G])
+        mean, var = tf.nn.moments(x, axes=[1, 2, 4], keepdims=True)
+        x = (x - mean) / tf.sqrt(var + self.eps)
+        x = tf.reshape(x, [B, H, W, C])
+
+        return x * self.gamma[None, None, None, :] + self.beta[None, None, None, :]
+
+def make_res_block(x, emb, out_channels, name_prefix, gn_groups=32):
     """
-    Simple ResNet-ish block with time/cond embedding added.
-    x: (B, H, W, C)
-    emb: (B, E)
+    ResBlock with GroupNorm + FiLM (scale/shift) conditioning from emb.
+
+    x:   (B,H,W,C)
+    emb: (B,E)  (time+cond fused embedding)
     """
     in_channels = x.shape[-1]
     h = x
 
-    # project embedding to channels and add
-    h_emb = layers.Dense(out_channels, name=f"{name_prefix}_emb_dense")(emb)
-    h_emb = layers.Activation("swish", name=f"{name_prefix}_emb_swish")(h_emb)
-    h_emb = layers.Reshape((1, 1, out_channels), name=f"{name_prefix}_emb_reshape")(h_emb)
+    # Project emb -> (gamma1, beta1, gamma2, beta2) for two GN layers
+    film = layers.Dense(
+        4 * out_channels,
+        kernel_initializer="zeros",   # start close to "no conditioning"
+        bias_initializer="zeros",
+        name=f"{name_prefix}_film",
+    )(emb)
+    film = layers.Reshape((1, 1, 4 * out_channels), name=f"{name_prefix}_film_reshape")(film)
+    
+    # film: (B,1,1,4*out_channels)
+    gamma1 = layers.Lambda(lambda z: z[..., 0*out_channels:1*out_channels],
+                        name=f"{name_prefix}_gamma1")(film)
+    beta1  = layers.Lambda(lambda z: z[..., 1*out_channels:2*out_channels],
+                        name=f"{name_prefix}_beta1")(film)
+    gamma2 = layers.Lambda(lambda z: z[..., 2*out_channels:3*out_channels],
+                        name=f"{name_prefix}_gamma2")(film)
+    beta2  = layers.Lambda(lambda z: z[..., 3*out_channels:4*out_channels],
+                        name=f"{name_prefix}_beta2")(film)
 
-    # first conv
+    # --- Conv 1 ---
     h = layers.Conv2D(out_channels, 3, padding="same", name=f"{name_prefix}_conv1")(h)
+    h = GroupNorm(groups=gn_groups, name=f"{name_prefix}_gn1")(h)
+    h = layers.Lambda(lambda z: z[0] * (1.0 + z[1]) + z[2], name=f"{name_prefix}_film1")([h, gamma1, beta1])
     h = layers.Activation("swish", name=f"{name_prefix}_act1")(h)
-    h = layers.Add(name=f"{name_prefix}_add_emb")([h, h_emb])
+
+    # --- Conv 2 ---
     h = layers.Conv2D(out_channels, 3, padding="same", name=f"{name_prefix}_conv2")(h)
+    h = GroupNorm(groups=gn_groups, name=f"{name_prefix}_gn2")(h)
+    h = layers.Lambda(lambda z: z[0] * (1.0 + z[1]) + z[2], name=f"{name_prefix}_film2")([h, gamma2, beta2])
     h = layers.Activation("swish", name=f"{name_prefix}_act2")(h)
 
-    # skip connection if channels differ
+    # Skip connection if channels differ
     if in_channels != out_channels:
         x = layers.Conv2D(out_channels, 1, padding="same", name=f"{name_prefix}_skip")(x)
 
@@ -54,10 +127,8 @@ def build_unet(cfg):
 
     # ---- time embedding ----
     t_emb_dim = base_channels * 4
-    t_emb = layers.Lambda(
-        lambda t: sinusoidal_time_embedding(t, t_emb_dim),
-        name="t_sinusoidal_emb",
-    )(t_in)
+    t_emb = SinusoidalTimeEmbedding(t_emb_dim, name="t_sin_emb")(t_in)
+
     t_emb = layers.Dense(t_emb_dim, activation="swish", name="t_emb_dense1")(t_emb)
     t_emb = layers.Dense(t_emb_dim, activation="swish", name="t_emb_dense2")(t_emb)
 
