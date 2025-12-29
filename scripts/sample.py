@@ -14,16 +14,21 @@ from tc_diffusion.plotting import save_image_grid
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=str, default="configs/base.yaml")
     p.add_argument(
-        "--weights",
+        "--config",
         type=str,
-        default="runs/baseline_ddpm_tc/weights_best.weights.h5",
-        help="Path to weights .weights.h5 file. "
-             "If not provided, will try to find the latest in experiment.output_dir.",
+        default="configs/base.yaml"
     )
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--out", type=str, default="samples/sample_grid.png")
+    p.add_argument(
+        "--batch_size",
+        type=int,
+        default=8
+    )
+    p.add_argument(
+        "--out",
+        type=str,
+        default="samples/sample_grid.png"
+    )
     p.add_argument(
         "--windows_out",
         type=str,
@@ -40,15 +45,13 @@ def parse_args():
             "0=TS (35–63 kt), 1=Cat1, 2=Cat2, 3=Cat3, 4=Cat4, 5=Cat5."
         ),
     )
+    p.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Run name under runs/ to load weights from.",
+    )
     return p.parse_args()
-
-
-def find_latest_weights(output_dir: str):
-    pattern = str(Path(output_dir) / "weights_*.weights.h5")
-    files = sorted(glob.glob(pattern))
-    if not files:
-        raise FileNotFoundError(f"No weight files found in {output_dir}")
-    return files[-1]
 
 
 if __name__ == "__main__":
@@ -69,11 +72,7 @@ if __name__ == "__main__":
     model = build_unet(cfg)
     diffusion = Diffusion(cfg)
 
-    if args.weights is None:
-        out_dir = cfg["experiment"]["output_dir"]
-        weights_path = find_latest_weights(out_dir)
-    else:
-        weights_path = args.weights
+    weights_path = f"runs/{args.name}/weights_best.weights.h5"
 
     print(f"Loading weights from {weights_path}")
     model.load_weights(weights_path)

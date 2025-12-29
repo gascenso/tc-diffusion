@@ -1,7 +1,3 @@
-experiment:
-  name: "baseline_ddpm_tc"
-  output_dir: "runs/baseline_ddpm_tc"
-
 data:
   gridsat_dir: "data/gridsat_patches"
   batch_size: 4
