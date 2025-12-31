@@ -33,7 +33,6 @@ class Diffusion:
             raise NotImplementedError(f"Unknown beta_schedule {name}")
 
     # --- for training ---
-
     def q_sample(self, x0, t, noise):
         """
         Forward process: q(x_t | x_0)
@@ -66,7 +65,6 @@ class Diffusion:
         return loss
 
     # --- for sampling ---
-
     def p_sample_step(self, model, x_t, t_int, cond):
         """
         Single reverse step p_theta(x_{t-1} | x_t).

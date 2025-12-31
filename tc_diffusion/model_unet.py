@@ -66,6 +66,29 @@ class GroupNorm(layers.Layer):
 
         return x * self.gamma[None, None, None, :] + self.beta[None, None, None, :]
 
+
+class ClassifierFreeCondDropout(layers.Layer):
+    """CFG label dropout.
+
+    Replaces a fraction of conditioning labels with a special "null" label id.
+    This enables classifier-free guidance at inference time (two-pass guidance).
+    """
+
+    def __init__(self, drop_prob: float, null_label: int, **kwargs):
+        super().__init__(**kwargs)
+        self.drop_prob = float(drop_prob)
+        self.null_label = int(null_label)
+
+    def call(self, labels, training=None):
+        labels = tf.cast(labels, tf.int32)
+        if not training or self.drop_prob <= 0.0:
+            return labels
+
+        # Randomly drop conditioning per-sample.
+        rnd = tf.random.uniform(tf.shape(labels), 0.0, 1.0)
+        dropped = tf.where(rnd < self.drop_prob, tf.fill(tf.shape(labels), self.null_label), labels)
+        return dropped
+
 def make_res_block(x, emb, out_channels, name_prefix, gn_groups=32):
     """
     ResBlock with GroupNorm + FiLM (scale/shift) conditioning from emb.
@@ -123,7 +146,12 @@ def build_unet(cfg):
     # Inputs
     x_in = keras.Input(shape=(image_size, image_size, 1), name="x_t")
     t_in = keras.Input(shape=(), dtype=tf.int32, name="t")
-    cond_in = keras.Input(shape=(), dtype=tf.float32, name="cond")  # scalar for now
+    # SS category conditioning (0..num_ss_classes-1). We reserve one extra id = num_ss_classes
+    # as the CFG "null" label used when conditioning is dropped during training.
+    num_ss_classes = int(cfg.get("conditioning", {}).get("num_ss_classes", 6))
+    cfg_drop_prob = float(cfg.get("conditioning", {}).get("cfg_drop_prob", 0.0))
+
+    cond_in = keras.Input(shape=(), dtype=tf.int32, name="ss_cat")
 
     # ---- time embedding ----
     t_emb_dim = base_channels * 4
@@ -132,9 +160,30 @@ def build_unet(cfg):
     t_emb = layers.Dense(t_emb_dim, activation="swish", name="t_emb_dense1")(t_emb)
     t_emb = layers.Dense(t_emb_dim, activation="swish", name="t_emb_dense2")(t_emb)
 
-    # ---- cond embedding (still scalar for now) ----
-    cond_vec = layers.Lambda(lambda c: tf.expand_dims(c, -1), name="cond_expand")(cond_in)
-    c_emb = layers.Dense(t_emb_dim, activation="swish", name="c_emb_dense1")(cond_vec)
+    # ---- cond embedding (categorical SS class) + CFG dropout ----
+    null_label = num_ss_classes
+
+    # Safety: clip to valid range [0, num_ss_classes-1] before applying CFG.
+    cond_clipped = layers.Lambda(
+        lambda c: tf.clip_by_value(tf.cast(c, tf.int32), 0, num_ss_classes - 1),
+        name="ss_cat_clip",
+    )(cond_in)
+
+    cond_dropped = ClassifierFreeCondDropout(
+        drop_prob=cfg_drop_prob,
+        null_label=null_label,
+        name="cfg_cond_dropout",
+    )(cond_clipped)
+
+    # Embedding includes the extra "null" label.
+    c_emb = layers.Embedding(
+        input_dim=num_ss_classes + 1,
+        output_dim=t_emb_dim,
+        name="ss_cat_emb",
+    )(cond_dropped)
+
+    # Optional MLP on top of the embedding (helps expressivity without much cost).
+    c_emb = layers.Dense(t_emb_dim, activation="swish", name="c_emb_dense1")(c_emb)
     c_emb = layers.Dense(t_emb_dim, activation="swish", name="c_emb_dense2")(c_emb)
 
     # fuse time + cond

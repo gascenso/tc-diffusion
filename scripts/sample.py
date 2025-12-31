@@ -48,7 +48,7 @@ def parse_args():
     p.add_argument(
         "--name",
         type=str,
-        default=None,
+        default="baseline_ddpm_tc",
         help="Run name under runs/ to load weights from.",
     )
     return p.parse_args()

@@ -11,7 +11,8 @@ conditioning:
   num_ss_classes: 6           # 0-5 Saffir-Simpson categories
   use_wind_speed: false       # we'll wire this later
   use_basin: false            # placeholder
-
+  cfg_drop_prob: 0.1
+  
 model:
   base_channels: 32
   channel_mults: [1, 2, 4]
