@@ -21,9 +21,18 @@ class Diffusion:
         alphas = 1.0 - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
 
+        # alpha_bar_{t-1} with alpha_bar_{-1} := 1
+        alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1]).astype(np.float32)
+
+        # posterior variance beta_tilde
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        posterior_variance = posterior_variance.astype(np.float32)
+
         self.betas = tf.constant(betas, dtype=tf.float32)
         self.alphas = tf.constant(alphas, dtype=tf.float32)
         self.alphas_cumprod = tf.constant(alphas_cumprod, dtype=tf.float32)
+        self.alphas_cumprod_prev = tf.constant(alphas_cumprod_prev, dtype=tf.float32)
+        self.posterior_variance = tf.constant(posterior_variance, dtype=tf.float32)
 
     def _make_beta_schedule(self, name, num_steps):
         if name == "linear":
@@ -91,10 +100,12 @@ class Diffusion:
         model_mean = sqrt_recip_alpha_t * (
             x_t - (beta_t / sqrt_one_minus_alpha_bar) * eps_theta
         )
+        
+        posterior_var_t = self.posterior_variance[t_int]  # scalar
 
         if t_int > 0:
             noise = tf.random.normal(shape=tf.shape(x_t))
-            x_prev = model_mean + tf.sqrt(beta_t) * noise
+            x_prev = model_mean + tf.sqrt(posterior_var_t) * noise
         else:
             # t == 0: no noise
             x_prev = model_mean
