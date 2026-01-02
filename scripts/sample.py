@@ -88,7 +88,8 @@ if __name__ == "__main__":
         model=model,
         batch_size=args.batch_size,
         image_size=image_size,
-        cond_value=args.ss_cat,  # unconditional for now
+        cond_value=args.ss_cat,
+        guidance_scale=args.guidance_scale,
     )
 
     out_path = Path(args.out)
