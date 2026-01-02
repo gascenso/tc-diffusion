@@ -51,6 +51,12 @@ def parse_args():
         default="baseline_ddpm_tc",
         help="Run name under runs/ to load weights from.",
     )
+    p.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=0.0,
+        help="Classifier-free guidance scale. 0 disables CFG. Typical: 1-5."
+    )
     return p.parse_args()
 
 

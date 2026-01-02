@@ -16,6 +16,8 @@ class Diffusion:
     def __init__(self, cfg):
         self.num_steps = int(cfg["diffusion"]["num_steps"])
         self.beta_schedule_name = cfg["diffusion"]["beta_schedule"]
+        self.num_ss_classes = int(cfg["conditioning"]["num_ss_classes"])
+        self.null_label = self.num_ss_classes  # must match model_unet.py
 
         betas = self._make_beta_schedule(self.beta_schedule_name, self.num_steps)
         alphas = 1.0 - betas
@@ -81,7 +83,8 @@ class Diffusion:
         t_int: Python int in [0, T-1], same for whole batch.
         cond: (B,) scalar cond per sample (placeholder for now).
         """
-        t = tf.fill([tf.shape(x_t)[0]], tf.cast(t_int, tf.int32))  # (B,)
+        bsz = tf.shape(x_t)[0]
+        t = tf.fill([bsz], tf.cast(t_int, tf.int32))  # (B,)
 
         beta_t = self.betas[t_int]              # scalar
         alpha_t = self.alphas[t_int]            # scalar
@@ -94,7 +97,25 @@ class Diffusion:
         sqrt_one_minus_alpha_bar = tf.sqrt(1.0 - alpha_bar_t)
         sqrt_recip_alpha_t = 1.0 / tf.sqrt(alpha_t)
 
-        eps_theta = model([x_t, t, cond], training=False)
+        if guidance_scale is None:
+            guidance_scale = 0.0
+        guidance_scale = tf.cast(guidance_scale, tf.float32)
+
+        if guidance_scale > 0.0:
+            # unconditional labels: the special null id
+            cond_null = tf.fill([bsz], tf.cast(self.null_label, tf.int32))
+
+            # One forward pass: [cond batch; uncond batch]
+            x_in = tf.concat([x_t, x_t], axis=0)
+            t_in = tf.concat([t, t], axis=0)
+            c_in = tf.concat([cond, cond_null], axis=0)
+
+            eps_all = model([x_in, t_in, c_in], training=False)
+            eps_cond, eps_uncond = tf.split(eps_all, num_or_size_splits=2, axis=0)
+
+            eps_theta = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+        else:
+            eps_theta = model([x_t, t, cond], training=False)
 
         # DDPM mean
         model_mean = sqrt_recip_alpha_t * (
@@ -112,7 +133,7 @@ class Diffusion:
 
         return x_prev
 
-    def sample(self, model, batch_size, image_size, cond_value=0, show_progress=True):
+    def sample(self, model, batch_size, image_size, cond_value=0, show_progress=True, guidance_scale=0.0):
         """
         Generate samples starting from pure noise.
 
@@ -137,6 +158,6 @@ class Diffusion:
             )
 
         for t_int in t_iter:
-            x_t = self.p_sample_step(model, x_t, t_int, cond)
+            x_t = self.p_sample_step(model, x_t, t_int, cond, guidance_scale=guidance_scale)
 
         return x_t
