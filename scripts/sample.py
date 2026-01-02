@@ -57,6 +57,11 @@ def parse_args():
         default=0.0,
         help="Classifier-free guidance scale. 0 disables CFG. Typical: 1-5."
     )
+    p.add_argument(
+        "--uncond",
+        action="store_true",
+        help="Unconditional sampling (ignore --ss_cat and use null label)."
+    )
     return p.parse_args()
 
 
@@ -83,12 +88,14 @@ if __name__ == "__main__":
     print(f"Loading weights from {weights_path}")
     model.load_weights(weights_path)
 
+    cond_value = None if args.uncond else args.ss_cat
+
     print("Sampling...")
     x_samples = diffusion.sample(
         model=model,
         batch_size=args.batch_size,
         image_size=image_size,
-        cond_value=args.ss_cat,
+        cond_value=cond_value,
         guidance_scale=args.guidance_scale,
     )
 

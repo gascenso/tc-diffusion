@@ -76,7 +76,7 @@ class Diffusion:
         return loss
 
     # --- for sampling ---
-    def p_sample_step(self, model, x_t, t_int, cond):
+    def p_sample_step(self, model, x_t, t_int, cond, guidance_scale=0.0):
         """
         Single reverse step p_theta(x_{t-1} | x_t).
 
@@ -133,7 +133,7 @@ class Diffusion:
 
         return x_prev
 
-    def sample(self, model, batch_size, image_size, cond_value=0, show_progress=True, guidance_scale=0.0):
+    def sample(self, model, batch_size, image_size, cond_value=None, show_progress=True, guidance_scale=0.0):
         """
         Generate samples starting from pure noise.
 
@@ -143,10 +143,12 @@ class Diffusion:
             shape=(batch_size, image_size, image_size, 1), dtype=tf.float32
         )
 
-        cond = tf.fill(
-            [batch_size],
-            tf.cast(cond_value, tf.int32),
-        )  # (B,)
+        if cond_value is None:
+            # unconditional: always use null label
+            cond = tf.fill([batch_size], tf.cast(self.null_label, tf.int32))
+        else:
+            # conditional: fixed SS category for whole batch
+            cond = tf.fill([batch_size], tf.cast(int(cond_value), tf.int32))
 
         t_iter = reversed(range(self.num_steps))
         if show_progress:
