@@ -36,3 +36,6 @@ training:
     enabled: true
     patience_epochs: 10   # number of epochs with no improvement before stopping
     min_delta: 1.0e-4     # minimum improvement in loss to count as "better"
+
+directories:
+  windows_samples_path: "/mnt/c/Users/guido/Desktop/sample.png"

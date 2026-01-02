@@ -31,18 +31,6 @@ def parse_args():
         default=8
     )
     p.add_argument(
-        "--out",
-        type=str,
-        default="samples/sample_grid.png"
-    )
-    p.add_argument(
-        "--windows_out",
-        type=str,
-        default="/mnt/c/Users/guido/Desktop/sample.png",
-        help="Optional path on Windows (e.g. /mnt/c/Users/guido/Desktop/sample.png) "
-             "to also copy the PNG to.",
-    )
-    p.add_argument(
         "--ss_cat",
         type=int,
         default=5,
@@ -105,7 +93,7 @@ if __name__ == "__main__":
         guidance_scale=args.guidance_scale,
     )
 
-    out_path = Path(args.out)
+    out_path = f"runs/{args.name}/sample.png"
     save_image_grid(
         x_samples,
         path=str(out_path),
@@ -115,7 +103,7 @@ if __name__ == "__main__":
     print(f"Saved sample grid to {out_path}")
 
     if args.windows_out is not None:
-        win_path = Path(args.windows_out)
+        win_path = Path(cfg["directories"]["windows_samples_path"])
         win_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(out_path, win_path)
         print(f"Copied sample grid to Windows path {win_path}")

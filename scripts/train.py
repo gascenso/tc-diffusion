@@ -40,16 +40,6 @@ def parse_args():
         action="store_true",
         help="Resume training from the latest weights_last.* in runs/<name>/ if available.",
     )
-
-    p.add_argument(
-        "--windows_loss_out",
-        type=str,
-        default="/mnt/c/Users/guido/Desktop/loss_curve.png",
-        help=(
-            "Optional path on Windows (e.g. /mnt/c/Users/guido/Desktop/loss_curve.png) "
-            "to also copy the training loss plot."
-        ),
-    )
     return p.parse_args()
 
 def write_run_config(run_dir: Path, cfg: dict):
@@ -115,9 +105,3 @@ if __name__ == "__main__":
     loss_png = run_dir / "loss_curve.png"
     save_loss_curve(history["epoch"], history["epoch_loss"], str(loss_png))
     print(f"Saved loss curve to {loss_png}")
-
-    if args.windows_loss_out is not None:
-        win_path = Path(args.windows_loss_out)
-        win_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(loss_png, win_path)
-        print(f"Copied loss curve to Windows path {win_path}")
