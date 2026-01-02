@@ -1,4 +1,10 @@
 # scripts/sample.py
+
+# Usage:
+# (unconditional sampling)      python -m scripts.sample --name <RUN_NAME> --uncond
+# (conditional sampling, Cat3)  python -m scripts.sample --name <RUN_NAME> --ss_cat 3
+# (conditional with CFG)        python -m scripts.sample --name <RUN_NAME> --ss_cat 3 --guidance_scale 2.0
+
 import argparse
 from pathlib import Path
 import glob

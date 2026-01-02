@@ -1,4 +1,9 @@
 # scripts/train.py
+
+# Usage:
+# (start new run)     python -m scripts.train --name <RUN_NAME>
+# (resume run)        python -m scripts.train --name <RUN_NAME> --resume
+
 import argparse
 from pathlib import Path
 import shutil
