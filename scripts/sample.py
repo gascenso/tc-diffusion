@@ -56,6 +56,11 @@ def parse_args():
         action="store_true",
         help="Unconditional sampling (ignore --ss_cat and use null label)."
     )
+    p.add_argument(
+        "--use_ema",
+        action="store_true",
+        help="If set, load EMA weights (weights_ema_best.weights.h5) instead of raw best weights.",
+    )
     return p.parse_args()
 
 
@@ -77,7 +82,10 @@ if __name__ == "__main__":
     model = build_unet(cfg)
     diffusion = Diffusion(cfg)
 
-    weights_path = f"runs/{args.name}/weights_best.weights.h5"
+    if args.use_ema:
+        weights_path = f"runs/{args.name}/weights_ema_best.weights.h5"
+    else:
+        weights_path = f"runs/{args.name}/weights_best.weights.h5"
 
     print(f"Loading weights from {weights_path}")
     model.load_weights(weights_path)
@@ -102,8 +110,7 @@ if __name__ == "__main__":
     )
     print(f"Saved sample grid to {out_path}")
 
-    if args.windows_out is not None:
-        win_path = Path(cfg["directories"]["windows_samples_path"])
-        win_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(out_path, win_path)
-        print(f"Copied sample grid to Windows path {win_path}")
+    win_path = Path(cfg["directories"]["windows_samples_path"])
+    win_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(out_path, win_path)
+    print(f"Copied sample grid to Windows path {win_path}")

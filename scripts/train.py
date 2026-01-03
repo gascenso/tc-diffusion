@@ -73,8 +73,14 @@ if __name__ == "__main__":
                 p.unlink()
             except Exception:
                 pass
+        for p in run_dir.glob("weights_ema_last.epoch_*.weights.h5"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
         for p in [
             run_dir / "weights_best.weights.h5",
+            run_dir / "weights_ema_best.weights.h5",
             run_dir / "run_state.json",
         ]:
             if p.exists():

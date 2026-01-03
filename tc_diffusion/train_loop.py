@@ -11,6 +11,45 @@ from .data import create_dataset
 from .model_unet import build_unet
 from .diffusion import Diffusion
 
+class EMA:
+    """Exponential Moving Average (EMA) over model weights.
+
+    Updates after each optimizer step:
+        ema = decay * ema + (1 - decay) * w
+    """
+
+    def __init__(self, model: tf.keras.Model, decay: float):
+        if not (0.0 < float(decay) < 1.0):
+            raise ValueError(f"EMA decay must be in (0, 1), got {decay}")
+        self.model = model
+        self.decay = tf.constant(float(decay), dtype=tf.float32)
+
+        # Shadow variables mirror model.weights (trainable + non-trainable)
+        self.shadow_vars = [
+            tf.Variable(w, trainable=False, dtype=w.dtype, name=f"ema/{w.name.split(':')[0]}")
+            for w in model.weights
+        ]
+
+    def update(self):
+        d = self.decay
+        one_minus_d = 1.0 - d
+        for s, w in zip(self.shadow_vars, self.model.weights):
+            s.assign(d * s + one_minus_d * w)
+
+    def copy_to_model(self):
+        for s, w in zip(self.shadow_vars, self.model.weights):
+            w.assign(s)
+
+    def copy_from_model(self):
+        for s, w in zip(self.shadow_vars, self.model.weights):
+            s.assign(w)
+
+    def get_model_weights_snapshot(self):
+        return [w.numpy() for w in self.model.weights]
+
+    def restore_model_weights_snapshot(self, snapshot):
+        for arr, w in zip(snapshot, self.model.weights):
+            w.assign(arr)
 
 def _state_path(out_dir: Path) -> Path:
     return out_dir / "run_state.json"
@@ -32,6 +71,20 @@ def _delete_other_last_weights(out_dir: Path, keep: Path):
             except Exception:
                 pass
 
+def _find_latest_ema_last_weights(out_dir: Path) -> Path | None:
+    files = sorted(glob.glob(str(out_dir / "weights_ema_last.epoch_*.weights.h5")))
+    if not files:
+        return None
+    return Path(files[-1])
+
+def _delete_other_ema_last_weights(out_dir: Path, keep: Path):
+    for f in glob.glob(str(out_dir / "weights_ema_last.epoch_*.weights.h5")):
+        fp = Path(f)
+        if fp != keep:
+            try:
+                fp.unlink()
+            except Exception:
+                pass
 
 def _load_state(out_dir: Path) -> dict | None:
     sp = _state_path(out_dir)
@@ -63,6 +116,10 @@ def train(cfg, resume: bool = False):
     model = build_unet(cfg)
     diffusion = Diffusion(cfg)
 
+    ema_decay = float(cfg.get("training", {}).get("ema_decay", 0.0))
+    use_ema = (ema_decay is not None) and (ema_decay > 0.0)
+    ema = EMA(model, ema_decay) if use_ema else None
+
     lr = float(cfg["training"]["lr"])
     num_epochs = int(cfg["training"]["num_epochs"])
     log_interval = int(cfg["training"]["log_interval_steps"])
@@ -90,13 +147,23 @@ def train(cfg, resume: bool = False):
     if resume:
         state = _load_state(out_dir)
         last_w = _find_latest_last_weights(out_dir)
+        last_ema_w = _find_latest_ema_last_weights(out_dir) if use_ema else None
 
         if state is None or last_w is None:
             print(f"[resume] No state/last weights found in {out_dir}. Starting fresh.")
         else:
             print(f"[resume] Loading last weights: {last_w}")
             model.load_weights(str(last_w))
-
+            if use_ema and ema is not None:
+                if last_ema_w is not None:
+                    print(f"[resume] Loading last EMA weights: {last_ema_w}")
+                    # Temporarily load EMA weights into model, copy into EMA shadow, then restore model weights.
+                    model.load_weights(str(last_ema_w))
+                    ema.copy_from_model()
+                    model.load_weights(str(last_w))
+                else:
+                    print("[resume] No EMA weights found; initializing EMA from current model weights.")
+                    ema.copy_from_model()
             # Continue from next epoch
             start_epoch = int(state.get("last_epoch", 0))
             best_epoch_loss = float(state.get("best_epoch_loss", best_epoch_loss))
@@ -127,7 +194,8 @@ def train(cfg, resume: bool = False):
 
             grads = tape.gradient(loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
-
+            if use_ema and ema is not None:
+                ema.update()
             global_step += 1
             loss_value = float(loss.numpy())
             epoch_loss_sum += loss_value
@@ -148,6 +216,14 @@ def train(cfg, resume: bool = False):
         last_path = out_dir / f"weights_last.epoch_{epoch+1}.weights.h5"
         model.save_weights(last_path)
         _delete_other_last_weights(out_dir, keep=last_path)
+        if use_ema and ema is not None:
+            ema_last_path = out_dir / f"weights_ema_last.epoch_{epoch+1}.weights.h5"
+            snap = ema.get_model_weights_snapshot()
+            ema.copy_to_model()
+            model.save_weights(ema_last_path)
+            ema.restore_model_weights_snapshot(snap)
+            _delete_other_ema_last_weights(out_dir, keep=ema_last_path)
+            print(f"  Saved EMA last weights to {ema_last_path}")
         print(f"  Saved last weights to {last_path}")
 
         # ----- check for improvement (best) -----
@@ -159,6 +235,13 @@ def train(cfg, resume: bool = False):
             best_path = out_dir / "weights_best.weights.h5"
             model.save_weights(best_path)
             print(f"  New best model (epoch {best_epoch_idx}), saved to {best_path}")
+            if use_ema and ema is not None:
+                best_ema_path = out_dir / "weights_ema_best.weights.h5"
+                snap = ema.get_model_weights_snapshot()
+                ema.copy_to_model()
+                model.save_weights(best_ema_path)
+                ema.restore_model_weights_snapshot(snap)
+                print(f"  New best EMA model (epoch {best_epoch_idx}), saved to {best_ema_path}")
         else:
             epochs_without_improvement += 1
             print(f"  No significant improvement ({epochs_without_improvement}/{patience_epochs})")
