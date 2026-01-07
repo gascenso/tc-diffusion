@@ -122,6 +122,7 @@ def train(cfg, resume: bool = False):
 
     lr = float(cfg["training"]["lr"])
     num_epochs = int(cfg["training"]["num_epochs"])
+    steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 2000))
     log_interval = int(cfg["training"]["log_interval_steps"])
     optimizer = keras.optimizers.Adam(learning_rate=lr)
 
@@ -189,6 +190,8 @@ def train(cfg, resume: bool = False):
         pbar = tqdm(ds, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
 
         for batch, (x0, cond) in enumerate(pbar):
+            if batch >= steps_per_epoch:
+                break
             with tf.GradientTape() as tape:
                 loss = diffusion.loss(model, x0, cond)
 
