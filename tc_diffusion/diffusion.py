@@ -36,12 +36,40 @@ class Diffusion:
         self.alphas_cumprod_prev = tf.constant(alphas_cumprod_prev, dtype=tf.float32)
         self.posterior_variance = tf.constant(posterior_variance, dtype=tf.float32)
 
-    def _make_beta_schedule(self, name, num_steps):
+    def _make_beta_schedule(self, name: str, num_steps: int):
+        """
+        Create a beta schedule.
+
+        Supported:
+        - "linear": linear beta schedule (original DDPM)
+        - "cosine": cosine alpha_bar schedule (Nichol & Dhariwal 2021)
+        """
         if name == "linear":
-            # Simple linear from 1e-4 to 0.02
-            return np.linspace(1e-4, 2e-2, num_steps, dtype=np.float32)
+            beta_start = 1e-4
+            beta_end = 2e-2
+            return np.linspace(beta_start, beta_end, num_steps, dtype=np.float64)
+
+        elif name == "cosine":
+            # --- cosine alpha_bar schedule (Nichol & Dhariwal, 2021) ---
+            s = 0.008
+            steps = num_steps
+
+            # t in [0, T]
+            t = np.linspace(0, steps, steps + 1, dtype=np.float64) / steps
+
+            alpha_bar = np.cos(((t + s) / (1.0 + s)) * np.pi / 2.0) ** 2
+            alpha_bar = alpha_bar / alpha_bar[0]  # normalize so alpha_bar[0] = 1
+
+            # betas from alpha_bar
+            betas = 1.0 - (alpha_bar[1:] / alpha_bar[:-1])
+
+            # numerical safety
+            betas = np.clip(betas, 1e-8, 0.999)
+
+            return betas.astype(np.float64)
+
         else:
-            raise NotImplementedError(f"Unknown beta_schedule {name}")
+            raise ValueError(f"Unknown beta schedule: {name}")
 
     # --- for training ---
     def q_sample(self, x0, t, noise):
