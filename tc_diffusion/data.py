@@ -1,114 +1,154 @@
-# tc_diffusion/data.py
-import os
-from glob import glob
+import json
 import random
+from pathlib import Path
+from typing import Dict, List, Iterator, Tuple
 
 import numpy as np
-import xarray as xr
 import tensorflow as tf
+import xarray as xr
 
 
-def _list_nc_files(gridsat_dir):
-    paths = sorted(glob(os.path.join(gridsat_dir, "*.nc")))
-    if not paths:
-        raise FileNotFoundError(f"No .nc files found in {gridsat_dir}")
-    return paths
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
 
-
-def _wind_to_ss_category(w_knots: float) -> int:
+def load_dataset_index(index_path: Path) -> Dict[str, List[str]]:
     """
-    Map WMO_WIND (knots) to Saffir–Simpson category index:
-
-      0: Tropical Storm (35–63 kt)
-      1: Category 1 (64–82 kt)
-      2: Category 2 (83–95 kt)
-      3: Category 3 (96–112 kt)
-      4: Category 4 (113–136 kt)
-      5: Category 5 (>136 kt)
-
-    If w < 35, we still map to 0 (TS / sub-TS bundled together).
+    Load dataset_index.json and return class -> list of relative file paths.
     """
-    w = float(w_knots)
-    if w <= 63.0:
-        return 0
-    elif w <= 82.0:
-        return 1
-    elif w <= 95.0:
-        return 2
-    elif w <= 112.0:
-        return 3
-    elif w <= 136.0:
-        return 4
-    else:
-        return 5
-    
+    with open(index_path, "r") as f:
+        index = json.load(f)
 
-def _load_example_np(path, bt_min, bt_max, image_size):
+    class_to_files = {
+        int(k): v for k, v in index["classes"].items()
+    }
+
+    return class_to_files
+
+
+def compute_class_sampling_probs(
+    class_to_files: Dict[int, List[str]],
+    alpha: float,
+) -> Dict[int, float]:
     """
-    Pure NumPy/xarray loader for a single .nc file.
-
-    Returns:
-        img:  np.float32 (H, W, 1) scaled to [-1, 1]
-        cond: np.int32 scalar = SS category index (0..5)
+    Compute class sampling probabilities using power-law reweighting:
+        p_train(c) ∝ p_empirical(c)^alpha
     """
-    ds = xr.open_dataset(path)
+    counts = {c: len(v) for c, v in class_to_files.items()}
+    total = sum(counts.values())
 
-    # Brightness temperature
-    bt = ds["bt"].values.astype(np.float32)
-    if bt.shape[0] != image_size or bt.shape[1] != image_size:
-        raise ValueError(
-            f"Unexpected bt shape {bt.shape}, expected ({image_size}, {image_size})"
-        )
+    # empirical distribution
+    p_emp = {c: counts[c] / total for c in counts}
 
-    # Wind → SS category
-    w_knots = ds.wmo_wind
-    ss_cat = _wind_to_ss_category(w_knots)
+    # reweighted distribution
+    weights = {c: p_emp[c] ** alpha for c in p_emp}
+    Z = sum(weights.values())
 
-    ds.close()
-
-    # Normalize BT from [bt_min, bt_max] -> [-1, 1]
-    bt_clipped = np.clip(bt, bt_min, bt_max)
-    bt_norm01 = (bt_clipped - bt_min) / (bt_max - bt_min)
-    bt_norm11 = bt_norm01 * 2.0 - 1.0
-    img = bt_norm11[..., None]  # (H, W, 1)
-
-    cond = np.array(ss_cat, dtype=np.int32)  # SS category index
-
-    return img.astype(np.float32), cond
+    probs = {c: weights[c] / Z for c in weights}
+    return probs
 
 
-def create_dataset(cfg, split="train"):
+# ------------------------------------------------------------
+# Generator
+# ------------------------------------------------------------
+
+class BalancedTCGenerator:
     """
-    Return a tf.data.Dataset yielding (image, ss_category) pairs.
+    Infinite generator yielding balanced TC samples.
 
-    ss_category is an int32 scalar in [0, 5].
+    Yields:
+        bt: (H, W, 1) float32
+        cond: int32 (SS category)
     """
-    gridsat_dir = cfg["data"]["gridsat_dir"]
-    bt_min = float(cfg["data"]["bt_min_k"])
-    bt_max = float(cfg["data"]["bt_max_k"])
-    image_size = int(cfg["data"]["image_size"])
-    batch_size = int(cfg["data"]["batch_size"])
 
-    files = _list_nc_files(gridsat_dir)
-    random.shuffle(files)                          # limit for testing, REMOVE LATER
-    files = files[: int(cfg["data"]["max_files"])] # limit for testing, REMOVE LATER
+    def __init__(
+        self,
+        data_root: Path,
+        class_to_files: Dict[int, List[str]],
+        class_probs: Dict[int, float],
+        seed: int = 42,
+    ):
+        self.data_root = data_root
+        self.class_to_files = class_to_files
+        self.class_probs = class_probs
 
-    def generator():
-        for path in files:
-            img, cond = _load_example_np(path, bt_min, bt_max, image_size)
-            yield img, cond
+        self.classes = sorted(class_to_files.keys())
+        self.probs = np.array([class_probs[c] for c in self.classes])
 
-    output_signature = (
-        tf.TensorSpec(
-            shape=(image_size, image_size, 1),
-            dtype=tf.float32,
-        ),  # image
-        tf.TensorSpec(shape=(), dtype=tf.int32),  # SS category
+        self.rng = random.Random(seed)
+
+    def __iter__(self) -> Iterator[Tuple[np.ndarray, np.int32]]:
+        while True:
+            # 1) sample class
+            cls = self.rng.choices(self.classes, weights=self.probs, k=1)[0]
+
+            # 2) sample file within class
+            rel_path = self.rng.choice(self.class_to_files[cls])
+            nc_path = self.data_root / rel_path
+
+            # 3) load NetCDF (BT only)
+            with xr.open_dataset(nc_path, engine="netcdf4") as ds:
+                bt = ds["bt"].values.astype(np.float32)
+
+            # ensure shape (H, W, 1)
+            if bt.ndim == 2:
+                bt = bt[..., None]
+
+            yield bt, np.int32(cls)
+
+
+# ------------------------------------------------------------
+# Public API
+# ------------------------------------------------------------
+
+def create_dataset(cfg) -> tf.data.Dataset:
+    """
+    Create a tf.data.Dataset with class-balanced sampling.
+    """
+
+    data_cfg = cfg["data"]
+    train_cfg = cfg["training"]
+
+    data_root = Path(data_cfg["data_root"])
+    index_path = Path(data_cfg["dataset_index"])
+    alpha = float(data_cfg.get("class_balance_alpha", 1.0))
+
+    batch_size = int(data_cfg["batch_size"])
+    seed = int(cfg.get("seed", 42))
+
+    # ---- load index ----
+    class_to_files = load_dataset_index(index_path)
+
+    # ---- compute sampling probabilities ----
+    class_probs = compute_class_sampling_probs(class_to_files, alpha)
+
+    # print once for sanity
+    print("\n[data] Class-balanced sampling probabilities:")
+    for c in sorted(class_probs):
+        print(f"  class {c}: p = {class_probs[c]:.4f} "
+              f"(n = {len(class_to_files[c])})")
+    print()
+
+    # ---- generator ----
+    gen = BalancedTCGenerator(
+        data_root=data_root,
+        class_to_files=class_to_files,
+        class_probs=class_probs,
+        seed=seed,
     )
 
-    ds = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
-    ds = ds.cache()
-    ds = ds.shuffle(buffer_size=min(len(files), 5000))
+    # ---- tf.data.Dataset ----
+    ds = tf.data.Dataset.from_generator(
+        lambda: iter(gen),
+        output_signature=(
+            tf.TensorSpec(shape=(None, None, 1), dtype=tf.float32),
+            tf.TensorSpec(shape=(), dtype=tf.int32),
+        ),
+    )
+
+    # shuffle only within small buffer (structure comes from sampler)
+    ds = ds.shuffle(buffer_size=4 * batch_size, seed=seed)
+
     ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
 
