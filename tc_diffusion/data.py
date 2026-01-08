@@ -11,6 +11,16 @@ import xarray as xr
 # ------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------
+def preprocess_bt(bt: np.ndarray, bt_range: Tuple[float, float]) -> np.ndarray:
+    bt = bt.astype(np.float32)
+    bt = np.nan_to_num(bt, nan=0.0, posinf=0.0, neginf=0.0)
+
+    bt_min, bt_max = bt_range
+    bt = np.clip(bt, bt_min, bt_max)
+
+    bt = (bt - bt_min) / (bt_max - bt_min)  # [0,1]
+    bt = bt * 2.0 - 1.0                     # [-1,1]
+    return bt
 
 def load_dataset_index(index_path: Path) -> Dict[str, List[str]]:
     """
@@ -67,11 +77,12 @@ class BalancedTCGenerator:
         class_to_files: Dict[int, List[str]],
         class_probs: Dict[int, float],
         seed: int = 42,
+        bt_range: Tuple[float, float] = (117.0, 348.0),
     ):
         self.data_root = data_root
         self.class_to_files = class_to_files
         self.class_probs = class_probs
-
+        self.bt_range = bt_range
         self.classes = sorted(class_to_files.keys())
         self.probs = np.array([class_probs[c] for c in self.classes])
 
@@ -86,10 +97,11 @@ class BalancedTCGenerator:
             rel_path = self.rng.choice(self.class_to_files[cls])
             nc_path = self.data_root / rel_path
 
-            # 3) load NetCDF (BT only)
+            # 3) load NetCDF (BT only) and normalize
             with xr.open_dataset(nc_path, engine="netcdf4") as ds:
                 bt = ds["bt"].values.astype(np.float32)
-
+            bt = preprocess_bt(bt, self.bt_range)
+            
             # ensure shape (H, W, 1)
             if bt.ndim == 2:
                 bt = bt[..., None]
@@ -107,8 +119,6 @@ def create_dataset(cfg) -> tf.data.Dataset:
     """
 
     data_cfg = cfg["data"]
-    train_cfg = cfg["training"]
-
     data_root = Path(data_cfg["data_root"])
     index_path = Path(data_cfg["dataset_index"])
     alpha = float(data_cfg.get("class_balance_alpha", 1.0))
@@ -135,6 +145,8 @@ def create_dataset(cfg) -> tf.data.Dataset:
         class_to_files=class_to_files,
         class_probs=class_probs,
         seed=seed,
+        bt_range=(float(data_cfg["bt_min_k"]),
+                  float(data_cfg["bt_max_k"])),
     )
 
     # ---- tf.data.Dataset ----
