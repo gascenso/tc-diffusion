@@ -1,7 +1,7 @@
 data:
   data_root: "data/gridsat_patches"
   dataset_index: "data/dataset_index.json"
-  class_balance_alpha: 0.3   # for reweighing sampling probabilities
+  class_balance_alpha: 0.6    # for reweighing sampling probabilities
   batch_size: 4
   num_workers: 2
   image_size: 256
