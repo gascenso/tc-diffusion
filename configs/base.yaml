@@ -1,7 +1,8 @@
 data:
   data_root: "data/gridsat_patches"
   dataset_index: "data/dataset_index.json"
-  class_balance_alpha: 0.6    # for reweighing sampling probabilities
+  class_balance_alpha: 0.6
+  class_balance_alpha_eval: 1.0   # use empirical distribution for val/test
   batch_size: 4
   num_workers: 2
   image_size: 256
