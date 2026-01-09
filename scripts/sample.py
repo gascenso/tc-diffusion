@@ -59,7 +59,7 @@ def parse_args():
     p.add_argument(
         "--use_ema",
         action="store_true",
-        help="If set, load EMA weights (weights_ema_best.weights.h5) instead of raw best weights.",
+        help="If set, load EMA weights (weights_ema_best_val.weights.h5) instead of raw best weights.",
     )
     return p.parse_args()
 
@@ -83,9 +83,9 @@ if __name__ == "__main__":
     diffusion = Diffusion(cfg)
 
     if args.use_ema:
-        weights_path = f"runs/{args.name}/weights_ema_best.weights.h5"
+        weights_path = f"runs/{args.name}/weights_ema_best_val.weights.h5"
     else:
-        weights_path = f"runs/{args.name}/weights_best.weights.h5"
+        weights_path = f"runs/{args.name}/weights_best_val.weights.h5"
 
     print(f"Loading weights from {weights_path}")
     model.load_weights(weights_path)
