@@ -82,13 +82,32 @@ if __name__ == "__main__":
     model = build_unet(cfg)
     diffusion = Diffusion(cfg)
 
-    if args.use_ema:
-        weights_path = f"runs/{args.name}/weights_ema_best_val.weights.h5"
-    else:
-        weights_path = f"runs/{args.name}/weights_best_val.weights.h5"
+    run_dir = Path("runs") / args.name
 
+    def resolve_weights_path(use_ema: bool) -> Path:
+        # Prefer the newer naming used by train_loop.py, but fall back to legacy names if present.
+        if use_ema:
+            candidates = [
+                run_dir / "weights_ema_best_val.weights.h5",
+                run_dir / "weights_ema_best.weights.h5",
+            ]
+        else:
+            candidates = [
+                run_dir / "weights_best_val.weights.h5",
+                run_dir / "weights_best.weights.h5",
+            ]
+
+        for p in candidates:
+            if p.exists():
+                return p
+
+        raise FileNotFoundError(
+            f"Could not find weights. Tried: {[str(p) for p in candidates]}"
+        )
+
+    weights_path = resolve_weights_path(args.use_ema)
     print(f"Loading weights from {weights_path}")
-    model.load_weights(weights_path)
+    model.load_weights(str(weights_path))
 
     cond_value = None if args.uncond else args.ss_cat
 
