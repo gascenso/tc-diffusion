@@ -8,7 +8,9 @@ data:
   bt_min_k: 117.0
   bt_max_k: 348.0
   max_files: 10000            # limit for testing, REMOVE LATER
-  
+  split_dir: data/splits
+  split: train              # train / val / test
+
 conditioning:
   num_ss_classes: 6           # 0-5 Saffir-Simpson categories
   use_wind_speed: false       # we'll wire this later
@@ -34,7 +36,8 @@ training:
   ema_decay: 0.9999
   log_interval_steps: 10
   mixed_precision: false
-
+  val_every_epochs: 1
+  val_steps: 500
   early_stopping:
     enabled: true
     patience_epochs: 10   # number of epochs with no improvement before stopping
