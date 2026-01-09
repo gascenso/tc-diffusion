@@ -101,6 +101,17 @@ def _save_state(out_dir: Path, state: dict):
         json.dump(state, f, indent=2)
     tmp.replace(sp)
 
+def evaluate_loss(diffusion, model, ds_val, val_steps: int):
+    """Compute mean diffusion loss over val_steps batches."""
+    loss_sum = 0.0
+    n = 0
+    for batch, (x0, cond) in enumerate(ds_val):
+        if batch >= val_steps:
+            break
+        loss = diffusion.loss(model, x0, cond)
+        loss_sum += float(loss.numpy())
+        n += 1
+    return loss_sum / max(1, n)
 
 def train(cfg, resume: bool = False):
     # GPU memory growth
@@ -112,7 +123,19 @@ def train(cfg, resume: bool = False):
         except Exception:
             pass
 
-    ds = create_dataset(cfg)
+    # --- build train/val datasets (split is controlled via cfg["data"]["split"]) ---
+    data_cfg = cfg.setdefault("data", {})
+    orig_split = data_cfg.get("split", "train")
+
+    data_cfg["split"] = "train"
+    ds_train = create_dataset(cfg)
+
+    data_cfg["split"] = "val"
+    ds_val = create_dataset(cfg)
+
+    # restore (so cfg isn't left in a surprising state)
+    data_cfg["split"] = orig_split
+    
     model = build_unet(cfg)
     diffusion = Diffusion(cfg)
 
@@ -123,6 +146,8 @@ def train(cfg, resume: bool = False):
     lr = float(cfg["training"]["lr"])
     num_epochs = int(cfg["training"]["num_epochs"])
     steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 2000))
+    val_every_epochs = int(cfg["training"].get("val_every_epochs", 1))
+    val_steps = int(cfg["training"].get("val_steps", 200))
     log_interval = int(cfg["training"]["log_interval_steps"])
     optimizer = keras.optimizers.Adam(learning_rate=lr)
 
@@ -144,6 +169,7 @@ def train(cfg, resume: bool = False):
 
     epoch_indices = []
     epoch_losses = []
+    val_losses = []
 
     if resume:
         state = _load_state(out_dir)
@@ -175,6 +201,7 @@ def train(cfg, resume: bool = False):
             # If you want continuous loss curves across resumes:
             epoch_indices = list(state.get("epoch_indices", []))
             epoch_losses = list(state.get("epoch_losses", []))
+            val_losses = list(state.get("val_losses", []))
 
             print(
                 f"[resume] start_epoch={start_epoch}, best_epoch={best_epoch_idx}, "
@@ -187,7 +214,7 @@ def train(cfg, resume: bool = False):
         epoch_loss_sum = 0.0
         epoch_batches = 0
 
-        pbar = tqdm(ds, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+        pbar = tqdm(ds_train, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
 
         for batch, (x0, cond) in enumerate(pbar):
             if batch >= steps_per_epoch:
@@ -214,6 +241,11 @@ def train(cfg, resume: bool = False):
         epoch_losses.append(epoch_loss)
 
         print(f"Epoch {epoch+1} mean loss: {epoch_loss:.6f}")
+        val_loss = None
+        if (epoch + 1) % val_every_epochs == 0:
+            val_loss = evaluate_loss(diffusion, model, ds_val, val_steps=val_steps)
+            val_losses.append(val_loss if val_loss is not None else None)
+            print(f"Epoch {epoch+1} val mean loss: {val_loss:.6f}")
 
         # ----- ALWAYS save "last" -----
         last_path = out_dir / f"weights_last.epoch_{epoch+1}.weights.h5"
@@ -229,17 +261,21 @@ def train(cfg, resume: bool = False):
             print(f"  Saved EMA last weights to {ema_last_path}")
         print(f"  Saved last weights to {last_path}")
 
-        # ----- check for improvement (best) -----
-        if best_epoch_loss - epoch_loss > min_delta:
-            best_epoch_loss = epoch_loss
+        # ----- check for improvement (best) based on VAL when available -----
+        metric = val_loss if val_loss is not None else epoch_loss
+
+        if best_epoch_loss - metric > min_delta:
+            best_epoch_loss = metric
             best_epoch_idx = epoch + 1
             epochs_without_improvement = 0
 
-            best_path = out_dir / "weights_best.weights.h5"
+            # Save "best-by-val" (or best-by-train if val_loss None)
+            best_path = out_dir / "weights_best_val.weights.h5"
             model.save_weights(best_path)
-            print(f"  New best model (epoch {best_epoch_idx}), saved to {best_path}")
+            print(f"  New best model (epoch {best_epoch_idx}), saved to {best_path} (metric={best_epoch_loss:.6f})")
+
             if use_ema and ema is not None:
-                best_ema_path = out_dir / "weights_ema_best.weights.h5"
+                best_ema_path = out_dir / "weights_ema_best_val.weights.h5"
                 snap = ema.get_model_weights_snapshot()
                 ema.copy_to_model()
                 model.save_weights(best_ema_path)
@@ -260,6 +296,7 @@ def train(cfg, resume: bool = False):
                 "epochs_without_improvement": epochs_without_improvement,
                 "epoch_indices": epoch_indices,
                 "epoch_losses": epoch_losses,
+                "val_losses": val_losses,
             },
         )
 

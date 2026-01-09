@@ -57,7 +57,13 @@ def compute_class_sampling_probs(
     probs = {c: weights[c] / Z for c in weights}
     return probs
 
-
+def load_split_file_set(split_dir: Path, split: str) -> set[str]:
+    fp = split_dir / f"files_{split}.txt"
+    if not fp.exists():
+        raise FileNotFoundError(f"Split file list not found: {fp}")
+    with fp.open("r") as f:
+        return set(line.strip() for line in f if line.strip())
+    
 # ------------------------------------------------------------
 # Generator
 # ------------------------------------------------------------
@@ -128,6 +134,21 @@ def create_dataset(cfg) -> tf.data.Dataset:
 
     # ---- load index ----
     class_to_files = load_dataset_index(index_path)
+    # apply split
+    split = data_cfg.get("split", "train")
+    split_dir = Path(data_cfg.get("split_dir", "data/splits"))
+    allowed = load_split_file_set(split_dir, split)
+
+    # Filter class->files to this split
+    class_to_files = {
+        c: [p for p in paths if p in allowed]
+        for c, paths in class_to_files.items()
+    }
+
+    # Sanity: ensure non-empty
+    total = sum(len(v) for v in class_to_files.values())
+    if total == 0:
+        raise RuntimeError(f"No files left after applying split='{split}'. Check split manifests and dataset_index paths.")
 
     # ---- compute sampling probabilities ----
     class_probs = compute_class_sampling_probs(class_to_files, alpha)
