@@ -165,8 +165,12 @@ def build_unet(cfg):
 
     # Safety: clip to valid range [0, num_ss_classes-1] before applying CFG.
     cond_clipped = layers.Lambda(
-        lambda c: tf.clip_by_value(tf.cast(c, tf.int32), 0, num_ss_classes - 1),
-        name="ss_cat_clip",
+        lambda c: tf.where(
+            tf.equal(tf.cast(c, tf.int32), tf.cast(null_label, tf.int32)),
+            tf.cast(c, tf.int32),  # keep null label as-is
+            tf.clip_by_value(tf.cast(c, tf.int32), 0, num_ss_classes - 1),
+        ),
+        name="ss_cat_clip_preserve_null",
     )(cond_in)
 
     cond_dropped = ClassifierFreeCondDropout(
