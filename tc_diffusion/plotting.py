@@ -38,7 +38,7 @@ def save_image_grid(x, path, bt_min_k, bt_max_k, ncols=4):
 
         if i < B:
             im = bt_k[i, ..., 0]
-            im_plot = ax.imshow(im, origin="lower")
+            im_plot = ax.imshow(im, origin="lower", cmap='gist_ncar')
         else:
             ax.imshow(np.zeros((H, W)), origin="lower")
 
