@@ -125,11 +125,9 @@ class Diffusion:
         sqrt_one_minus_alpha_bar = tf.sqrt(1.0 - alpha_bar_t)
         sqrt_recip_alpha_t = 1.0 / tf.sqrt(alpha_t)
 
-        if guidance_scale is None:
-            guidance_scale = 0.0
-        guidance_scale = tf.cast(guidance_scale, tf.float32)
+        gs = 0.0 if guidance_scale is None else float(guidance_scale)
 
-        if guidance_scale > 0.0:
+        if gs > 0.0:
             # unconditional labels: the special null id
             cond_null = tf.fill([bsz], tf.cast(self.null_label, tf.int32))
 
@@ -141,7 +139,7 @@ class Diffusion:
             eps_all = model([x_in, t_in, c_in], training=False)
             eps_cond, eps_uncond = tf.split(eps_all, num_or_size_splits=2, axis=0)
 
-            eps_theta = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+            eps_theta = eps_uncond + tf.cast(gs, tf.float32) * (eps_cond - eps_uncond)
         else:
             eps_theta = model([x_t, t, cond], training=False)
 
