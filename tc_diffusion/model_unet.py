@@ -227,7 +227,7 @@ def build_unet(cfg):
         # upsample except at the highest-res level (level 0) – but we’ve stored skip before pool,
         # so we first upsample then concat
         if level != len(channel_mults) - 1:
-            h = layers.UpSampling2D(size=2, interpolation="nearest", name=f"up_l{level}_up")(h)
+            h = layers.UpSampling2D(size=2, interpolation="bilinear", name=f"up_l{level}_up")(h)
 
         # After upsampling, h should match skip spatial dims
         h = layers.Concatenate(name=f"up_l{level}_concat")([h, skip])
