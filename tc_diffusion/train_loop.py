@@ -101,12 +101,17 @@ def _save_state(out_dir: Path, state: dict):
         json.dump(state, f, indent=2)
     tmp.replace(sp)
 
-def evaluate_loss(diffusion, model, ds_val, val_steps: int):
-    """Compute mean diffusion loss over val_steps batches."""
+def evaluate_loss(diffusion, model, ds_val, val_steps: int | None = None):
+    """Compute mean diffusion loss.
+
+    If val_steps is None or <=0, iterate over the *entire* ds_val.
+    This is the recommended mode for finite, deterministic validation sets.
+    """
+    full_pass = (val_steps is None) or (int(val_steps) <= 0)
     loss_sum = 0.0
     n = 0
     for batch, (x0, cond) in enumerate(ds_val):
-        if batch >= val_steps:
+        if (not full_pass) and batch >= int(val_steps):
             break
         loss = diffusion.loss(model, x0, cond)
         loss_sum += float(loss.numpy())
@@ -127,14 +132,25 @@ def train(cfg, resume: bool = False):
     data_cfg = cfg.setdefault("data", {})
     orig_split = data_cfg.get("split", "train")
 
+    # Preserve eval_mode if present
+    orig_eval_mode = data_cfg.get("eval_mode", "full")
+
     data_cfg["split"] = "train"
     ds_train = create_dataset(cfg)
 
+    # Validation: build two deterministic finite sets:
+    #   1) full pass over the val split (micro average)
+    #   2) fixed balanced subset (tail-sensitive but stable)
     data_cfg["split"] = "val"
-    ds_val = create_dataset(cfg)
+    data_cfg["eval_mode"] = "full"
+    ds_val_full = create_dataset(cfg)
+
+    data_cfg["eval_mode"] = "balanced_fixed"
+    ds_val_balanced = create_dataset(cfg)
 
     # restore (so cfg isn't left in a surprising state)
     data_cfg["split"] = orig_split
+    data_cfg["eval_mode"] = orig_eval_mode
     
     model = build_unet(cfg)
     diffusion = Diffusion(cfg)
@@ -147,7 +163,8 @@ def train(cfg, resume: bool = False):
     num_epochs = int(cfg["training"]["num_epochs"])
     steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 2000))
     val_every_epochs = int(cfg["training"].get("val_every_epochs", 1))
-    val_steps = int(cfg["training"].get("val_steps", 200))
+    # If val_steps <= 0, we will do a full deterministic pass.
+    val_steps = int(cfg["training"].get("val_steps", 0))
     log_interval = int(cfg["training"]["log_interval_steps"])
     optimizer = keras.optimizers.Adam(learning_rate=lr)
 
@@ -163,6 +180,7 @@ def train(cfg, resume: bool = False):
     # ----- resume state -----
     start_epoch = 0
     best_epoch_loss = float("inf")
+    best_epoch_balanced = float("inf")
     best_epoch_idx = -1
     epochs_without_improvement = 0
     global_step = 0
@@ -170,6 +188,7 @@ def train(cfg, resume: bool = False):
     epoch_indices = []
     epoch_losses = []
     val_losses = []
+    val_losses_balanced = []
 
     if resume:
         state = _load_state(out_dir)
@@ -194,6 +213,7 @@ def train(cfg, resume: bool = False):
             # Continue from next epoch
             start_epoch = int(state.get("last_epoch", 0))
             best_epoch_loss = float(state.get("best_epoch_loss", best_epoch_loss))
+            best_epoch_balanced = float(state.get("best_epoch_balanced", best_epoch_balanced))
             best_epoch_idx = int(state.get("best_epoch", best_epoch_idx))
             epochs_without_improvement = int(state.get("epochs_without_improvement", 0))
             global_step = int(state.get("global_step", 0))
@@ -202,6 +222,7 @@ def train(cfg, resume: bool = False):
             epoch_indices = list(state.get("epoch_indices", []))
             epoch_losses = list(state.get("epoch_losses", []))
             val_losses = list(state.get("val_losses", []))
+            val_losses_balanced = list(state.get("val_losses_balanced", []))
 
             print(
                 f"[resume] start_epoch={start_epoch}, best_epoch={best_epoch_idx}, "
@@ -242,10 +263,14 @@ def train(cfg, resume: bool = False):
 
         print(f"Epoch {epoch+1} mean loss: {epoch_loss:.6f}")
         val_loss = None
+        val_loss_balanced = None
         if (epoch + 1) % val_every_epochs == 0:
-            val_loss = evaluate_loss(diffusion, model, ds_val, val_steps=val_steps)
+            val_loss = evaluate_loss(diffusion, model, ds_val_full, val_steps=val_steps)
+            val_loss_balanced = evaluate_loss(diffusion, model, ds_val_balanced, val_steps=val_steps)
             val_losses.append(val_loss if val_loss is not None else None)
-            print(f"Epoch {epoch+1} val mean loss: {val_loss:.6f}")
+            val_losses_balanced.append(val_loss_balanced if val_loss_balanced is not None else None)
+            print(f"Epoch {epoch+1} val mean loss (full): {val_loss:.6f}")
+            print(f"Epoch {epoch+1} val mean loss (balanced_fixed): {val_loss_balanced:.6f}")
 
         # ----- ALWAYS save "last" -----
         last_path = out_dir / f"weights_last.epoch_{epoch+1}.weights.h5"
@@ -261,10 +286,11 @@ def train(cfg, resume: bool = False):
             print(f"  Saved EMA last weights to {ema_last_path}")
         print(f"  Saved last weights to {last_path}")
 
-        # ----- check for improvement (best) based on VAL when available -----
+        # ----- check for improvement (best) based on FULL val when available -----
         metric = val_loss if val_loss is not None else epoch_loss
 
-        if best_epoch_loss - metric > min_delta:
+        improved = (best_epoch_loss - metric > min_delta)
+        if improved:
             best_epoch_loss = metric
             best_epoch_idx = epoch + 1
             epochs_without_improvement = 0
@@ -285,6 +311,21 @@ def train(cfg, resume: bool = False):
             epochs_without_improvement += 1
             print(f"  No significant improvement ({epochs_without_improvement}/{patience_epochs})")
 
+        # Also track a best model on the balanced_fixed validation metric (does NOT drive early stopping).
+        if val_loss_balanced is not None and (best_epoch_balanced - val_loss_balanced > min_delta):
+            best_epoch_balanced = val_loss_balanced
+            best_bal_path = out_dir / "weights_best_balanced_val.weights.h5"
+            model.save_weights(best_bal_path)
+            print(f"  New best BALANCED model, saved to {best_bal_path} (metric={best_epoch_balanced:.6f})")
+            if use_ema and ema is not None:
+                best_bal_ema_path = out_dir / "weights_ema_best_balanced_val.weights.h5"
+                snap = ema.get_model_weights_snapshot()
+                ema.copy_to_model()
+                model.save_weights(best_bal_ema_path)
+                ema.restore_model_weights_snapshot(snap)
+                print(f"  New best BALANCED EMA model, saved to {best_bal_ema_path}")
+
+
         # ----- persist run state (for resuming) -----
         _save_state(
             out_dir,
@@ -293,10 +334,12 @@ def train(cfg, resume: bool = False):
                 "global_step": global_step,
                 "best_epoch": best_epoch_idx,
                 "best_epoch_loss": best_epoch_loss,
+                "best_epoch_balanced": best_epoch_balanced,
                 "epochs_without_improvement": epochs_without_improvement,
                 "epoch_indices": epoch_indices,
                 "epoch_losses": epoch_losses,
                 "val_losses": val_losses,
+                "val_losses_balanced": val_losses_balanced,
             },
         )
 

@@ -10,6 +10,10 @@ data:
   bt_max_k: 348.0
   split_dir: data/splits
   split: train              # train / val / test
+  finite_eval: true
+  eval_seed: 42
+  eval_mode: full
+  val_balanced_per_class: 5 # used only when eval_mode: balanced_fixed
 
 conditioning:
   num_ss_classes: 6           # 0-5 Saffir-Simpson categories
@@ -31,13 +35,13 @@ diffusion:
 
 training:
   num_epochs: 25
-  steps_per_epoch: 2000
+  steps_per_epoch: 50
   lr: 1e-4
   ema_decay: 0.9999
   log_interval_steps: 10
   mixed_precision: false
   val_every_epochs: 1
-  val_steps: 500
+  val_steps: 0
   early_stopping:
     enabled: true
     patience_epochs: 10   # number of epochs with no improvement before stopping
