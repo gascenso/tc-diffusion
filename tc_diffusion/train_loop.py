@@ -267,8 +267,8 @@ def train(cfg, resume: bool = False):
         if (epoch + 1) % val_every_epochs == 0:
             val_loss = evaluate_loss(diffusion, model, ds_val_full, val_steps=val_steps)
             val_loss_balanced = evaluate_loss(diffusion, model, ds_val_balanced, val_steps=val_steps)
-            val_losses.append(val_loss if val_loss is not None else None)
-            val_losses_balanced.append(val_loss_balanced if val_loss_balanced is not None else None)
+            val_losses.append(val_loss)
+            val_losses_balanced.append(val_loss_balanced)
             print(f"Epoch {epoch+1} val mean loss (full): {val_loss:.6f}")
             print(f"Epoch {epoch+1} val mean loss (balanced_fixed): {val_loss_balanced:.6f}")
 

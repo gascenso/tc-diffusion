@@ -6,7 +6,6 @@
 
 import argparse
 from pathlib import Path
-import shutil
 import yaml
 import json
 import datetime
@@ -79,6 +78,11 @@ if __name__ == "__main__":
             except Exception:
                 pass
         for p in [
+            run_dir / "weights_best_val.weights.h5",
+            run_dir / "weights_ema_best_val.weights.h5",
+            run_dir / "weights_best_balanced_val.weights.h5",
+            run_dir / "weights_ema_best_balanced_val.weights.h5",
+            # keep legacy too (optional)
             run_dir / "weights_best.weights.h5",
             run_dir / "weights_ema_best.weights.h5",
             run_dir / "run_state.json",

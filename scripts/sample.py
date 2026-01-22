@@ -7,7 +7,6 @@
 
 import argparse
 from pathlib import Path
-import glob
 import shutil
 
 import tensorflow as tf

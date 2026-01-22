@@ -292,13 +292,7 @@ def create_dataset(cfg) -> tf.data.Dataset:
     allowed = load_split_file_set(split_dir, split)
 
     # Use alpha from config only for training; use empirical (alpha=1.0) for val/test
-    alpha_train = float(data_cfg.get("class_balance_alpha", 1.0))
-    alpha_eval = float(data_cfg.get("class_balance_alpha_eval", 1.0))  # optional override
-
-    if split in ("val", "test"):
-        alpha = alpha_eval
-    else:
-        alpha = alpha_train
+    alpha = float(data_cfg.get("class_balance_alpha", 1.0))
 
     # Filter class->files to this split
     class_to_files = {

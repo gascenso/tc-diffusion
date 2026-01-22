@@ -2,14 +2,11 @@ data:
   data_root: "data/gridsat_patches"
   dataset_index: "data/dataset_index.json"
   class_balance_alpha: 0.6
-  class_balance_alpha_eval: 1.0   # use empirical distribution for val/test
   batch_size: 4
-  num_workers: 2
   image_size: 256
   bt_min_k: 117.0
   bt_max_k: 348.0
   split_dir: data/splits
-  split: train              # train / val / test
   finite_eval: true
   eval_seed: 42
   eval_mode: full
@@ -34,14 +31,13 @@ diffusion:
   loss_type: "eps_mse"
 
 training:
-  num_epochs: 25
-  steps_per_epoch: 50
+  num_epochs: 50
+  steps_per_epoch: 2000
   lr: 1e-4
   ema_decay: 0.9999
   log_interval_steps: 10
   mixed_precision: false
   val_every_epochs: 1
-  val_steps: 0
   early_stopping:
     enabled: true
     patience_epochs: 10   # number of epochs with no improvement before stopping
