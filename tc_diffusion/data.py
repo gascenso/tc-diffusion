@@ -263,7 +263,7 @@ class BalancedTCGenerator:
 # Public API
 # ------------------------------------------------------------
 
-def create_dataset(cfg) -> tf.data.Dataset:
+def create_dataset(cfg, split) -> tf.data.Dataset:
     """
     Create a tf.data.Dataset.
 
@@ -287,7 +287,6 @@ def create_dataset(cfg) -> tf.data.Dataset:
     # ---- load index ----
     class_to_files = load_dataset_index(index_path)
     # apply split
-    split = data_cfg.get("split", "train")
     split_dir = Path(data_cfg.get("split_dir", "data/splits"))
     allowed = load_split_file_set(split_dir, split)
 

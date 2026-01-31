@@ -128,28 +128,24 @@ def train(cfg, resume: bool = False):
         except Exception:
             pass
 
-    # --- build train/val datasets (split is controlled via cfg["data"]["split"]) ---
+    # --- build train/val datasets ---
     data_cfg = cfg.setdefault("data", {})
-    orig_split = data_cfg.get("split", "train")
 
     # Preserve eval_mode if present
     orig_eval_mode = data_cfg.get("eval_mode", "full")
 
-    data_cfg["split"] = "train"
-    ds_train = create_dataset(cfg)
+    ds_train = create_dataset(cfg, split="train")
 
     # Validation: build two deterministic finite sets:
     #   1) full pass over the val split (micro average)
     #   2) fixed balanced subset (tail-sensitive but stable)
-    data_cfg["split"] = "val"
     data_cfg["eval_mode"] = "full"
-    ds_val_full = create_dataset(cfg)
+    ds_val_full = create_dataset(cfg, split="val")
 
     data_cfg["eval_mode"] = "balanced_fixed"
     ds_val_balanced = create_dataset(cfg)
 
     # restore (so cfg isn't left in a surprising state)
-    data_cfg["split"] = orig_split
     data_cfg["eval_mode"] = orig_eval_mode
     
     model = build_unet(cfg)
