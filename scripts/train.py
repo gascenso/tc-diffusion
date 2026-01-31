@@ -6,6 +6,7 @@
 
 import argparse
 from pathlib import Path
+import shutil
 import yaml
 import json
 import datetime
@@ -62,36 +63,12 @@ if __name__ == "__main__":
     runs_root = Path("runs")
     run_dir = runs_root / args.name
 
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    if not args.resume:
+    if run_dir.exists() and not args.resume:
         # Starting fresh in an existing directory is allowed.
         # Clean up files that would cause accidental resume or confusion.
-        for p in run_dir.glob("weights_last.epoch_*.weights.h5"):
-            try:
-                p.unlink()
-            except Exception:
-                pass
-        for p in run_dir.glob("weights_ema_last.epoch_*.weights.h5"):
-            try:
-                p.unlink()
-            except Exception:
-                pass
-        for p in [
-            run_dir / "weights_best_val.weights.h5",
-            run_dir / "weights_ema_best_val.weights.h5",
-            run_dir / "weights_best_balanced_val.weights.h5",
-            run_dir / "weights_ema_best_balanced_val.weights.h5",
-            # keep legacy too (optional)
-            run_dir / "weights_best.weights.h5",
-            run_dir / "weights_ema_best.weights.h5",
-            run_dir / "run_state.json",
-        ]:
-            if p.exists():
-                try:
-                    p.unlink()
-                except Exception:
-                    pass
+        shutil.rmtree(run_dir)
+
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     # Inject output_dir into config so everything uses this run folder
     cfg.setdefault("experiment", {})
