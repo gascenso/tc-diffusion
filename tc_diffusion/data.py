@@ -307,13 +307,13 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
     # --------------------------------------------------------
     # Finite evaluation dataset (recommended)
     # --------------------------------------------------------
-    finite_eval = bool(data_cfg.get("finite_eval", True))
+
     eval_mode = str(data_cfg.get("eval_mode", "full"))  # 'full' | 'balanced_fixed'
     eval_seed = int(data_cfg.get("eval_seed", seed))
 
     bt_range = (float(data_cfg["bt_min_k"]), float(data_cfg["bt_max_k"]))
 
-    if split in ("val", "test") and finite_eval:
+    if split in ("val", "test"):
         # Build deterministic (path,label) pairs from the split manifest.
         rel_paths, labels = _build_split_pairs(class_to_files, allowed)
         if len(rel_paths) == 0:

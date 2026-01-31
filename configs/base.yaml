@@ -7,7 +7,6 @@ data:
   bt_min_k: 117.0
   bt_max_k: 348.0
   split_dir: data/splits
-  finite_eval: true
   eval_seed: 42
   eval_mode: full
   val_balanced_per_class: 5 # used only when eval_mode: balanced_fixed
