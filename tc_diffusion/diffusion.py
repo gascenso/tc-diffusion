@@ -36,6 +36,48 @@ class Diffusion:
         self.alphas_cumprod_prev = tf.constant(alphas_cumprod_prev, dtype=tf.float32)
         self.posterior_variance = tf.constant(posterior_variance, dtype=tf.float32)
 
+        # sampling stabilization (high leverage for avoiding clipped extremes)
+        self.dynamic_threshold = bool(cfg["diffusion"].get("dynamic_threshold", True))
+        self.dynamic_threshold_p = float(cfg["diffusion"].get("dynamic_threshold_p", 0.995))
+
+    def _predict_x0_from_eps(self, x_t, t_int, eps_theta):
+        """
+        Reconstruct x0 from epsilon prediction:
+          x0 = (x_t - sqrt(1 - alpha_bar_t) * eps) / sqrt(alpha_bar_t)
+        """
+        alpha_bar_t = tf.cast(self.alphas_cumprod[t_int], tf.float32)  # scalar
+        sqrt_ab = tf.sqrt(alpha_bar_t)
+        sqrt_one_minus_ab = tf.sqrt(1.0 - alpha_bar_t)
+        return (x_t - sqrt_one_minus_ab * eps_theta) / (sqrt_ab + 1e-8)
+
+    def _dynamic_threshold_x0(self, x0, p=0.995, eps=1e-8):
+        """
+        Dynamic thresholding (per-sample).
+        x0: [B,H,W,C] in normalized space.
+
+        Returns:
+          x0_thr: thresholded x0 in [-1,1] (approximately)
+          s: per-sample scale [B,1,1,1]
+        """
+        b = tf.shape(x0)[0]
+        x = tf.reshape(x0, [b, -1])
+        absx = tf.abs(x)
+
+        # percentile index
+        n = tf.shape(absx)[1]
+        k = tf.cast(tf.round(p * tf.cast(n - 1, tf.float32)), tf.int32)
+        k = tf.clip_by_value(k, 0, n - 1)
+
+        absx_sorted = tf.sort(absx, axis=1)
+        s = tf.gather(absx_sorted, k, axis=1)  # [B]
+
+        # Avoid amplifying small values
+        s = tf.maximum(s, 1.0)
+        s = tf.reshape(s, [-1, 1, 1, 1])
+
+        x0_thr = tf.clip_by_value(x0, -s, s) / (s + eps)
+        return x0_thr, s
+
     def _make_beta_schedule(self, name: str, num_steps: int):
         """
         Create a beta schedule.
@@ -144,8 +186,20 @@ class Diffusion:
             eps_theta = model([x_t, t, cond], training=False)
 
         # DDPM mean
+        # --- reconstruct x0, stabilize it, then recompute mean ---
+        x0_pred = self._predict_x0_from_eps(x_t, t_int, eps_theta)
+
+        if self.dynamic_threshold:
+            x0_pred, _ = self._dynamic_threshold_x0(x0_pred, p=self.dynamic_threshold_p)
+
+        # Recompute eps consistent with stabilized x0 (important)
+        # eps = (x_t - sqrt(alpha_bar) * x0) / sqrt(1 - alpha_bar)
+        sqrt_alpha_bar = tf.sqrt(alpha_bar_t)
+        eps_theta = (x_t - sqrt_alpha_bar * x0_pred) / (sqrt_one_minus_alpha_bar + 1e-8)
+
+        # DDPM mean using stabilized eps (equivalently stabilized x0)
         model_mean = sqrt_recip_alpha_t * (
-            x_t - (beta_t / sqrt_one_minus_alpha_bar) * eps_theta
+            x_t - (beta_t / (sqrt_one_minus_alpha_bar + 1e-8)) * eps_theta
         )
         
         posterior_var_t = self.posterior_variance[t_int]  # scalar
