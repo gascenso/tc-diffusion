@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 from .data import create_dataset
 from .model_unet import build_unet
 from .diffusion import Diffusion
+from .evaluation.evaluator import TCEvaluator
 
 class EMA:
     """Exponential Moving Average (EMA) over model weights.
@@ -143,7 +144,7 @@ def train(cfg, resume: bool = False):
     ds_val_full = create_dataset(cfg, split="val")
 
     data_cfg["eval_mode"] = "balanced_fixed"
-    ds_val_balanced = create_dataset(cfg)
+    ds_val_balanced = create_dataset(cfg, split="val")
 
     # restore (so cfg isn't left in a surprising state)
     data_cfg["eval_mode"] = orig_eval_mode
@@ -166,6 +167,11 @@ def train(cfg, resume: bool = False):
 
     out_dir = Path(cfg["experiment"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ----- evaluation -----
+    eval_cfg = cfg.get("evaluation", {})
+    eval_enabled = bool(eval_cfg.get("enabled", True))
+    evaluator = TCEvaluator(cfg) if eval_enabled else None
 
     # ----- early stopping config -----
     es_cfg = cfg["training"].get("early_stopping", {})
@@ -346,6 +352,17 @@ def train(cfg, resume: bool = False):
                 f"(best epoch: {best_epoch_idx}, with loss {best_epoch_loss:.6f})"
             )
             break
+    
+
+    
+    # ----- periodic physics evaluation -----
+    heavy = True
+    tag = 'post_training'
+    try:
+        evaluator.run(model=model, diffusion=diffusion, out_dir=out_dir, tag=tag, heavy=heavy)
+        print(f"  [eval] wrote eval/{tag} (heavy={heavy})")
+    except Exception as e:
+        print(f"  [eval] failed at epoch {epoch+1}: {e}")
 
     return {
         "epoch": epoch_indices,
