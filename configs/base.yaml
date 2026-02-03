@@ -28,6 +28,8 @@ diffusion:
   num_steps: 1000
   beta_schedule: "linear"
   loss_type: "eps_mse"
+  dynamic_threshold: true
+  dynamic_threshold_p: 0.995
 
 training:
   num_epochs: 50
@@ -41,6 +43,34 @@ training:
     enabled: true
     patience_epochs: 10   # number of epochs with no improvement before stopping
     min_delta: 1.0e-4     # minimum improvement in loss to count as "better"
+
+evaluation:
+  enabled: true
+  every_epochs: 5
+
+  # run heavier eval less frequently (more samples -> smoother curves)
+  heavy_every_epochs: 15
+  n_per_class_light: 5
+  n_per_class_heavy: 50
+
+  # generation settings
+  guidance_scale: 0.0         # set >0 once you rely on CFG at inference
+  sampler: "ddpm"             # "ddpm" supported; can extend later
+  seed: 123
+
+  # real reference sampling (matched by class)
+  real_seed: 123
+
+  # feature + diversity
+  profile_bins: 96            # radial bins for profiles (higher -> more detailed, slower)
+  psd_bins: 96                # radial bins for power spectrum
+
+  proxy_classifier:
+    enabled: true
+    max_train_per_class: 2000
+    C: 1.0
+    solver: "lbfgs"
+    max_iter: 200
 
 directories:
   windows_samples_path: "/mnt/c/Users/guido/Desktop/sample.png"
