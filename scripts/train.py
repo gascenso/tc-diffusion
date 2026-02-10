@@ -2,6 +2,7 @@
 
 # Usage:
 # (start new run)     python -m scripts.train --name <RUN_NAME>
+# (override config)   python -m scripts.train --name <RUN_NAME> --override training.lr=5e-4 data.batch_size=8
 # (resume run)        python -m scripts.train --name <RUN_NAME> --resume
 
 import argparse
