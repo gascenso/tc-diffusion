@@ -7,7 +7,6 @@
 
 import argparse
 from pathlib import Path
-import shutil
 
 import tensorflow as tf
 
@@ -133,8 +132,3 @@ if __name__ == "__main__":
         bt_max_k=float(cfg["data"]["bt_max_k"]),
     )
     print(f"Saved sample grid to {out_path}")
-
-    win_path = Path(cfg["directories"]["windows_samples_path"])
-    win_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(out_path, win_path)
-    print(f"Copied sample grid to Windows path {win_path}")

@@ -66,6 +66,3 @@ evaluation:
     C: 1.0
     solver: "lbfgs"
     max_iter: 200
-
-directories:
-  windows_samples_path: "/mnt/c/Users/guido/Desktop/sample.png"
