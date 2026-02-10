@@ -70,13 +70,7 @@ def _write_json(path: Path, obj: Dict[str, Any]):
 # -----------------------------------------------------------------------------
 
 def _load_one_bt_k(nc_path: Path, bt_min_k: float, bt_max_k: float) -> np.ndarray:
-    with xr.open_dataset(
-        nc_path,
-        engine="netcdf4",
-        decode_cf=False,
-        mask_and_scale=False,
-        cache=False,
-    ) as ds:
+    with xr.open_dataset(nc_path, engine="netcdf4") as ds:
         bt = ds["bt"].values.astype(np.float32)
 
     bt = np.nan_to_num(bt, nan=bt_min_k)
@@ -312,7 +306,6 @@ class TCEvaluator:
         eval_root.mkdir(parents=True, exist_ok=True)
 
         gen_by_class: Dict[int, np.ndarray] = {}
-        gen_by_class_vis: Dict[int, np.ndarray] = {}
 
         class_iter = range(num_classes)
         if show_progress:
@@ -338,8 +331,6 @@ class TCEvaluator:
 
             gen_k_raw = denorm_bt(x, bt_min_k, bt_max_k)[..., 0]
             gen_by_class[c] = gen_k_raw
-
-            gen_by_class_vis[c] = np.clip(gen_k_raw, bt_min_k, bt_max_k)
 
             save_image_grid(
                 x,
@@ -370,6 +361,69 @@ class TCEvaluator:
             )
             per_class_metrics[c] = m
             per_class_curves[c] = cur
+
+        plots_root = eval_root / "plots"
+        for c, cur in per_class_curves.items():
+            class_plot_dir = plots_root / f"class_{c}"
+
+            bins = np.asarray(cur["bt_bins"], dtype=np.float32)
+            hist_real = np.asarray(cur["hist_real"], dtype=np.float32)
+            hist_gen = np.asarray(cur["hist_gen"], dtype=np.float32)
+            plot_hist_overlay(
+                out_path=class_plot_dir / "pixel_hist_bt.png",
+                bins=bins,
+                real_hist=hist_real,
+                gen_hist=hist_gen,
+                title=f"Class {c}: Pixel BT Histogram",
+                xlabel="Brightness temperature [K]",
+            )
+
+            r_mean_real_mu = np.asarray(cur["radial_mean_real_mu"], dtype=np.float32)
+            r_mean_real_sd = np.asarray(cur["radial_mean_real_sd"], dtype=np.float32)
+            r_mean_gen_mu = np.asarray(cur["radial_mean_gen_mu"], dtype=np.float32)
+            r_mean_gen_sd = np.asarray(cur["radial_mean_gen_sd"], dtype=np.float32)
+            r = np.linspace(0.0, 1.0, num=r_mean_real_mu.shape[0], dtype=np.float32)
+            plot_radial_profiles(
+                out_path=class_plot_dir / "radial_mean.png",
+                r=r,
+                real_mean=r_mean_real_mu,
+                real_std=r_mean_real_sd,
+                gen_mean=r_mean_gen_mu,
+                gen_std=r_mean_gen_sd,
+                title=f"Class {c}: Radial Mean Profile",
+                ylabel="BT [K]",
+            )
+
+            r_az_real_mu = np.asarray(cur["radial_azstd_real_mu"], dtype=np.float32)
+            r_az_real_sd = np.asarray(cur["radial_azstd_real_sd"], dtype=np.float32)
+            r_az_gen_mu = np.asarray(cur["radial_azstd_gen_mu"], dtype=np.float32)
+            r_az_gen_sd = np.asarray(cur["radial_azstd_gen_sd"], dtype=np.float32)
+            r_az = np.linspace(0.0, 1.0, num=r_az_real_mu.shape[0], dtype=np.float32)
+            plot_radial_profiles(
+                out_path=class_plot_dir / "radial_azstd.png",
+                r=r_az,
+                real_mean=r_az_real_mu,
+                real_std=r_az_real_sd,
+                gen_mean=r_az_gen_mu,
+                gen_std=r_az_gen_sd,
+                title=f"Class {c}: Radial Azimuthal Std",
+                ylabel="Azimuthal std(BT) [K]",
+            )
+
+            psd_real_mu = np.asarray(cur["psd_real_mu"], dtype=np.float32)
+            psd_real_sd = np.asarray(cur["psd_real_sd"], dtype=np.float32)
+            psd_gen_mu = np.asarray(cur["psd_gen_mu"], dtype=np.float32)
+            psd_gen_sd = np.asarray(cur["psd_gen_sd"], dtype=np.float32)
+            k = np.linspace(0.0, 1.0, num=psd_real_mu.shape[0], dtype=np.float32)
+            plot_psd(
+                out_path=class_plot_dir / "psd_radial.png",
+                k=k,
+                real_mean=psd_real_mu,
+                real_std=psd_real_sd,
+                gen_mean=psd_gen_mu,
+                gen_std=psd_gen_sd,
+                title=f"Class {c}: Radial PSD",
+            )
 
         report = {
             "tag": tag,
