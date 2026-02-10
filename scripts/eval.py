@@ -2,7 +2,7 @@
 
 # Usage:
 # (evaluate finished run)     python -m scripts.eval --name <RUN_NAME>
-# (override config)           python -m scripts.eval --name <RUN_NAME> --override evaluation.num_n_per_class_heavy=100
+# (override config)           python -m scripts.eval --name <RUN_NAME> --override evaluation.n_per_class_heavy=100
 # (show progress bar)         python -m scripts.eval --name <RUN_NAME> --show_progress
 
 import argparse
@@ -16,7 +16,12 @@ from tc_diffusion.evaluation.evaluator import TCEvaluator
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=str, default="configs/base.yaml")
+    p.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Config path. Defaults to runs/<name>/config.yaml saved at training time.",
+    )
     p.add_argument("--override", nargs="*", default=[])
     p.add_argument("--name", type=str, required=True, help="Name of run under runs/ to load weights from")
     p.add_argument("--out_dir", type=str, default=None, help="Output dir (defaults to run dir inferred from weights path)")
@@ -28,12 +33,19 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    cfg = load_config(args.config, overrides=args.override)
 
-    weights_path = Path("runs") / args.name / "weights_ema_best_val.weights.h5"
+    run_dir = Path("runs") / args.name
+    config_path = Path(args.config) if args.config else (run_dir / "config.yaml")
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Config file not found: {config_path}. "
+            "Pass --config explicitly or ensure the run has a saved config.yaml."
+        )
+    cfg = load_config(str(config_path), overrides=args.override)
+
+    weights_path = run_dir / "weights_ema_best_val.weights.h5"
     if args.out_dir is None:
-        # if weights are in runs/<name>/..., use that as out_dir
-        out_dir = weights_path.parent
+        out_dir = run_dir
     else:
         out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
