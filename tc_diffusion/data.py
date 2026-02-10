@@ -7,9 +7,38 @@ import numpy as np
 import tensorflow as tf
 import xarray as xr
 
-P_AUG      = tf.constant([0.15, 0.20, 0.35, 0.60, 0.75, 0.85], dtype=tf.float32)
-MAX_SHIFT  = tf.constant([2,    2,    2,    2,    2,   2  ], dtype=tf.int32)
-MAX_BARS   = tf.constant([1,    1,    1,    2,    2,    3   ], dtype=tf.int32)
+def _build_aug_policy(num_classes: int) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Return classwise augmentation parameters sized to num_classes."""
+    if int(num_classes) <= 0:
+        raise ValueError(f"num_classes must be > 0, got {num_classes}")
+
+    # Anchor policy for the canonical 6 SS classes; resampled for other counts.
+    p_anchor = np.array([0.15, 0.20, 0.35, 0.60, 0.75, 0.85], dtype=np.float32)
+    shift_anchor = np.array([2, 2, 2, 2, 2, 2], dtype=np.int32)
+    bars_anchor = np.array([1, 1, 1, 2, 2, 3], dtype=np.int32)
+
+    if int(num_classes) == int(p_anchor.shape[0]):
+        p_aug = p_anchor
+        max_shift = shift_anchor
+        max_bars = bars_anchor
+    else:
+        src = np.linspace(0.0, 1.0, num=p_anchor.shape[0], dtype=np.float32)
+        dst = np.linspace(0.0, 1.0, num=int(num_classes), dtype=np.float32)
+        p_aug = np.interp(dst, src, p_anchor).astype(np.float32)
+        max_shift = np.rint(
+            np.interp(dst, src, shift_anchor.astype(np.float32))
+        ).astype(np.int32)
+        max_bars = np.rint(
+            np.interp(dst, src, bars_anchor.astype(np.float32))
+        ).astype(np.int32)
+
+    max_shift = np.maximum(max_shift, 0)
+    max_bars = np.maximum(max_bars, 0)
+    return (
+        tf.constant(p_aug, dtype=tf.float32),
+        tf.constant(max_shift, dtype=tf.int32),
+        tf.constant(max_bars, dtype=tf.int32),
+    )
 
 # ------------------------------------------------------------
 # Utilities
@@ -136,16 +165,22 @@ def random_bar_erasing(x, max_bars, min_w=1, max_w=5, fill_mode="local"):
         return tf.squeeze(out, axis=-1)
     return out
 
-def augment_x_given_y(x, y):
+def augment_x_given_y(
+    x,
+    y,
+    p_aug: tf.Tensor,
+    max_shift_per_class: tf.Tensor,
+    max_bars_per_class: tf.Tensor,
+):
     """
     x: [H,W,1] (or [H,W]) normalized already (e.g., to [-1,1])
     y: int label
     """
     y = tf.cast(y, tf.int32)
 
-    p = tf.gather(P_AUG, y)
-    max_shift = tf.gather(MAX_SHIFT, y)
-    max_bars = tf.gather(MAX_BARS, y)
+    p = tf.gather(p_aug, y)
+    max_shift = tf.gather(max_shift_per_class, y)
+    max_bars = tf.gather(max_bars_per_class, y)
 
     def do_aug():
         x1 = rot90_only(x)
@@ -282,14 +317,7 @@ def _tf_load_one_netcdf(
         rel_path = _decode_path(rel_path_obj)
         nc_path = data_root / rel_path
 
-        # Keep decoding minimal; avoid reading global attrs if possible.
-        with xr.open_dataset(
-            nc_path,
-            engine=engine,
-            decode_cf=False,
-            mask_and_scale=False,
-            cache=False,
-        ) as ds:
+        with xr.open_dataset(nc_path, engine=engine) as ds:
             bt = ds["bt"].values.astype(np.float32)
 
         bt = preprocess_bt(bt, (bt_min, bt_max))
@@ -339,9 +367,6 @@ def _create_finite_eval_dataset(
     # Thread-safety: keep netCDF opens single-threaded.
     map_fn = _tf_load_one_netcdf(data_root, bt_range, engine=engine)
     ds = ds.map(map_fn, num_parallel_calls=int(num_parallel_calls), deterministic=True)
-    ds = ds.map(lambda x, y: (augment_x_given_y(x, y), y),
-            num_parallel_calls=tf.data.AUTOTUNE)
-    
     ds = ds.batch(batch_size, drop_remainder=False)
     ds = ds.prefetch(1)
 
@@ -520,6 +545,11 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
 
     # shuffle only within small buffer (structure comes from sampler)
     ds = ds.shuffle(buffer_size=4 * batch_size, seed=seed)
+    p_aug, max_shift, max_bars = _build_aug_policy(int(cfg["conditioning"]["num_ss_classes"]))
+    ds = ds.map(
+        lambda x, y: (augment_x_given_y(x, y, p_aug, max_shift, max_bars), y),
+        num_parallel_calls=tf.data.AUTOTUNE,
+    )
 
     ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
