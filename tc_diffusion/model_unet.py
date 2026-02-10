@@ -33,12 +33,21 @@ class SinusoidalTimeEmbedding(layers.Layer):
 class GroupNorm(layers.Layer):
     def __init__(self, groups=32, eps=1e-5, **kwargs):
         super().__init__(**kwargs)
-        self.groups = groups
-        self.eps = eps
+        self.requested_groups = int(groups)
+        self.groups = int(groups)
+        self.eps = float(eps)
 
     def build(self, input_shape):
         channels = int(input_shape[-1])
-        self.groups = min(self.groups, channels)
+        if channels is None:
+            raise ValueError("GroupNorm requires a known channel dimension (input_shape[-1]).")
+
+        # Pick the largest G <= requested_groups such that channels % G == 0
+        g = min(self.requested_groups, channels)
+        while g > 1 and (channels % g) != 0:
+            g -= 1
+        self.groups = max(g, 1)
+
         self.gamma = self.add_weight(
             name="gamma",
             shape=(channels,),
@@ -55,16 +64,22 @@ class GroupNorm(layers.Layer):
 
     def call(self, x):
         # x: (B,H,W,C)
-        B, H, W = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2]
-        C = x.shape[-1]
+        B = tf.shape(x)[0]
+        H = tf.shape(x)[1]
+        W = tf.shape(x)[2]
+        C = tf.shape(x)[3]
         G = self.groups
 
-        x = tf.reshape(x, [B, H, W, G, C // G])
+        # C_per_group is guaranteed integer because we enforce divisibility in build()
+        C_per_group = tf.math.floordiv(C, G)
+
+        x = tf.reshape(x, [B, H, W, G, C_per_group])
         mean, var = tf.nn.moments(x, axes=[1, 2, 4], keepdims=True)
         x = (x - mean) / tf.sqrt(var + self.eps)
         x = tf.reshape(x, [B, H, W, C])
 
         return x * self.gamma[None, None, None, :] + self.beta[None, None, None, :]
+
 
 
 class ClassifierFreeCondDropout(layers.Layer):
