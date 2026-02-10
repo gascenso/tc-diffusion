@@ -163,7 +163,7 @@ def _compute_suite_for_class(
     gh = _hist_density(gflat_clip, bins)
 
     js = js_divergence(rh, gh)
-    w1 = wasserstein1_from_hist(rh, gh)
+    w1 = wasserstein1_from_hist(rh, gh, bin_edges=bins)
 
     # ------------------------------------------------------------------
     # radial / azimuthal structure (on clipped)

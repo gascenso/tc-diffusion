@@ -28,10 +28,15 @@ def js_divergence(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> float:
     return float(0.5 * (kl_pm + kl_qm))
 
 
-def wasserstein1_from_hist(p: np.ndarray, q: np.ndarray) -> float:
+def wasserstein1_from_hist(
+    p: np.ndarray,
+    q: np.ndarray,
+    *,
+    bin_edges: np.ndarray | None = None,
+) -> float:
     """
     1D Wasserstein-1 distance computed from histograms on the same bins.
-    Uses cumulative sums; scale depends on bin width (assumes equal width bins).
+    If bin_edges are provided, returns distance in data units (e.g. Kelvin).
     """
     p = np.asarray(p, dtype=np.float64)
     q = np.asarray(q, dtype=np.float64)
@@ -39,7 +44,20 @@ def wasserstein1_from_hist(p: np.ndarray, q: np.ndarray) -> float:
     q = q / (q.sum() + 1e-12)
     cdf_p = np.cumsum(p)
     cdf_q = np.cumsum(q)
-    return float(np.mean(np.abs(cdf_p - cdf_q)))
+    cdf_gap = np.abs(cdf_p - cdf_q)
+
+    if bin_edges is None:
+        # fallback: assumes unit bin width
+        return float(np.sum(cdf_gap))
+
+    edges = np.asarray(bin_edges, dtype=np.float64)
+    if edges.ndim != 1 or edges.shape[0] != p.shape[0] + 1:
+        raise ValueError(
+            f"bin_edges must have length len(p)+1; got {edges.shape[0]} for len(p)={p.shape[0]}"
+        )
+
+    widths = np.diff(edges)
+    return float(np.sum(cdf_gap * widths))
 
 
 def summary_stats(x: np.ndarray) -> Dict[str, float]:
