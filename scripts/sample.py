@@ -22,7 +22,8 @@ def parse_args():
     p.add_argument(
         "--config",
         type=str,
-        default="configs/base.yaml"
+        default=None,
+        help="Config path. Defaults to runs/<name>/config.yaml saved at training time.",
     )
     p.add_argument(
         "--batch_size",
@@ -65,7 +66,14 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    cfg = load_config(args.config, overrides=[])
+    run_dir = Path("runs") / args.name
+    config_path = Path(args.config) if args.config else (run_dir / "config.yaml")
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Config file not found: {config_path}. "
+            "Pass --config explicitly or ensure the run has a saved config.yaml."
+        )
+    cfg = load_config(str(config_path), overrides=[])
 
     # GPU memory growth (optional, same as train)
     gpus = tf.config.list_physical_devices("GPU")
@@ -80,8 +88,6 @@ if __name__ == "__main__":
 
     model = build_unet(cfg)
     diffusion = Diffusion(cfg)
-
-    run_dir = Path("runs") / args.name
 
     def resolve_weights_path(use_ema: bool) -> Path:
         # Prefer the newer naming used by train_loop.py, but fall back to legacy names if present.
