@@ -224,6 +224,9 @@ def compute_class_sampling_probs(
         p_train(c) ∝ p_empirical(c)^alpha
     """
     counts = {c: len(v) for c, v in class_to_files.items()}
+    counts = {c: n for c, n in counts.items() if n > 0}
+    if not counts:
+        raise RuntimeError("No non-empty classes available for sampling.")
     total = sum(counts.values())
 
     # empirical distribution
