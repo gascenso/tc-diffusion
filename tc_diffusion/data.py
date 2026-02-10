@@ -453,7 +453,6 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
     data_cfg = cfg["data"]
     data_root = Path(data_cfg["data_root"])
     index_path = Path(data_cfg["dataset_index"])
-    alpha = float(data_cfg.get("class_balance_alpha", 1.0))
 
     batch_size = int(data_cfg["batch_size"])
     seed = int(cfg.get("seed", 42))

@@ -45,7 +45,6 @@ training:
     min_delta: 1.0e-4     # minimum improvement in loss to count as "better"
 
 evaluation:
-  every_epochs: 5
   n_per_class_heavy: 50
   gen_batch_size: null       # micro-batch for generation; null -> use data.batch_size
 
