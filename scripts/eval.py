@@ -2,7 +2,7 @@
 
 # Usage:
 # (evaluate finished run)     python -m scripts.eval --name <RUN_NAME>
-# (override config)           python -m scripts.eval --name <RUN_NAME> --override evaluation.num_samples=200
+# (override config)           python -m scripts.eval --name <RUN_NAME> --override evaluation.num_n_per_class_heavy=100
 # (show progress bar)         python -m scripts.eval --name <RUN_NAME> --show_progress
 
 import argparse
