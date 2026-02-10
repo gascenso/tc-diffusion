@@ -1,4 +1,10 @@
 # scripts/eval.py
+
+# Usage:
+# (evaluate finished run)     python -m scripts.eval --name <RUN_NAME>
+# (override config)           python -m scripts.eval --name <RUN_NAME> --override evaluation.num_samples=200
+# (show progress bar)         python -m scripts.eval --name <RUN_NAME> --show_progress
+
 import argparse
 from pathlib import Path
 import yaml
@@ -19,7 +25,7 @@ def parse_args():
     p.add_argument("--out_dir", type=str, default=None, help="Output dir (defaults to run dir inferred from weights path)")
     p.add_argument("--tag", type=str, default="manual_eval")
     p.add_argument("--heavy", action="store_true")
-    p.add_argument("--progress", action="store_true", help="Show progress bars during evaluation")
+    p.add_argument("--show_progress", action="store_true", help="Show progress bars during evaluation")
     return p.parse_args()
 
 
@@ -47,7 +53,7 @@ if __name__ == "__main__":
         out_dir=out_dir,
         tag=args.tag,
         heavy=bool(args.heavy),
-        show_progress=bool(args.progress),
+        show_progress=bool(args.show_progress),
     )
 
     print("Wrote evaluation report to:", out_dir / "eval" / args.tag / "metrics.json")
