@@ -45,12 +45,7 @@ training:
     min_delta: 1.0e-4     # minimum improvement in loss to count as "better"
 
 evaluation:
-  enabled: true
   every_epochs: 5
-
-  # run heavier eval less frequently (more samples -> smoother curves)
-  heavy_every_epochs: 15
-  n_per_class_light: 5
   n_per_class_heavy: 50
   gen_batch_size: null       # micro-batch for generation; null -> use data.batch_size
 
