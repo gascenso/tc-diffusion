@@ -7,9 +7,6 @@
 
 import argparse
 from pathlib import Path
-import yaml
-
-import tensorflow as tf
 
 from tc_diffusion.config import load_config
 from tc_diffusion.model_unet import build_unet
