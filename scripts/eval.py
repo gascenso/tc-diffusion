@@ -43,12 +43,34 @@ if __name__ == "__main__":
         )
     cfg = load_config(str(config_path), overrides=args.override)
 
-    weights_path = run_dir / "weights_ema_best_val.weights.h5"
     if args.out_dir is None:
         out_dir = run_dir
     else:
         out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    def resolve_weights_path() -> Path:
+        ema_candidates = [
+            run_dir / "weights_ema_best_val.weights.h5",
+            run_dir / "weights_ema_best.weights.h5",
+        ]
+        for p in ema_candidates:
+            if p.exists():
+                return p
+
+        non_ema_candidates = [
+            run_dir / "weights_best_val.weights.h5",
+            run_dir / "weights_best.weights.h5",
+        ]
+        for p in non_ema_candidates:
+            if p.exists():
+                print(f"[warn] EMA checkpoint not found; using non-EMA weights: {p.name}")
+                return p
+
+        tried = [str(p) for p in (ema_candidates + non_ema_candidates)]
+        raise FileNotFoundError(f"Could not find evaluation weights. Tried: {tried}")
+
+    weights_path = resolve_weights_path()
 
     # Build + load
     model = build_unet(cfg)
