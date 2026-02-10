@@ -7,10 +7,154 @@ import numpy as np
 import tensorflow as tf
 import xarray as xr
 
+P_AUG      = tf.constant([0.15, 0.20, 0.35, 0.60, 0.75, 0.85], dtype=tf.float32)
+MAX_SHIFT  = tf.constant([2,    2,    2,    2,    2,   2  ], dtype=tf.int32)
+MAX_BARS   = tf.constant([1,    1,    1,    2,    2,    3   ], dtype=tf.int32)
 
 # ------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------
+def rot90_only(x):
+    # x: [H, W, C] or [H, W]
+    k = tf.random.uniform([], minval=0, maxval=4, dtype=tf.int32)
+    return tf.image.rot90(x, k)
+
+def random_shift_reflect(x, max_shift):
+    # max_shift: int scalar tensor
+    if max_shift <= 0:
+        return x
+
+    h = tf.shape(x)[0]
+    w = tf.shape(x)[1]
+
+    dy = tf.random.uniform([], -max_shift, max_shift + 1, dtype=tf.int32)
+    dx = tf.random.uniform([], -max_shift, max_shift + 1, dtype=tf.int32)
+
+    # reflect pad enough to allow cropping after shift
+    pad_y = max_shift
+    pad_x = max_shift
+    x_pad = tf.pad(
+        x,
+        paddings=[[pad_y, pad_y], [pad_x, pad_x], [0, 0]] if x.shape.rank == 3 else [[pad_y, pad_y], [pad_x, pad_x]],
+        mode="REFLECT",
+    )
+
+    # crop with offset
+    y0 = pad_y + dy
+    x0 = pad_x + dx
+    if x.shape.rank == 3:
+        return tf.image.crop_to_bounding_box(x_pad, y0, x0, h, w)
+    else:
+        # expand to use crop_to_bounding_box then squeeze
+        x_pad3 = x_pad[..., None]
+        out = tf.image.crop_to_bounding_box(x_pad3, y0, x0, h, w)
+        return tf.squeeze(out, axis=-1)
+
+def random_bar_erasing(x, max_bars, min_w=1, max_w=5, fill_mode="local"):
+    """
+    Erase bars spanning full height or width.
+    TF-graph-safe + shape-invariant in while_loop.
+    """
+
+    # Ensure [H, W, C]
+    if x.shape.rank == 2:
+        x3 = x[..., None]
+        squeeze_back = True
+    else:
+        x3 = x
+        squeeze_back = False
+
+    # Dynamic spatial dims
+    H = tf.shape(x3)[0]
+    W = tf.shape(x3)[1]
+
+    # IMPORTANT: keep a *static* channel dim if available (e.g., 1)
+    C_static = x3.shape[-1]  # python int or None
+    if C_static is None:
+        C = tf.shape(x3)[2]   # fallback dynamic
+    else:
+        C = C_static          # use static for shapes below
+
+    def no_erase():
+        return x3
+
+    def do_erase():
+        nbars = tf.random.uniform([], 0, max_bars + 1, dtype=tf.int32)
+
+        def body(i, img):
+            horiz = tf.random.uniform([], 0, 2, dtype=tf.int32)  # 0=vertical, 1=horizontal
+            bw = tf.random.uniform([], min_w, max_w + 1, dtype=tf.int32)
+
+            if fill_mode == "local":
+                mu = tf.reduce_mean(img, axis=[0, 1], keepdims=True)
+                sigma = tf.math.reduce_std(img, axis=[0, 1], keepdims=True)
+                fill = mu + tf.random.normal([H, W, C], dtype=img.dtype) * (0.1 * (sigma + 1e-6))
+            else:
+                fill = tf.random.normal([H, W, C], dtype=img.dtype)
+
+            def vertical():
+                x0 = tf.random.uniform([], 0, W - bw + 1, dtype=tf.int32)
+                mask = tf.concat([
+                    tf.ones([H, x0, C], dtype=img.dtype),
+                    tf.zeros([H, bw, C], dtype=img.dtype),
+                    tf.ones([H, W - x0 - bw, C], dtype=img.dtype),
+                ], axis=1)
+                return img * mask + fill * (1.0 - mask)
+
+            def horizontal():
+                y0 = tf.random.uniform([], 0, H - bw + 1, dtype=tf.int32)
+                mask = tf.concat([
+                    tf.ones([y0, W, C], dtype=img.dtype),
+                    tf.zeros([bw, W, C], dtype=img.dtype),
+                    tf.ones([H - y0 - bw, W, C], dtype=img.dtype),
+                ], axis=0)
+                return img * mask + fill * (1.0 - mask)
+
+            img2 = tf.cond(horiz == 0, vertical, horizontal)
+
+            # Force static shape preservation (critical for while_loop)
+            img2.set_shape(x3.shape)
+            return i + 1, img2
+
+        # Shape invariants: allow H,W to be unknown, but keep channel rank consistent
+        img_inv = tf.TensorShape([None, None, C_static if C_static is not None else None])
+
+        _, out = tf.while_loop(
+            lambda i, _: i < nbars,
+            body,
+            loop_vars=[tf.constant(0, tf.int32), x3],
+            shape_invariants=[tf.TensorShape([]), img_inv],
+        )
+
+        out.set_shape(x3.shape)
+        return out
+
+    out = tf.cond(max_bars > 0, do_erase, no_erase)
+    out.set_shape(x3.shape)
+
+    if squeeze_back:
+        return tf.squeeze(out, axis=-1)
+    return out
+
+def augment_x_given_y(x, y):
+    """
+    x: [H,W,1] (or [H,W]) normalized already (e.g., to [-1,1])
+    y: int label
+    """
+    y = tf.cast(y, tf.int32)
+
+    p = tf.gather(P_AUG, y)
+    max_shift = tf.gather(MAX_SHIFT, y)
+    max_bars = tf.gather(MAX_BARS, y)
+
+    def do_aug():
+        x1 = rot90_only(x)
+        x2 = random_shift_reflect(x1, max_shift=max_shift)
+        x3 = random_bar_erasing(x2, max_bars=max_bars, min_w=1, max_w=5, fill_mode="local")
+        return x3
+
+    return tf.cond(tf.random.uniform([]) < p, do_aug, lambda: x)
+
 def preprocess_bt(bt: np.ndarray, bt_range: Tuple[float, float]) -> np.ndarray:
     bt = bt.astype(np.float32)
     bt = np.nan_to_num(bt, nan=0.0, posinf=0.0, neginf=0.0)
@@ -195,7 +339,9 @@ def _create_finite_eval_dataset(
     # Thread-safety: keep netCDF opens single-threaded.
     map_fn = _tf_load_one_netcdf(data_root, bt_range, engine=engine)
     ds = ds.map(map_fn, num_parallel_calls=int(num_parallel_calls), deterministic=True)
-
+    ds = ds.map(lambda x, y: (augment_x_given_y(x, y), y),
+            num_parallel_calls=tf.data.AUTOTUNE)
+    
     ds = ds.batch(batch_size, drop_remainder=False)
     ds = ds.prefetch(1)
 
