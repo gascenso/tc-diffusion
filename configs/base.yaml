@@ -51,7 +51,7 @@ evaluation:
   # run heavier eval less frequently (more samples -> smoother curves)
   heavy_every_epochs: 15
   n_per_class_light: 5
-  n_per_class_heavy: 30
+  n_per_class_heavy: 50
   gen_batch_size: null       # micro-batch for generation; null -> use data.batch_size
 
   # generation settings
