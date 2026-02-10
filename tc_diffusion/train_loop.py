@@ -160,6 +160,8 @@ def train(cfg, resume: bool = False):
     num_epochs = int(cfg["training"]["num_epochs"])
     steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 2000))
     val_every_epochs = int(cfg["training"].get("val_every_epochs", 1))
+    if val_every_epochs <= 0:
+        raise ValueError(f"training.val_every_epochs must be >= 1, got {val_every_epochs}")
     # If val_steps <= 0, we will do a full deterministic pass.
     val_steps = int(cfg["training"].get("val_steps", 0))
     log_interval = int(cfg["training"]["log_interval_steps"])
@@ -169,9 +171,7 @@ def train(cfg, resume: bool = False):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ----- evaluation -----
-    eval_cfg = cfg.get("evaluation", {})
-    eval_enabled = bool(eval_cfg.get("enabled", True))
-    evaluator = TCEvaluator(cfg) if eval_enabled else None
+    evaluator = TCEvaluator(cfg)
 
     # ----- early stopping config -----
     es_cfg = cfg["training"].get("early_stopping", {})
@@ -288,30 +288,31 @@ def train(cfg, resume: bool = False):
             print(f"  Saved EMA last weights to {ema_last_path}")
         print(f"  Saved last weights to {last_path}")
 
-        # ----- check for improvement (best) based on FULL val when available -----
-        metric = val_loss if val_loss is not None else epoch_loss
+        # ----- check for improvement (best) on FULL validation only -----
+        if val_loss is not None:
+            metric = val_loss
+            improved = (best_epoch_loss - metric > min_delta)
+            if improved:
+                best_epoch_loss = metric
+                best_epoch_idx = epoch + 1
+                epochs_without_improvement = 0
 
-        improved = (best_epoch_loss - metric > min_delta)
-        if improved:
-            best_epoch_loss = metric
-            best_epoch_idx = epoch + 1
-            epochs_without_improvement = 0
+                best_path = out_dir / "weights_best_val.weights.h5"
+                model.save_weights(best_path)
+                print(f"  New best model (epoch {best_epoch_idx}), saved to {best_path} (metric={best_epoch_loss:.6f})")
 
-            # Save "best-by-val" (or best-by-train if val_loss None)
-            best_path = out_dir / "weights_best_val.weights.h5"
-            model.save_weights(best_path)
-            print(f"  New best model (epoch {best_epoch_idx}), saved to {best_path} (metric={best_epoch_loss:.6f})")
-
-            if use_ema and ema is not None:
-                best_ema_path = out_dir / "weights_ema_best_val.weights.h5"
-                snap = ema.get_model_weights_snapshot()
-                ema.copy_to_model()
-                model.save_weights(best_ema_path)
-                ema.restore_model_weights_snapshot(snap)
-                print(f"  New best EMA model (epoch {best_epoch_idx}), saved to {best_ema_path}")
+                if use_ema and ema is not None:
+                    best_ema_path = out_dir / "weights_ema_best_val.weights.h5"
+                    snap = ema.get_model_weights_snapshot()
+                    ema.copy_to_model()
+                    model.save_weights(best_ema_path)
+                    ema.restore_model_weights_snapshot(snap)
+                    print(f"  New best EMA model (epoch {best_epoch_idx}), saved to {best_ema_path}")
+            else:
+                epochs_without_improvement += 1
+                print(f"  No significant improvement ({epochs_without_improvement}/{patience_epochs})")
         else:
-            epochs_without_improvement += 1
-            print(f"  No significant improvement ({epochs_without_improvement}/{patience_epochs})")
+            print("  Skipping early-stopping update (validation not run this epoch).")
 
         # Also track a best model on the balanced_fixed validation metric (does NOT drive early stopping).
         if val_loss_balanced is not None and (best_epoch_balanced - val_loss_balanced > min_delta):
@@ -355,14 +356,23 @@ def train(cfg, resume: bool = False):
     
 
     
-    # ----- periodic physics evaluation -----
+    # ----- post-training physics evaluation (always) -----
     heavy = True
-    tag = 'post_training'
-    try:
-        evaluator.run(model=model, diffusion=diffusion, out_dir=out_dir, tag=tag, heavy=heavy)
-        print(f"  [eval] wrote eval/{tag} (heavy={heavy})")
-    except Exception as e:
-        print(f"  [eval] failed at epoch {epoch+1}: {e}")
+    tag = "post_training"
+    eval_weights = out_dir / "weights_best_val.weights.h5"
+    if use_ema and ema is not None:
+        ema_best = out_dir / "weights_ema_best_val.weights.h5"
+        if ema_best.exists():
+            eval_weights = ema_best
+
+    if not eval_weights.exists():
+        raise FileNotFoundError(
+            f"Post-training evaluation requires best weights, but none were found at {eval_weights}."
+        )
+
+    model.load_weights(str(eval_weights))
+    evaluator.run(model=model, diffusion=diffusion, out_dir=out_dir, tag=tag, heavy=heavy)
+    print(f"  [eval] wrote eval/{tag} (heavy={heavy}) using {eval_weights.name}")
 
     return {
         "epoch": epoch_indices,
