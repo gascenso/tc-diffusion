@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -41,6 +41,7 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ev.setdefault("heavy_every_epochs", 25)
     ev.setdefault("n_per_class_light", 5)
     ev.setdefault("n_per_class_heavy", 50)
+    ev.setdefault("gen_batch_size", None)
     ev.setdefault("guidance_scale", 0.0)
     ev.setdefault("sampler", "ddpm")
     ev.setdefault("seed", 123)
@@ -290,6 +291,19 @@ class TCEvaluator:
 
         num_classes = int(cfg["conditioning"]["num_ss_classes"])
         n_per = int(ev["n_per_class_heavy"] if heavy else ev["n_per_class_light"])
+        if n_per <= 0:
+            raise ValueError(f"evaluation n_per_class must be > 0, got {n_per}")
+
+        # Total generated samples per class is n_per; this only controls
+        # micro-batch size to fit hardware limits.
+        gen_batch_size_cfg = ev.get("gen_batch_size")
+        if gen_batch_size_cfg is None:
+            gen_batch_size = int(data_cfg.get("batch_size", n_per))
+        else:
+            gen_batch_size = int(gen_batch_size_cfg)
+        if gen_batch_size <= 0:
+            raise ValueError(f"evaluation.gen_batch_size must be > 0, got {gen_batch_size}")
+        gen_batch_size = min(gen_batch_size, n_per)
 
         tf.random.set_seed(ev["seed"])
         np.random.seed(ev["seed"])
@@ -305,14 +319,22 @@ class TCEvaluator:
             class_iter = tqdm(class_iter, desc="Eval: generating", leave=True)
 
         for c in class_iter:
-            x = diffusion.sample(
-                model,
-                batch_size=n_per,
-                image_size=image_size,
-                cond_value=c,
-                guidance_scale=float(ev["guidance_scale"]),
-                show_progress=show_progress,
-            ).numpy()
+            chunks = []
+            remaining = n_per
+            while remaining > 0:
+                bsz = min(gen_batch_size, remaining)
+                x_chunk = diffusion.sample(
+                    model,
+                    batch_size=bsz,
+                    image_size=image_size,
+                    cond_value=c,
+                    guidance_scale=float(ev["guidance_scale"]),
+                    show_progress=show_progress,
+                ).numpy()
+                chunks.append(x_chunk)
+                remaining -= bsz
+
+            x = np.concatenate(chunks, axis=0)
 
             gen_k_raw = denorm_bt(x, bt_min_k, bt_max_k)[..., 0]
             gen_by_class[c] = gen_k_raw
@@ -353,6 +375,7 @@ class TCEvaluator:
             "tag": tag,
             "heavy": heavy,
             "n_per_class": n_per,
+            "gen_batch_size": gen_batch_size,
             "macro": {},
             "per_class": per_class_metrics,
         }
