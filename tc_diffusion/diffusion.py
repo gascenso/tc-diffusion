@@ -207,11 +207,10 @@ class Diffusion:
         if t_int > 0:
             noise = tf.random.normal(shape=tf.shape(x_t))
             x_prev = model_mean + tf.sqrt(posterior_var_t) * noise
-        else:
-            # t == 0: no noise
-            x_prev = model_mean
+            return x_prev
 
-        return x_prev
+        # t == 0: return the stabilized x0 prediction (NOT model_mean)
+        return x0_pred
 
     def sample(self, model, batch_size, image_size, cond_value=None, show_progress=True, guidance_scale=0.0):
         """
