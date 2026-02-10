@@ -209,8 +209,8 @@ class Diffusion:
             x_prev = model_mean + tf.sqrt(posterior_var_t) * noise
             return x_prev
 
-        # t == 0: return the stabilized x0 prediction (NOT model_mean)
-        return x0_pred
+        # t == 0: return x0 prediction (NOT model_mean), clipped to expected data range.
+        return tf.clip_by_value(x0_pred, -1.0, 1.0)
 
     def sample(self, model, batch_size, image_size, cond_value=None, show_progress=True, guidance_scale=0.0):
         """
