@@ -404,11 +404,23 @@ class BalancedTCGenerator:
         bt_range: Tuple[float, float] = (117.0, 348.0),
     ):
         self.data_root = data_root
-        self.class_to_files = class_to_files
+        self.class_to_files = {int(c): list(v) for c, v in class_to_files.items()}
         self.class_probs = class_probs
         self.bt_range = bt_range
-        self.classes = sorted(class_to_files.keys())
-        self.probs = np.array([class_probs[c] for c in self.classes])
+
+        # Keep only classes that are both sampleable and assigned non-zero mass.
+        self.classes = [
+            c for c in sorted(self.class_to_files.keys())
+            if (len(self.class_to_files[c]) > 0) and (float(self.class_probs.get(c, 0.0)) > 0.0)
+        ]
+        if not self.classes:
+            raise RuntimeError("No valid classes available for balanced sampling.")
+
+        probs = np.array([float(self.class_probs[c]) for c in self.classes], dtype=np.float64)
+        psum = float(probs.sum())
+        if psum <= 0.0:
+            raise RuntimeError("Class sampling probabilities have non-positive sum.")
+        self.probs = probs / psum
 
         self.rng = random.Random(seed)
 
