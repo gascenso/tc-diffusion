@@ -1,0 +1,17 @@
+numpy<2
+ml-dtypes<0.5
+xarray
+netCDF4
+pandas
+matplotlib
+seaborn
+tqdm
+scikit-learn
+opencv-python
+pyyaml
+scipy
+# add any repo-specific libs you use, e.g.:
+# hydra-core
+# omegaconf
+# einops
+# tensorflow-addons
