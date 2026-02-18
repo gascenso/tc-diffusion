@@ -30,3 +30,9 @@ runs/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# --- Docker stuff
+.dockerignore
+compose.yaml
+dc
+Dockerfile
