@@ -1,7 +1,7 @@
 # tc_diffusion/model_unet.py
 import tensorflow as tf
 from tensorflow import keras
-from keras import layers
+from tensorflow.keras import layers #type: ignore
 
 
 class SinusoidalTimeEmbedding(layers.Layer):
