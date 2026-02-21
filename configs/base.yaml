@@ -2,7 +2,7 @@ data:
   data_root: "data/gridsat_patches"
   dataset_index: "data/dataset_index.json"
   class_balance_alpha: 0.6
-  batch_size: 4
+  batch_size: 8
   image_size: 256
   bt_min_k: 117.0
   bt_max_k: 348.0
@@ -19,7 +19,7 @@ conditioning:
   
 model:
   base_channels: 32
-  channel_mults: [1, 2, 4]
+  channel_mults: [1, 2, 4, 8]
   num_res_blocks: 2
   attention_resolutions: []   # no attention yet
   dropout: 0.0
@@ -32,7 +32,7 @@ diffusion:
   dynamic_threshold_p: 0.995
 
 training:
-  num_epochs: 50
+  num_epochs: 100
   steps_per_epoch: 2000
   lr: 1e-4
   ema_decay: 0.9999
@@ -41,11 +41,11 @@ training:
   val_every_epochs: 1
   early_stopping:
     enabled: true
-    patience_epochs: 10   # number of epochs with no improvement before stopping
-    min_delta: 1.0e-4     # minimum improvement in loss to count as "better"
+    patience_epochs: 15   # number of epochs with no improvement before stopping
+    min_delta: 1.0e-8     # minimum improvement in loss to count as "better"
 
 evaluation:
-  n_per_class_heavy: 50
+  n_per_class_heavy: 35
   gen_batch_size: null       # micro-batch for generation; null -> use data.batch_size
 
   # generation settings
