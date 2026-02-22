@@ -18,6 +18,15 @@ class Diffusion:
         self.beta_schedule_name = cfg["diffusion"]["beta_schedule"]
         self.num_ss_classes = int(cfg["conditioning"]["num_ss_classes"])
         self.null_label = self.num_ss_classes  # must match model_unet.py
+        self.prediction_type = self._parse_prediction_type(
+            str(cfg["diffusion"].get("loss_type", "eps_mse"))
+        )
+        min_snr_gamma_cfg = cfg["diffusion"].get("min_snr_gamma", None)
+        self.min_snr_gamma = None if min_snr_gamma_cfg is None else float(min_snr_gamma_cfg)
+        if self.min_snr_gamma is not None and self.min_snr_gamma <= 0.0:
+            raise ValueError(
+                f"diffusion.min_snr_gamma must be > 0 when set, got {self.min_snr_gamma}"
+            )
 
         betas = self._make_beta_schedule(self.beta_schedule_name, self.num_steps)
         alphas = 1.0 - betas
@@ -40,6 +49,18 @@ class Diffusion:
         self.dynamic_threshold = bool(cfg["diffusion"].get("dynamic_threshold", True))
         self.dynamic_threshold_p = float(cfg["diffusion"].get("dynamic_threshold_p", 0.995))
 
+    def _parse_prediction_type(self, loss_type: str) -> str:
+        lt = str(loss_type).strip().lower()
+        if lt in {"eps", "eps_mse", "epsilon", "epsilon_mse"}:
+            return "eps"
+        if lt in {"v", "v_mse", "vpred", "v_pred", "v_prediction"}:
+            return "v"
+        raise ValueError(
+            "diffusion.loss_type must be one of: "
+            "eps_mse|eps|epsilon_mse|epsilon|v_mse|v|vpred|v_pred|v_prediction. "
+            f"Got: {loss_type}"
+        )
+
     def _predict_x0_from_eps(self, x_t, t_int, eps_theta):
         """
         Reconstruct x0 from epsilon prediction:
@@ -49,6 +70,26 @@ class Diffusion:
         sqrt_ab = tf.sqrt(alpha_bar_t)
         sqrt_one_minus_ab = tf.sqrt(1.0 - alpha_bar_t)
         return (x_t - sqrt_one_minus_ab * eps_theta) / (sqrt_ab + 1e-8)
+
+    def _predict_x0_from_v(self, x_t, alpha_bar_t, v_theta):
+        """
+        Reconstruct x0 from v-prediction:
+          x0 = sqrt(alpha_bar_t) * x_t - sqrt(1 - alpha_bar_t) * v
+        alpha_bar_t can be scalar or [B,1,1,1].
+        """
+        sqrt_ab = tf.sqrt(alpha_bar_t)
+        sqrt_one_minus_ab = tf.sqrt(1.0 - alpha_bar_t)
+        return sqrt_ab * x_t - sqrt_one_minus_ab * v_theta
+
+    def _predict_eps_from_v(self, x_t, alpha_bar_t, v_theta):
+        """
+        Reconstruct eps from v-prediction:
+          eps = sqrt(1 - alpha_bar_t) * x_t + sqrt(alpha_bar_t) * v
+        alpha_bar_t can be scalar or [B,1,1,1].
+        """
+        sqrt_ab = tf.sqrt(alpha_bar_t)
+        sqrt_one_minus_ab = tf.sqrt(1.0 - alpha_bar_t)
+        return sqrt_one_minus_ab * x_t + sqrt_ab * v_theta
 
     def _dynamic_threshold_x0(self, x0, p=0.995, eps=1e-8):
         """
@@ -127,9 +168,27 @@ class Diffusion:
         x_t = tf.sqrt(alpha_bar_t) * x0 + tf.sqrt(1.0 - alpha_bar_t) * noise
         return x_t
 
+    def _min_snr_weights(self, t):
+        """
+        Min-SNR loss weights per sample.
+        - eps prediction: w = min(snr, gamma) / snr
+        - v prediction:   w = min(snr, gamma) / (snr + 1)
+        """
+        if self.min_snr_gamma is None:
+            return tf.ones_like(tf.cast(t, tf.float32))
+
+        alpha_bar_t = tf.gather(self.alphas_cumprod, t)  # (B,)
+        snr = alpha_bar_t / tf.maximum(1.0 - alpha_bar_t, 1e-8)
+        gamma = tf.cast(self.min_snr_gamma, tf.float32)
+        snr_cap = tf.minimum(snr, gamma)
+
+        if self.prediction_type == "eps":
+            return snr_cap / tf.maximum(snr, 1e-8)
+        return snr_cap / (snr + 1.0)
+
     def loss(self, model, x0, cond):
         """
-        One-step diffusion training loss (epsilon MSE).
+        One-step diffusion training loss.
         x0: (B, H, W, C) in [-1, 1]
         cond: (B,) scalar for now
         """
@@ -141,8 +200,21 @@ class Diffusion:
         noise = tf.random.normal(shape=tf.shape(x0))
 
         x_t = self.q_sample(x0, t, noise)
-        eps_pred = model([x_t, t, cond], training=True)
-        loss = tf.reduce_mean((noise - eps_pred) ** 2)
+        pred = model([x_t, t, cond], training=True)
+
+        alpha_bar_t = tf.gather(self.alphas_cumprod, t)  # (B,)
+        alpha_bar_t = tf.reshape(alpha_bar_t, (-1, 1, 1, 1))
+        sqrt_ab = tf.sqrt(alpha_bar_t)
+        sqrt_one_minus_ab = tf.sqrt(1.0 - alpha_bar_t)
+
+        if self.prediction_type == "eps":
+            target = noise
+        else:
+            target = sqrt_ab * noise - sqrt_one_minus_ab * x0
+
+        mse_per_sample = tf.reduce_mean((pred - target) ** 2, axis=[1, 2, 3])  # (B,)
+        weights = self._min_snr_weights(t)  # (B,)
+        loss = tf.reduce_mean(mse_per_sample * weights)
         return loss
 
     # --- for sampling ---
@@ -178,16 +250,18 @@ class Diffusion:
             t_in = tf.concat([t, t], axis=0)
             c_in = tf.concat([cond, cond_null], axis=0)
 
-            eps_all = model([x_in, t_in, c_in], training=False)
-            eps_cond, eps_uncond = tf.split(eps_all, num_or_size_splits=2, axis=0)
-
-            eps_theta = eps_uncond + tf.cast(gs, tf.float32) * (eps_cond - eps_uncond)
+            pred_all = model([x_in, t_in, c_in], training=False)
+            pred_cond, pred_uncond = tf.split(pred_all, num_or_size_splits=2, axis=0)
+            pred_theta = pred_uncond + tf.cast(gs, tf.float32) * (pred_cond - pred_uncond)
         else:
-            eps_theta = model([x_t, t, cond], training=False)
+            pred_theta = model([x_t, t, cond], training=False)
 
-        # DDPM mean
-        # --- reconstruct x0, stabilize it, then recompute mean ---
-        x0_pred = self._predict_x0_from_eps(x_t, t_int, eps_theta)
+        if self.prediction_type == "eps":
+            eps_theta = pred_theta
+            x0_pred = self._predict_x0_from_eps(x_t, t_int, eps_theta)
+        else:
+            x0_pred = self._predict_x0_from_v(x_t, alpha_bar_t, pred_theta)
+            eps_theta = self._predict_eps_from_v(x_t, alpha_bar_t, pred_theta)
 
         if self.dynamic_threshold:
             x0_pred, _ = self._dynamic_threshold_x0(x0_pred, p=self.dynamic_threshold_p)

@@ -27,7 +27,13 @@ model:
 diffusion:
   num_steps: 1000
   beta_schedule: "linear"
+  # Training target / parameterization:
+  # - "eps_mse" (default): predict epsilon (classic DDPM)
+  # - "v_mse":             predict v (recommended modern default)
   loss_type: "eps_mse"
+  # Optional Min-SNR-gamma weighting (set null to disable).
+  # Typical values: 3.0 - 5.0. Works with both eps and v.
+  min_snr_gamma: null
   dynamic_threshold: true
   dynamic_threshold_p: 0.995
 
