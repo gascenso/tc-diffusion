@@ -4,8 +4,8 @@ data:
   class_balance_alpha: 0.6
   batch_size: 8
   image_size: 256
-  bt_min_k: 117.0
-  bt_max_k: 348.0
+  bt_min_k: 180.0 # q0.1; global min is 117.0
+  bt_max_k: 310.0 # q99.9; global max is 348.0
   split_dir: data/splits
   eval_seed: 42
   eval_mode: full
