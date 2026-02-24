@@ -30,10 +30,10 @@ diffusion:
   # Training target / parameterization:
   # - "eps_mse" (default): predict epsilon (classic DDPM)
   # - "v_mse":             predict v (recommended modern default)
-  loss_type: "eps_mse"
+  loss_type: "v_mse"
   # Optional Min-SNR-gamma weighting (set null to disable).
   # Typical values: 3.0 - 5.0. Works with both eps and v.
-  min_snr_gamma: null
+  min_snr_gamma: 2.5
   dynamic_threshold: true
   dynamic_threshold_p: 0.995
 
