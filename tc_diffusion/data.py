@@ -185,8 +185,8 @@ def augment_x_given_y(
     def do_aug():
         x1 = rot90_only(x)
         x2 = random_shift_reflect(x1, max_shift=max_shift)
-        x3 = random_bar_erasing(x2, max_bars=max_bars, min_w=1, max_w=5, fill_mode="local")
-        return x3
+        #x3 = random_bar_erasing(x2, max_bars=max_bars, min_w=1, max_w=5, fill_mode="local")
+        return x2
 
     return tf.cond(tf.random.uniform([]) < p, do_aug, lambda: x)
 
