@@ -36,3 +36,6 @@ Thumbs.db
 compose.yaml
 dc
 Dockerfile
+
+# --- HPC stuff
+hpc/
