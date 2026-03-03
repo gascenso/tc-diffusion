@@ -6,6 +6,7 @@
 # (resume run)        python -m scripts.train --name <RUN_NAME> --resume
 
 import argparse
+import time
 from pathlib import Path
 import shutil
 import yaml
@@ -57,6 +58,7 @@ def write_run_meta(run_dir: Path, meta: dict):
 
 
 if __name__ == "__main__":
+    t_start = time.perf_counter()
     args = parse_args()
     cfg = load_config(args.config, overrides=args.override)
 
@@ -93,3 +95,9 @@ if __name__ == "__main__":
     loss_png = run_dir / "loss_curve.png"
     save_loss_curve(history["epoch"], history["epoch_loss"], str(loss_png))
     print(f"Saved loss curve to {loss_png}")
+
+    elapsed = time.perf_counter() - t_start
+    hrs = int(elapsed // 3600)
+    mins = int((elapsed % 3600) // 60)
+    secs = int(elapsed % 60)
+    print(f"Total wall time: {hrs:02d}:{mins:02d}:{secs:02d} (hh:mm:ss)")
