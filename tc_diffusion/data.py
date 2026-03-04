@@ -1,5 +1,7 @@
 import json
 import random
+from bisect import bisect_right
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Iterator, Tuple
 
@@ -201,7 +203,7 @@ def preprocess_bt(bt: np.ndarray, bt_range: Tuple[float, float]) -> np.ndarray:
     bt = bt * 2.0 - 1.0                     # [-1,1]
     return bt
 
-def load_dataset_index(index_path: Path) -> Dict[str, List[str]]:
+def load_dataset_index(index_path: Path) -> Dict[int, List[str]]:
     """
     Load dataset_index.json and return class -> list of relative file paths.
     """
@@ -213,6 +215,189 @@ def load_dataset_index(index_path: Path) -> Dict[str, List[str]]:
     }
 
     return class_to_files
+
+
+class BTDataBackend:
+    """Backend that returns raw BT arrays by dataset-relative path."""
+
+    name = "base"
+    supports_parallel_reads = False
+
+    def load_bt(self, rel_path: str) -> np.ndarray:
+        raise NotImplementedError
+
+
+class NetCDFBTBackend(BTDataBackend):
+    name = "netcdf"
+    supports_parallel_reads = False
+
+    def __init__(self, data_root: Path, engine: str = "netcdf4"):
+        self.data_root = Path(data_root)
+        self.engine = str(engine)
+
+    def load_bt(self, rel_path: str) -> np.ndarray:
+        nc_path = self.data_root / rel_path
+        with xr.open_dataset(nc_path, engine=self.engine) as ds:
+            return ds["bt"].values.astype(np.float32)
+
+
+@dataclass(frozen=True)
+class PackedShardInfo:
+    path: str
+    start: int
+    stop: int
+
+
+class PackedMemmapBackend(BTDataBackend):
+    """Read raw BT arrays from sharded .npy memmaps produced offline."""
+
+    name = "packed_memmap"
+    supports_parallel_reads = True
+
+    def __init__(self, manifest_path: Path):
+        self.manifest_path = Path(manifest_path)
+        if not self.manifest_path.exists():
+            raise FileNotFoundError(f"Packed manifest not found: {self.manifest_path}")
+
+        with self.manifest_path.open("r") as f:
+            manifest = json.load(f)
+
+        backend = str(manifest.get("backend", "")).lower()
+        if backend != self.name:
+            raise ValueError(
+                f"Packed manifest backend mismatch: expected '{self.name}', got '{backend or 'missing'}'"
+            )
+
+        self.root = self.manifest_path.parent
+        self.sample_shape = tuple(int(v) for v in manifest["sample_shape"])
+        self.dtype = np.dtype(manifest["dtype"])
+        self.num_samples = int(manifest["num_samples"])
+
+        rel_paths_file = self.root / manifest["rel_paths_file"]
+        with rel_paths_file.open("r") as f:
+            self.rel_paths = [line.strip() for line in f if line.strip()]
+        if len(self.rel_paths) != self.num_samples:
+            raise ValueError(
+                f"Packed rel_paths count mismatch: expected {self.num_samples}, found {len(self.rel_paths)}"
+            )
+
+        self.path_to_index = {rel_path: idx for idx, rel_path in enumerate(self.rel_paths)}
+        if len(self.path_to_index) != len(self.rel_paths):
+            raise ValueError("Packed rel_paths contain duplicates; expected unique dataset-relative paths.")
+
+        labels_file = self.root / manifest["labels_file"]
+        self.labels = np.load(labels_file, mmap_mode="r")
+        if int(self.labels.shape[0]) != self.num_samples:
+            raise ValueError(
+                f"Packed labels count mismatch: expected {self.num_samples}, found {self.labels.shape[0]}"
+            )
+
+        self.shards = [
+            PackedShardInfo(
+                path=str(shard["path"]),
+                start=int(shard["start"]),
+                stop=int(shard["stop"]),
+            )
+            for shard in manifest["shards"]
+        ]
+        if not self.shards:
+            raise ValueError("Packed manifest contains no shards.")
+        prev_stop = 0
+        for shard in self.shards:
+            if shard.start != prev_stop:
+                raise ValueError(
+                    f"Packed shard layout must be contiguous; expected start={prev_stop}, found {shard.start}"
+                )
+            if shard.stop <= shard.start:
+                raise ValueError(
+                    f"Packed shard has invalid bounds [{shard.start}, {shard.stop}) for path {shard.path}"
+                )
+            prev_stop = shard.stop
+        if prev_stop != self.num_samples:
+            raise ValueError(
+                f"Packed shard coverage mismatch: last shard stops at {prev_stop}, expected {self.num_samples}"
+            )
+
+        self._shard_starts = [shard.start for shard in self.shards]
+        self._shard_memmaps = [self._open_shard_memmap(shard_idx) for shard_idx in range(len(self.shards))]
+
+    def _resolve_shard(self, global_index: int) -> Tuple[int, PackedShardInfo]:
+        if global_index < 0 or global_index >= self.num_samples:
+            raise IndexError(f"Packed sample index out of range: {global_index}")
+
+        shard_idx = bisect_right(self._shard_starts, int(global_index)) - 1
+        if shard_idx < 0:
+            raise IndexError(f"Could not resolve shard for packed sample index {global_index}")
+
+        shard = self.shards[shard_idx]
+        if global_index >= shard.stop:
+            raise IndexError(
+                f"Packed sample index {global_index} falls outside shard bounds [{shard.start}, {shard.stop})"
+            )
+        return shard_idx, shard
+
+    def _open_shard_memmap(self, shard_idx: int) -> np.ndarray:
+        shard = self.shards[shard_idx]
+        shard_path = self.root / shard.path
+        mm = np.load(shard_path, mmap_mode="r")
+
+        expected_rows = shard.stop - shard.start
+        expected_shape = (expected_rows, *self.sample_shape)
+        if tuple(mm.shape) != expected_shape:
+            raise ValueError(
+                f"Packed shard shape mismatch for {shard_path}: expected {expected_shape}, found {tuple(mm.shape)}"
+            )
+        if np.dtype(mm.dtype) != self.dtype:
+            raise ValueError(
+                f"Packed shard dtype mismatch for {shard_path}: expected {self.dtype}, found {mm.dtype}"
+            )
+        return mm
+
+    def load_bt_by_index(self, global_index: int) -> np.ndarray:
+        shard_idx, shard = self._resolve_shard(global_index)
+        mm = self._shard_memmaps[shard_idx]
+        local_index = int(global_index) - shard.start
+        return np.asarray(mm[local_index], dtype=np.float32)
+
+    def load_bt(self, rel_path: str) -> np.ndarray:
+        try:
+            global_index = self.path_to_index[rel_path]
+        except KeyError as exc:
+            raise KeyError(f"Packed manifest does not contain rel_path '{rel_path}'") from exc
+        return self.load_bt_by_index(global_index)
+
+
+def build_data_backend(data_cfg) -> BTDataBackend:
+    backend_name = str(data_cfg.get("backend", "netcdf")).lower()
+    if backend_name == "netcdf":
+        engine = str(data_cfg.get("netcdf_engine", data_cfg.get("eval_engine", "netcdf4")))
+        return NetCDFBTBackend(Path(data_cfg["data_root"]), engine=engine)
+
+    if backend_name == "packed_memmap":
+        manifest_path = data_cfg.get("packed_manifest")
+        if not manifest_path:
+            raise ValueError("data.packed_manifest must be set when data.backend='packed_memmap'")
+        return PackedMemmapBackend(Path(manifest_path))
+
+    raise ValueError(
+        f"Unsupported data backend '{backend_name}'. Expected one of: 'netcdf', 'packed_memmap'."
+    )
+
+
+def resolve_eval_num_parallel_calls(data_cfg, backend: BTDataBackend):
+    raw = data_cfg.get("eval_num_parallel_calls")
+    if raw is None:
+        return tf.data.AUTOTUNE if backend.supports_parallel_reads else 1
+
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {"auto", "autotune"}:
+            return tf.data.AUTOTUNE
+
+    num_parallel_calls = int(raw)
+    if num_parallel_calls <= 0:
+        raise ValueError(f"data.eval_num_parallel_calls must be > 0 or 'autotune', got {raw!r}")
+    return num_parallel_calls
 
 
 def compute_class_sampling_probs(
@@ -292,16 +477,11 @@ def _fixed_balanced_subset(
     return out_paths, out_labels
 
 
-def _tf_load_one_netcdf(
-    data_root: Path,
+def _tf_load_one_sample(
+    backend: BTDataBackend,
     bt_range: Tuple[float, float],
-    engine: str = "netcdf4",
 ):
-    """Factory returning a tf.data mapping fn that loads & preprocesses NetCDF.
-
-    IMPORTANT: netCDF4/HDF5 is not reliably thread-safe under concurrent opens.
-    Use num_parallel_calls=1 in tf.data when using this.
-    """
+    """Factory returning a tf.data map fn that loads & preprocesses one sample."""
     bt_min, bt_max = float(bt_range[0]), float(bt_range[1])
 
     def _decode_path(rel_path_obj) -> str:
@@ -318,11 +498,7 @@ def _tf_load_one_netcdf(
 
     def _py_load(rel_path_obj, label):
         rel_path = _decode_path(rel_path_obj)
-        nc_path = data_root / rel_path
-
-        with xr.open_dataset(nc_path, engine=engine) as ds:
-            bt = ds["bt"].values.astype(np.float32)
-
+        bt = backend.load_bt(rel_path)
         bt = preprocess_bt(bt, (bt_min, bt_max))
         if bt.ndim == 2:
             bt = bt[..., None]
@@ -343,15 +519,14 @@ def _tf_load_one_netcdf(
 
 def _create_finite_eval_dataset(
     *,
-    data_root: Path,
+    backend: BTDataBackend,
     rel_paths: List[str],
     labels: List[int],
     batch_size: int,
     seed: int,
     bt_range: Tuple[float, float],
     shuffle: bool,
-    num_parallel_calls: int = 1,
-    engine: str = "netcdf4",
+    num_parallel_calls=1,
 ) -> tf.data.Dataset:
     ds = tf.data.Dataset.from_tensor_slices(
         (
@@ -367,17 +542,17 @@ def _create_finite_eval_dataset(
             reshuffle_each_iteration=False,
         )
 
-    # Thread-safety: keep netCDF opens single-threaded.
-    map_fn = _tf_load_one_netcdf(data_root, bt_range, engine=engine)
+    map_fn = _tf_load_one_sample(backend, bt_range)
     ds = ds.map(map_fn, num_parallel_calls=int(num_parallel_calls), deterministic=True)
     ds = ds.batch(batch_size, drop_remainder=False)
-    ds = ds.prefetch(1)
+    ds = ds.prefetch(tf.data.AUTOTUNE if backend.supports_parallel_reads else 1)
 
-    # Stronger guarantee: single-threaded tf.data pipeline for eval
     opts = tf.data.Options()
     opts.deterministic = True
-    opts.threading.private_threadpool_size = 1
-    opts.threading.max_intra_op_parallelism = 1
+    if not backend.supports_parallel_reads:
+        # netCDF4/HDF5 open/read paths are safer single-threaded.
+        opts.threading.private_threadpool_size = 1
+        opts.threading.max_intra_op_parallelism = 1
     ds = ds.with_options(opts)
 
     return ds
@@ -397,13 +572,13 @@ class BalancedTCGenerator:
 
     def __init__(
         self,
-        data_root: Path,
+        backend: BTDataBackend,
         class_to_files: Dict[int, List[str]],
         class_probs: Dict[int, float],
         seed: int = 42,
         bt_range: Tuple[float, float] = (117.0, 348.0),
     ):
-        self.data_root = data_root
+        self.backend = backend
         self.class_to_files = {int(c): list(v) for c, v in class_to_files.items()}
         self.class_probs = class_probs
         self.bt_range = bt_range
@@ -431,11 +606,9 @@ class BalancedTCGenerator:
 
             # 2) sample file within class
             rel_path = self.rng.choice(self.class_to_files[cls])
-            nc_path = self.data_root / rel_path
 
-            # 3) load NetCDF (BT only) and normalize
-            with xr.open_dataset(nc_path, engine="netcdf4") as ds:
-                bt = ds["bt"].values.astype(np.float32)
+            # 3) load BT and normalize
+            bt = self.backend.load_bt(rel_path)
             bt = preprocess_bt(bt, self.bt_range)
             
             # ensure shape (H, W, 1)
@@ -463,8 +636,8 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
     """
 
     data_cfg = cfg["data"]
-    data_root = Path(data_cfg["data_root"])
     index_path = Path(data_cfg["dataset_index"])
+    backend = build_data_backend(data_cfg)
 
     batch_size = int(data_cfg["batch_size"])
     seed = int(cfg.get("seed", 42))
@@ -514,11 +687,10 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
                     f"balanced_fixed produced an empty subset (per_class={per_class})."
                 )
 
-        num_parallel_calls = int(data_cfg.get("eval_num_parallel_calls", 1))
-        engine = str(data_cfg.get("eval_engine", "netcdf4"))
+        num_parallel_calls = resolve_eval_num_parallel_calls(data_cfg, backend)
         # NOTE: shuffle=False ensures a stable, full-pass metric per epoch.
         return _create_finite_eval_dataset(
-            data_root=data_root,
+            backend=backend,
             rel_paths=rel_paths,
             labels=labels,
             batch_size=batch_size,
@@ -526,7 +698,6 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
             bt_range=bt_range,
             shuffle=False,
             num_parallel_calls=num_parallel_calls,
-            engine=engine,
         )
 
     # ---- compute sampling probabilities ----
@@ -541,7 +712,7 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
 
     # ---- generator ----
     gen = BalancedTCGenerator(
-        data_root=data_root,
+        backend=backend,
         class_to_files=class_to_files,
         class_probs=class_probs,
         seed=seed,

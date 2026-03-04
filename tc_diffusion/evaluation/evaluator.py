@@ -8,7 +8,6 @@ from typing import Dict, Any, Tuple
 
 import numpy as np
 import tensorflow as tf
-import xarray as xr
 from tqdm.auto import tqdm
 
 from .metrics import (
@@ -27,7 +26,7 @@ from .metrics import (
 
 from .plots import plot_radial_profiles, plot_psd, plot_hist_overlay
 from ..plotting import save_image_grid
-from ..data import load_dataset_index, load_split_file_set
+from ..data import build_data_backend, load_dataset_index, load_split_file_set
 
 
 # -----------------------------------------------------------------------------
@@ -69,10 +68,8 @@ def _write_json(path: Path, obj: Dict[str, Any]):
 # real data loading
 # -----------------------------------------------------------------------------
 
-def _load_one_bt_k(nc_path: Path, bt_min_k: float, bt_max_k: float) -> np.ndarray:
-    with xr.open_dataset(nc_path, engine="netcdf4") as ds:
-        bt = ds["bt"].values.astype(np.float32)
-
+def _load_one_bt_k(backend, rel_path: str, bt_min_k: float, bt_max_k: float) -> np.ndarray:
+    bt = backend.load_bt(rel_path)
     bt = np.nan_to_num(bt, nan=bt_min_k)
     bt = np.clip(bt, bt_min_k, bt_max_k)
     return bt
@@ -84,11 +81,11 @@ def _sample_real_by_class(
     seed: int,
 ) -> Dict[int, np.ndarray]:
     data_cfg = cfg["data"]
-    data_root = Path(data_cfg["data_root"])
     index_path = Path(data_cfg["dataset_index"])
     split_dir = Path(data_cfg["split_dir"])
     bt_min_k = float(data_cfg["bt_min_k"])
     bt_max_k = float(data_cfg["bt_max_k"])
+    backend = build_data_backend(data_cfg)
 
     class_to_files = load_dataset_index(index_path)
     allowed = load_split_file_set(split_dir, split="val")
@@ -106,7 +103,7 @@ def _sample_real_by_class(
 
         imgs = []
         for idx in pick:
-            imgs.append(_load_one_bt_k(data_root / rels[int(idx)], bt_min_k, bt_max_k))
+            imgs.append(_load_one_bt_k(backend, rels[int(idx)], bt_min_k, bt_max_k))
 
         out[int(c)] = np.stack(imgs, axis=0)
 

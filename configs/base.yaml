@@ -1,12 +1,16 @@
 data:
   data_root: "data/gridsat_patches"
   dataset_index: "data/dataset_index.json"
+  backend: "netcdf"           # "netcdf" | "packed_memmap"
+  packed_manifest: null       # required when backend: packed_memmap
+  netcdf_engine: "netcdf4"
   class_balance_alpha: 0.6
   batch_size: 8
   image_size: 256
   bt_min_k: 180.0 # q0.1; global min is 117.0
   bt_max_k: 310.0 # q99.9; global max is 348.0
   split_dir: data/splits
+  eval_num_parallel_calls: null  # null -> 1 for netcdf, AUTOTUNE for packed_memmap
   eval_seed: 42
   eval_mode: full
   val_balanced_per_class: 5 # used only when eval_mode: balanced_fixed
