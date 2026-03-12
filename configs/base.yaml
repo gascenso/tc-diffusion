@@ -4,7 +4,14 @@ data:
   backend: "netcdf"           # "netcdf" | "packed_memmap"
   packed_manifest: null       # required when backend: packed_memmap
   netcdf_engine: "netcdf4"
-  class_balance_alpha: 0.6
+  class_balance_alpha: 0.4
+  class_balance_curriculum:
+    enabled: true
+    start_alpha: 1.0
+    end_alpha: 0.4
+    start_epoch: 0
+    ramp_epochs: 40
+    mode: "cosine"
   batch_size: 8
   image_size: 256
   bt_min_k: 180.0 # q0.1; global min is 117.0
@@ -17,7 +24,17 @@ data:
 
 conditioning:
   num_ss_classes: 6           # 0-5 Saffir-Simpson categories
-  use_wind_speed: false       # we'll wire this later
+  use_wind_speed: true        # requires dataset_index.json with "samples" metadata for best results
+  wind_min_kt: 35.0
+  wind_max_kt: 170.0
+  wind_null_kt: 0.0
+  eval_wind_targets_kt:       # used by evaluator when use_wind_speed=true
+    "0": 49.0
+    "1": 73.0
+    "2": 89.0
+    "3": 104.0
+    "4": 124.5
+    "5": 145.0
   use_basin: false            # placeholder
   cfg_drop_prob: 0.1
   
@@ -59,7 +76,7 @@ evaluation:
   gen_batch_size: null       # micro-batch for generation; null -> use data.batch_size
 
   # generation settings
-  guidance_scale: 0.0         # set >0 once you rely on CFG at inference
+  guidance_scale: 2.5         # set >0 once you rely on CFG at inference
   sampler: "ddpm"             # "ddpm" supported; can extend later
   seed: 123
 

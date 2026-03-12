@@ -2,6 +2,22 @@ import tensorflow as tf
 import numpy as np
 from tqdm.auto import tqdm
 
+
+def _ss_class_midpoint_kt_scalar(ss_cat: int) -> float:
+    cls = int(ss_cat)
+    if cls == 0:
+        return 49.0
+    if cls == 1:
+        return 73.0
+    if cls == 2:
+        return 89.0
+    if cls == 3:
+        return 104.0
+    if cls == 4:
+        return 124.5
+    return 145.0
+
+
 class Diffusion:
     """
     Implements the forward diffusion process and training loss for a diffusion model.
@@ -16,8 +32,13 @@ class Diffusion:
     def __init__(self, cfg):
         self.num_steps = int(cfg["diffusion"]["num_steps"])
         self.beta_schedule_name = cfg["diffusion"]["beta_schedule"]
-        self.num_ss_classes = int(cfg["conditioning"]["num_ss_classes"])
+        cond_cfg = cfg.get("conditioning", {})
+        self.num_ss_classes = int(cond_cfg.get("num_ss_classes", 6))
         self.null_label = self.num_ss_classes  # must match model_unet.py
+        self.use_wind_speed = bool(cond_cfg.get("use_wind_speed", False))
+        self.wind_min_kt = float(cond_cfg.get("wind_min_kt", 35.0))
+        self.wind_max_kt = float(cond_cfg.get("wind_max_kt", 170.0))
+        self.null_wind_kt = float(cond_cfg.get("wind_null_kt", 0.0))
         self.prediction_type = self._parse_prediction_type(
             str(cfg["diffusion"].get("loss_type", "eps_mse"))
         )
@@ -48,6 +69,40 @@ class Diffusion:
         # sampling stabilization (high leverage for avoiding clipped extremes)
         self.dynamic_threshold = bool(cfg["diffusion"].get("dynamic_threshold", True))
         self.dynamic_threshold_p = float(cfg["diffusion"].get("dynamic_threshold_p", 0.995))
+
+    def _default_wind_from_ss_tensor(self, ss_cat):
+        ss_cat = tf.cast(ss_cat, tf.int32)
+        if self.num_ss_classes == 6:
+            table = tf.constant([49.0, 73.0, 89.0, 104.0, 124.5, 145.0], dtype=tf.float32)
+            idx = tf.clip_by_value(ss_cat, 0, 5)
+            wind = tf.gather(table, idx)
+        else:
+            idx = tf.cast(tf.clip_by_value(ss_cat, 0, self.num_ss_classes - 1), tf.float32)
+            span = tf.maximum(self.wind_max_kt - self.wind_min_kt, 1e-6)
+            wind = self.wind_min_kt + ((idx + 0.5) / float(self.num_ss_classes)) * span
+        return tf.where(
+            tf.equal(ss_cat, self.null_label),
+            tf.fill(tf.shape(wind), tf.cast(self.null_wind_kt, tf.float32)),
+            tf.cast(wind, tf.float32),
+        )
+
+    def _prepare_condition_tensors(self, cond, batch_size):
+        if isinstance(cond, dict):
+            ss_cat = tf.cast(cond["ss_cat"], tf.int32)
+            if "wind_kt" in cond:
+                wind_kt = tf.cast(cond["wind_kt"], tf.float32)
+            else:
+                wind_kt = self._default_wind_from_ss_tensor(ss_cat)
+        elif isinstance(cond, (tuple, list)) and len(cond) == 2:
+            ss_cat = tf.cast(cond[0], tf.int32)
+            wind_kt = tf.cast(cond[1], tf.float32)
+        else:
+            ss_cat = tf.cast(cond, tf.int32)
+            wind_kt = self._default_wind_from_ss_tensor(ss_cat)
+
+        ss_cat = tf.reshape(ss_cat, [batch_size])
+        wind_kt = tf.reshape(wind_kt, [batch_size])
+        return ss_cat, wind_kt
 
     def _parse_prediction_type(self, loss_type: str) -> str:
         lt = str(loss_type).strip().lower()
@@ -190,7 +245,7 @@ class Diffusion:
         """
         One-step diffusion training loss.
         x0: (B, H, W, C) in [-1, 1]
-        cond: (B,) scalar for now
+        cond: int tensor (ss cat) or dict with {"ss_cat", "wind_kt"}
         """
         batch_size = tf.shape(x0)[0]
         # Uniform t from [0, num_steps-1]
@@ -200,7 +255,8 @@ class Diffusion:
         noise = tf.random.normal(shape=tf.shape(x0))
 
         x_t = self.q_sample(x0, t, noise)
-        pred = model([x_t, t, cond], training=True)
+        ss_cat, wind_kt = self._prepare_condition_tensors(cond, batch_size)
+        pred = model([x_t, t, ss_cat, wind_kt], training=True)
 
         alpha_bar_t = tf.gather(self.alphas_cumprod, t)  # (B,)
         alpha_bar_t = tf.reshape(alpha_bar_t, (-1, 1, 1, 1))
@@ -223,10 +279,11 @@ class Diffusion:
         Single reverse step p_theta(x_{t-1} | x_t).
 
         t_int: Python int in [0, T-1], same for whole batch.
-        cond: (B,) scalar cond per sample (placeholder for now).
+        cond: int tensor (ss cat) or dict with {"ss_cat", "wind_kt"}.
         """
         bsz = tf.shape(x_t)[0]
         t = tf.fill([bsz], tf.cast(t_int, tf.int32))  # (B,)
+        cond_ss, cond_wind = self._prepare_condition_tensors(cond, bsz)
 
         beta_t = self.betas[t_int]              # scalar
         alpha_t = self.alphas[t_int]            # scalar
@@ -243,18 +300,20 @@ class Diffusion:
 
         if gs > 0.0:
             # unconditional labels: the special null id
-            cond_null = tf.fill([bsz], tf.cast(self.null_label, tf.int32))
+            cond_null_ss = tf.fill([bsz], tf.cast(self.null_label, tf.int32))
+            cond_null_wind = tf.fill([bsz], tf.cast(self.null_wind_kt, tf.float32))
 
             # One forward pass: [cond batch; uncond batch]
             x_in = tf.concat([x_t, x_t], axis=0)
             t_in = tf.concat([t, t], axis=0)
-            c_in = tf.concat([cond, cond_null], axis=0)
+            ss_in = tf.concat([cond_ss, cond_null_ss], axis=0)
+            wind_in = tf.concat([cond_wind, cond_null_wind], axis=0)
 
-            pred_all = model([x_in, t_in, c_in], training=False)
+            pred_all = model([x_in, t_in, ss_in, wind_in], training=False)
             pred_cond, pred_uncond = tf.split(pred_all, num_or_size_splits=2, axis=0)
             pred_theta = pred_uncond + tf.cast(gs, tf.float32) * (pred_cond - pred_uncond)
         else:
-            pred_theta = model([x_t, t, cond], training=False)
+            pred_theta = model([x_t, t, cond_ss, cond_wind], training=False)
 
         if self.prediction_type == "eps":
             eps_theta = pred_theta
@@ -286,22 +345,39 @@ class Diffusion:
         # t == 0: return x0 prediction (NOT model_mean), clipped to expected data range.
         return tf.clip_by_value(x0_pred, -1.0, 1.0)
 
-    def sample(self, model, batch_size, image_size, cond_value=None, show_progress=True, guidance_scale=0.0):
+    def sample(
+        self,
+        model,
+        batch_size,
+        image_size,
+        cond_value=None,
+        wind_value_kt=None,
+        show_progress=True,
+        guidance_scale=0.0,
+    ):
         """
         Generate samples starting from pure noise.
 
-        cond_value: integer SS category index (0..5).
+        cond_value: integer SS category index (0..5), or None for unconditional.
+        wind_value_kt: optional wind conditioning value. If None, uses class midpoint.
         """
         x_t = tf.random.normal(
             shape=(batch_size, image_size, image_size, 1), dtype=tf.float32
         )
 
         if cond_value is None:
-            # unconditional: always use null label
-            cond = tf.fill([batch_size], tf.cast(self.null_label, tf.int32))
+            cond = {
+                "ss_cat": tf.fill([batch_size], tf.cast(self.null_label, tf.int32)),
+                "wind_kt": tf.fill([batch_size], tf.cast(self.null_wind_kt, tf.float32)),
+            }
         else:
-            # conditional: fixed SS category for whole batch
-            cond = tf.fill([batch_size], tf.cast(int(cond_value), tf.int32))
+            cls = int(cond_value)
+            if wind_value_kt is None:
+                wind_value_kt = _ss_class_midpoint_kt_scalar(cls)
+            cond = {
+                "ss_cat": tf.fill([batch_size], tf.cast(cls, tf.int32)),
+                "wind_kt": tf.fill([batch_size], tf.cast(float(wind_value_kt), tf.float32)),
+            }
 
         t_iter = reversed(range(self.num_steps))
         if show_progress:

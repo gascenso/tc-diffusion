@@ -1,6 +1,7 @@
 # tc_diffusion/train_loop.py
 import json
 import glob
+import math
 from pathlib import Path
 
 import tensorflow as tf
@@ -119,6 +120,38 @@ def evaluate_loss(diffusion, model, ds_val, val_steps: int | None = None):
         n += 1
     return loss_sum / max(1, n)
 
+
+def resolve_train_alpha(cfg, epoch_idx: int, num_epochs: int) -> float:
+    data_cfg = cfg.get("data", {})
+    default_alpha = float(data_cfg.get("class_balance_alpha", 1.0))
+    curr_cfg = data_cfg.get("class_balance_curriculum", {})
+    if not isinstance(curr_cfg, dict) or not bool(curr_cfg.get("enabled", False)):
+        return default_alpha
+
+    start_alpha = float(curr_cfg.get("start_alpha", 1.0))
+    end_alpha = float(curr_cfg.get("end_alpha", default_alpha))
+    mode = str(curr_cfg.get("mode", "linear")).strip().lower()
+    start_epoch = int(curr_cfg.get("start_epoch", 0))
+    ramp_epochs = int(curr_cfg.get("ramp_epochs", max(1, num_epochs // 2)))
+
+    if epoch_idx < start_epoch:
+        return start_alpha
+
+    if ramp_epochs <= 1:
+        return end_alpha
+
+    progress = (epoch_idx - start_epoch) / float(ramp_epochs - 1)
+    progress = max(0.0, min(1.0, progress))
+
+    if mode == "cosine":
+        progress = 0.5 * (1.0 - math.cos(math.pi * progress))
+    elif mode != "linear":
+        raise ValueError(
+            f"Unsupported data.class_balance_curriculum.mode='{mode}'. Expected 'linear' or 'cosine'."
+        )
+
+    return (1.0 - progress) * start_alpha + progress * end_alpha
+
 def train(cfg, resume: bool = False):
     # GPU memory growth
     gpus = tf.config.list_physical_devices("GPU")
@@ -135,7 +168,7 @@ def train(cfg, resume: bool = False):
     # Preserve eval_mode if present
     orig_eval_mode = data_cfg.get("eval_mode", "full")
 
-    ds_train = create_dataset(cfg, split="train")
+    ds_train, train_sampler = create_dataset(cfg, split="train", return_train_generator=True)
 
     # Validation: build two deterministic finite sets:
     #   1) full pass over the val split (micro average)
@@ -231,8 +264,16 @@ def train(cfg, resume: bool = False):
                 f"best_loss={best_epoch_loss:.6f}, global_step={global_step}"
             )
 
+    active_alpha = None
+
     for epoch in range(start_epoch, num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
+
+        epoch_alpha = resolve_train_alpha(cfg, epoch_idx=epoch, num_epochs=num_epochs)
+        if active_alpha is None or abs(epoch_alpha - active_alpha) > 1e-12:
+            train_sampler.set_alpha(epoch_alpha, verbose=True)
+            active_alpha = epoch_alpha
+            print(f"[data] Epoch {epoch+1}: class_balance_alpha={epoch_alpha:.4f}")
 
         epoch_loss_sum = 0.0
         epoch_batches = 0

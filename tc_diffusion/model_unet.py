@@ -83,26 +83,33 @@ class GroupNorm(layers.Layer):
 
 
 class ClassifierFreeCondDropout(layers.Layer):
-    """CFG label dropout.
+    """Joint CFG dropout for categorical and continuous conditioning."""
 
-    Replaces a fraction of conditioning labels with a special "null" label id.
-    This enables classifier-free guidance at inference time (two-pass guidance).
-    """
-
-    def __init__(self, drop_prob: float, null_label: int, **kwargs):
+    def __init__(self, drop_prob: float, null_label: int, null_wind_kt: float, **kwargs):
         super().__init__(**kwargs)
         self.drop_prob = float(drop_prob)
         self.null_label = int(null_label)
+        self.null_wind_kt = float(null_wind_kt)
 
-    def call(self, labels, training=None):
+    def call(self, inputs, training=None):
+        labels, wind_kt = inputs
         labels = tf.cast(labels, tf.int32)
-        if not training or self.drop_prob <= 0.0:
-            return labels
+        wind_kt = tf.cast(wind_kt, tf.float32)
+        if self.drop_prob <= 0.0:
+            return labels, wind_kt
 
-        # Randomly drop conditioning per-sample.
-        rnd = tf.random.uniform(tf.shape(labels), 0.0, 1.0)
-        dropped = tf.where(rnd < self.drop_prob, tf.fill(tf.shape(labels), self.null_label), labels)
-        return dropped
+        if training is None:
+            training = keras.backend.learning_phase()
+        training = tf.cast(training, tf.bool)
+
+        def _drop():
+            rnd = tf.random.uniform(tf.shape(labels), 0.0, 1.0)
+            drop = rnd < self.drop_prob
+            labels_out = tf.where(drop, tf.fill(tf.shape(labels), self.null_label), labels)
+            wind_out = tf.where(drop, tf.fill(tf.shape(wind_kt), self.null_wind_kt), wind_kt)
+            return labels_out, wind_out
+
+        return tf.cond(training, _drop, lambda: (labels, wind_kt))
 
 def make_res_block(x, emb, out_channels, name_prefix, gn_groups=32):
     """
@@ -161,12 +168,18 @@ def build_unet(cfg):
     # Inputs
     x_in = keras.Input(shape=(image_size, image_size, 1), name="x_t")
     t_in = keras.Input(shape=(), dtype=tf.int32, name="t")
-    # SS category conditioning (0..num_ss_classes-1). We reserve one extra id = num_ss_classes
-    # as the CFG "null" label used when conditioning is dropped during training.
-    num_ss_classes = int(cfg.get("conditioning", {}).get("num_ss_classes", 6))
-    cfg_drop_prob = float(cfg.get("conditioning", {}).get("cfg_drop_prob", 0.0))
+    cond_cfg = cfg.get("conditioning", {})
 
-    cond_in = keras.Input(shape=(), dtype=tf.int32, name="ss_cat")
+    # SS category conditioning (0..num_ss_classes-1). One extra id is reserved as CFG null token.
+    num_ss_classes = int(cond_cfg.get("num_ss_classes", 6))
+    cfg_drop_prob = float(cond_cfg.get("cfg_drop_prob", 0.0))
+    use_wind_speed = bool(cond_cfg.get("use_wind_speed", False))
+    wind_min_kt = float(cond_cfg.get("wind_min_kt", 35.0))
+    wind_max_kt = float(cond_cfg.get("wind_max_kt", 170.0))
+    wind_null_kt = float(cond_cfg.get("wind_null_kt", 0.0))
+
+    ss_cat_in = keras.Input(shape=(), dtype=tf.int32, name="ss_cat")
+    wind_kt_in = keras.Input(shape=(), dtype=tf.float32, name="wind_kt")
 
     # ---- time embedding ----
     t_emb_dim = base_channels * 4
@@ -179,34 +192,72 @@ def build_unet(cfg):
     null_label = num_ss_classes
 
     # Safety: clip to valid range [0, num_ss_classes-1] before applying CFG.
-    cond_clipped = layers.Lambda(
+    ss_cat_clipped = layers.Lambda(
         lambda c: tf.where(
             tf.equal(tf.cast(c, tf.int32), tf.cast(null_label, tf.int32)),
             tf.cast(c, tf.int32),  # keep null label as-is
             tf.clip_by_value(tf.cast(c, tf.int32), 0, num_ss_classes - 1),
         ),
         name="ss_cat_clip_preserve_null",
-    )(cond_in)
+    )(ss_cat_in)
+    wind_kt_clipped = layers.Lambda(
+        lambda w: tf.where(
+            tf.equal(tf.cast(w, tf.float32), tf.cast(wind_null_kt, tf.float32)),
+            tf.cast(w, tf.float32),  # keep null wind token as-is
+            tf.clip_by_value(tf.cast(w, tf.float32), wind_min_kt, wind_max_kt),
+        ),
+        name="wind_clip_preserve_null",
+    )(wind_kt_in)
 
-    cond_dropped = ClassifierFreeCondDropout(
+    ss_cat_dropped, wind_kt_dropped = ClassifierFreeCondDropout(
         drop_prob=cfg_drop_prob,
         null_label=null_label,
+        null_wind_kt=wind_null_kt,
         name="cfg_cond_dropout",
-    )(cond_clipped)
+    )([ss_cat_clipped, wind_kt_clipped])
 
     # Embedding includes the extra "null" label.
     c_emb = layers.Embedding(
         input_dim=num_ss_classes + 1,
         output_dim=t_emb_dim,
         name="ss_cat_emb",
-    )(cond_dropped)
+    )(ss_cat_dropped)
 
     # Optional MLP on top of the embedding (helps expressivity without much cost).
     c_emb = layers.Dense(t_emb_dim, activation="swish", name="c_emb_dense1")(c_emb)
     c_emb = layers.Dense(t_emb_dim, activation="swish", name="c_emb_dense2")(c_emb)
 
-    # fuse time + cond
-    tc_emb = layers.Add(name="tc_emb")([t_emb, c_emb])  # (B, t_emb_dim)
+    if use_wind_speed:
+        wind_scaled = layers.Lambda(
+            lambda w: tf.where(
+                tf.equal(w, tf.cast(wind_null_kt, tf.float32)),
+                tf.fill(tf.shape(w), tf.cast(-2.0, tf.float32)),
+                tf.clip_by_value(
+                    2.0 * ((w - wind_min_kt) / max(wind_max_kt - wind_min_kt, 1e-6)) - 1.0,
+                    -1.0,
+                    1.0,
+                ),
+            ),
+            name="wind_scaled",
+        )(wind_kt_dropped)
+        wind_feats = layers.Lambda(
+            lambda w: tf.concat(
+                [
+                    w[:, None],
+                    tf.sin(3.141592653589793 * w[:, None]),
+                    tf.cos(3.141592653589793 * w[:, None]),
+                    tf.sin(2.0 * 3.141592653589793 * w[:, None]),
+                    tf.cos(2.0 * 3.141592653589793 * w[:, None]),
+                ],
+                axis=-1,
+            ),
+            name="wind_fourier_feats",
+        )(wind_scaled)
+        w_emb = layers.Dense(t_emb_dim, activation="swish", name="w_emb_dense1")(wind_feats)
+        w_emb = layers.Dense(t_emb_dim, activation="swish", name="w_emb_dense2")(w_emb)
+        tc_emb = layers.Add(name="tc_emb")([t_emb, c_emb, w_emb])  # (B, t_emb_dim)
+    else:
+        tc_emb = layers.Add(name="tc_emb")([t_emb, c_emb])  # (B, t_emb_dim)
 
     # ---- Downsampling path ----
     hs = []  # skip connections
@@ -259,5 +310,9 @@ def build_unet(cfg):
     # ---- Output ----
     eps_out = layers.Conv2D(1, 3, padding="same", name="eps_out")(h)
 
-    model = keras.Model(inputs=[x_in, t_in, cond_in], outputs=eps_out, name="unet_ddpm")
+    model = keras.Model(
+        inputs=[x_in, t_in, ss_cat_in, wind_kt_in],
+        outputs=eps_out,
+        name="unet_ddpm",
+    )
     return model

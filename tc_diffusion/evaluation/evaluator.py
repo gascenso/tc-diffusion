@@ -64,6 +64,87 @@ def _write_json(path: Path, obj: Dict[str, Any]):
         json.dump(obj, f, indent=2)
 
 
+def _ss_class_midpoint_kt(ss_cat: int) -> float:
+    cls = int(ss_cat)
+    if cls == 0:
+        return 49.0
+    if cls == 1:
+        return 73.0
+    if cls == 2:
+        return 89.0
+    if cls == 3:
+        return 104.0
+    if cls == 4:
+        return 124.5
+    return 145.0
+
+
+def _resolve_eval_wind_target_kt(cfg: Dict[str, Any], ss_cat: int) -> float:
+    cond_cfg = cfg.get("conditioning", {})
+    targets = cond_cfg.get("eval_wind_targets_kt")
+    if isinstance(targets, dict):
+        key = str(int(ss_cat))
+        if key in targets:
+            try:
+                return float(targets[key])
+            except Exception:
+                pass
+    return _ss_class_midpoint_kt(int(ss_cat))
+
+
+def _pearson(x: np.ndarray, y: np.ndarray) -> float | None:
+    if x.size < 2 or y.size < 2:
+        return None
+    x = x.astype(np.float64)
+    y = y.astype(np.float64)
+    x = x - x.mean()
+    y = y - y.mean()
+    den = float(np.sqrt(np.sum(x * x) * np.sum(y * y)))
+    if den <= 0.0:
+        return None
+    return float(np.sum(x * y) / den)
+
+
+def _compute_macro_metrics(per_class_metrics: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    if not per_class_metrics:
+        return {}
+
+    class_ids = sorted(int(c) for c in per_class_metrics.keys())
+    classes = np.asarray(class_ids, dtype=np.float64)
+    real_mean = np.asarray(
+        [per_class_metrics[c]["pixel_stats"]["real"]["mean"] for c in class_ids],
+        dtype=np.float64,
+    )
+    gen_mean = np.asarray(
+        [per_class_metrics[c]["pixel_stats"]["gen_raw"]["mean"] for c in class_ids],
+        dtype=np.float64,
+    )
+    real_eye = np.asarray(
+        [per_class_metrics[c]["eye_contrast_proxy"]["real_mean"] for c in class_ids],
+        dtype=np.float64,
+    )
+    gen_eye = np.asarray(
+        [per_class_metrics[c]["eye_contrast_proxy"]["gen_mean"] for c in class_ids],
+        dtype=np.float64,
+    )
+
+    out = {
+        "pixel_mean_bt": {
+            "corr_class_real": _pearson(classes, real_mean),
+            "corr_class_gen": _pearson(classes, gen_mean),
+            "corr_real_gen": _pearson(real_mean, gen_mean),
+            "mae_gen_vs_real": float(np.mean(np.abs(gen_mean - real_mean))),
+        },
+        "eye_contrast_proxy": {
+            "corr_class_real": _pearson(classes, real_eye),
+            "corr_class_gen": _pearson(classes, gen_eye),
+            "corr_real_gen": _pearson(real_eye, gen_eye),
+            "mae_gen_vs_real": float(np.mean(np.abs(gen_eye - real_eye))),
+        },
+    }
+    return out
+
+
 # -----------------------------------------------------------------------------
 # real data loading
 # -----------------------------------------------------------------------------
@@ -281,6 +362,7 @@ class TCEvaluator:
         image_size = int(data_cfg.get("image_size", 256))
 
         num_classes = int(cfg["conditioning"]["num_ss_classes"])
+        use_wind_speed = bool(cfg.get("conditioning", {}).get("use_wind_speed", False))
         n_per = int(ev["n_per_class_heavy"] if heavy else ev["n_per_class_light"])
         if n_per <= 0:
             raise ValueError(f"evaluation n_per_class must be > 0, got {n_per}")
@@ -303,12 +385,18 @@ class TCEvaluator:
         eval_root.mkdir(parents=True, exist_ok=True)
 
         gen_by_class: Dict[int, np.ndarray] = {}
+        wind_targets_kt: Dict[int, float] = {}
 
         class_iter = range(num_classes)
         if show_progress:
             class_iter = tqdm(class_iter, desc="Eval: generating", leave=True)
 
         for c in class_iter:
+            wind_target = None
+            if use_wind_speed:
+                wind_target = _resolve_eval_wind_target_kt(cfg, c)
+                wind_targets_kt[int(c)] = float(wind_target)
+
             chunks = []
             remaining = n_per
             while remaining > 0:
@@ -318,6 +406,7 @@ class TCEvaluator:
                     batch_size=bsz,
                     image_size=image_size,
                     cond_value=c,
+                    wind_value_kt=wind_target,
                     guidance_scale=float(ev["guidance_scale"]),
                     show_progress=show_progress,
                 ).numpy()
@@ -427,9 +516,13 @@ class TCEvaluator:
             "heavy": heavy,
             "n_per_class": n_per,
             "gen_batch_size": gen_batch_size,
-            "macro": {},
+            "macro": _compute_macro_metrics(per_class_metrics),
             "per_class": per_class_metrics,
         }
+        if wind_targets_kt:
+            report["conditioning_targets"] = {
+                "wind_kt_by_class": {str(k): float(v) for k, v in sorted(wind_targets_kt.items())}
+            }
 
         _write_json(eval_root / "metrics.json", report)
         return report

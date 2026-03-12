@@ -39,6 +39,12 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--wind_kt",
+        type=float,
+        default=None,
+        help="Continuous wind conditioning value [kt]. If omitted, class midpoint is used.",
+    )
+    p.add_argument(
         "--name",
         type=str,
         default="baseline_ddpm_tc",
@@ -114,6 +120,7 @@ if __name__ == "__main__":
     model.load_weights(str(weights_path))
 
     cond_value = None if args.uncond else args.ss_cat
+    wind_value_kt = None if args.uncond else args.wind_kt
 
     print("Sampling...")
     x_samples = diffusion.sample(
@@ -121,6 +128,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         image_size=image_size,
         cond_value=cond_value,
+        wind_value_kt=wind_value_kt,
         guidance_scale=args.guidance_scale,
     )
 

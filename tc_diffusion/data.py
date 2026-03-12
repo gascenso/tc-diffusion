@@ -3,7 +3,7 @@ import random
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Iterator, Tuple
+from typing import Any, Dict, Iterator, List, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -203,7 +203,27 @@ def preprocess_bt(bt: np.ndarray, bt_range: Tuple[float, float]) -> np.ndarray:
     bt = bt * 2.0 - 1.0                     # [-1,1]
     return bt
 
-def load_dataset_index(index_path: Path) -> Dict[int, List[str]]:
+def ss_class_midpoint_kt(ss_cat: int) -> float:
+    """Representative wind speed [kt] for each SS class."""
+    cls = int(ss_cat)
+    # Midpoints in the WMO bins used by scripts/create_dataset_index.py.
+    if cls == 0:
+        return 49.0   # 35-63
+    if cls == 1:
+        return 73.0   # 64-82
+    if cls == 2:
+        return 89.0   # 83-95
+    if cls == 3:
+        return 104.0  # 96-112
+    if cls == 4:
+        return 124.5  # 113-136
+    return 145.0      # >136
+
+
+def load_dataset_index(
+    index_path: Path,
+    return_sample_meta: bool = False,
+) -> Dict[int, List[str]] | Tuple[Dict[int, List[str]], Dict[str, Dict[str, Any]]]:
     """
     Load dataset_index.json and return class -> list of relative file paths.
     """
@@ -213,8 +233,52 @@ def load_dataset_index(index_path: Path) -> Dict[int, List[str]]:
     class_to_files = {
         int(k): v for k, v in index["classes"].items()
     }
+    if not return_sample_meta:
+        return class_to_files
 
-    return class_to_files
+    raw_samples = index.get("samples", {})
+    sample_meta: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw_samples, dict):
+        for rel_path, meta in raw_samples.items():
+            if not isinstance(meta, dict):
+                continue
+            entry: Dict[str, Any] = {}
+            if "ss_cat" in meta:
+                try:
+                    entry["ss_cat"] = int(meta["ss_cat"])
+                except Exception:
+                    pass
+            if "wmo_wind_kt" in meta:
+                try:
+                    w = float(meta["wmo_wind_kt"])
+                    if np.isfinite(w):
+                        entry["wmo_wind_kt"] = w
+                except Exception:
+                    pass
+            if entry:
+                sample_meta[str(rel_path)] = entry
+
+    return class_to_files, sample_meta
+
+
+def build_relpath_to_wind_kt(
+    rel_paths: List[str],
+    labels: List[int],
+    sample_meta: Dict[str, Dict[str, Any]],
+) -> Tuple[Dict[str, float], int]:
+    """Build rel_path -> wind[kt] map; fall back to class midpoint when metadata is missing."""
+    out: Dict[str, float] = {}
+    n_fallback = 0
+    for rel_path, y in zip(rel_paths, labels):
+        meta = sample_meta.get(rel_path)
+        if meta is not None and "wmo_wind_kt" in meta:
+            wind_kt = float(meta["wmo_wind_kt"])
+            if np.isfinite(wind_kt):
+                out[rel_path] = wind_kt
+                continue
+        out[rel_path] = ss_class_midpoint_kt(int(y))
+        n_fallback += 1
+    return out, n_fallback
 
 
 class BTDataBackend:
@@ -480,9 +544,12 @@ def _fixed_balanced_subset(
 def _tf_load_one_sample(
     backend: BTDataBackend,
     bt_range: Tuple[float, float],
+    use_wind_speed: bool = False,
+    rel_path_to_wind_kt: Dict[str, float] | None = None,
 ):
     """Factory returning a tf.data map fn that loads & preprocesses one sample."""
     bt_min, bt_max = float(bt_range[0]), float(bt_range[1])
+    wind_lookup = dict(rel_path_to_wind_kt or {})
 
     def _decode_path(rel_path_obj) -> str:
         # rel_path_obj can be bytes, np.bytes_, or a 0-d numpy array
@@ -498,21 +565,38 @@ def _tf_load_one_sample(
 
     def _py_load(rel_path_obj, label):
         rel_path = _decode_path(rel_path_obj)
+        y = int(label)
         bt = backend.load_bt(rel_path)
         bt = preprocess_bt(bt, (bt_min, bt_max))
         if bt.ndim == 2:
             bt = bt[..., None]
-        return bt, np.int32(label)
+        if not use_wind_speed:
+            return bt, np.int32(y)
+
+        wind_kt = float(wind_lookup.get(rel_path, ss_class_midpoint_kt(y)))
+        return bt, np.int32(y), np.float32(wind_kt)
 
     def _tf_map(rel_path, label):
-        bt, y = tf.numpy_function(
+        if not use_wind_speed:
+            bt, y = tf.numpy_function(
+                func=_py_load,
+                inp=[rel_path, label],
+                Tout=[tf.float32, tf.int32],
+            )
+            bt.set_shape([None, None, 1])
+            y.set_shape([])
+            return bt, y
+
+        bt, y, wind_kt = tf.numpy_function(
             func=_py_load,
             inp=[rel_path, label],
-            Tout=[tf.float32, tf.int32],
+            Tout=[tf.float32, tf.int32, tf.float32],
         )
         bt.set_shape([None, None, 1])
         y.set_shape([])
-        return bt, y
+        wind_kt.set_shape([])
+        cond = {"ss_cat": y, "wind_kt": wind_kt}
+        return bt, cond
 
     return _tf_map
 
@@ -526,6 +610,8 @@ def _create_finite_eval_dataset(
     seed: int,
     bt_range: Tuple[float, float],
     shuffle: bool,
+    use_wind_speed: bool = False,
+    rel_path_to_wind_kt: Dict[str, float] | None = None,
     num_parallel_calls=1,
 ) -> tf.data.Dataset:
     ds = tf.data.Dataset.from_tensor_slices(
@@ -542,7 +628,12 @@ def _create_finite_eval_dataset(
             reshuffle_each_iteration=False,
         )
 
-    map_fn = _tf_load_one_sample(backend, bt_range)
+    map_fn = _tf_load_one_sample(
+        backend,
+        bt_range,
+        use_wind_speed=use_wind_speed,
+        rel_path_to_wind_kt=rel_path_to_wind_kt,
+    )
     ds = ds.map(map_fn, num_parallel_calls=int(num_parallel_calls), deterministic=True)
     ds = ds.batch(batch_size, drop_remainder=False)
     ds = ds.prefetch(tf.data.AUTOTUNE if backend.supports_parallel_reads else 1)
@@ -577,13 +668,26 @@ class BalancedTCGenerator:
         class_probs: Dict[int, float],
         seed: int = 42,
         bt_range: Tuple[float, float] = (117.0, 348.0),
+        use_wind_speed: bool = False,
+        rel_path_to_wind_kt: Dict[str, float] | None = None,
     ):
         self.backend = backend
         self.class_to_files = {int(c): list(v) for c, v in class_to_files.items()}
-        self.class_probs = class_probs
+        self.class_probs = {int(c): float(p) for c, p in class_probs.items()}
         self.bt_range = bt_range
+        self.use_wind_speed = bool(use_wind_speed)
+        self.rel_path_to_wind_kt = dict(rel_path_to_wind_kt or {})
+        self.alpha = None
 
-        # Keep only classes that are both sampleable and assigned non-zero mass.
+        self.classes: List[int] = []
+        self.probs = np.zeros((0,), dtype=np.float64)
+        self.set_class_probs(self.class_probs, verbose=True)
+
+        self.rng = random.Random(seed)
+
+    def set_class_probs(self, class_probs: Dict[int, float], verbose: bool = False):
+        """Update class sampling probabilities for curriculum schedules."""
+        self.class_probs = {int(c): float(p) for c, p in class_probs.items()}
         self.classes = [
             c for c in sorted(self.class_to_files.keys())
             if (len(self.class_to_files[c]) > 0) and (float(self.class_probs.get(c, 0.0)) > 0.0)
@@ -597,9 +701,22 @@ class BalancedTCGenerator:
             raise RuntimeError("Class sampling probabilities have non-positive sum.")
         self.probs = probs / psum
 
-        self.rng = random.Random(seed)
+        if verbose:
+            print("\n[data] Class-balanced sampling probabilities:")
+            for c in sorted(self.class_probs):
+                print(
+                    f"  class {c}: p = {self.class_probs[c]:.4f} "
+                    f"(n = {len(self.class_to_files.get(c, []))})"
+                )
+            print()
 
-    def __iter__(self) -> Iterator[Tuple[np.ndarray, np.int32]]:
+    def set_alpha(self, alpha: float, verbose: bool = False):
+        """Recompute class probabilities from alpha and apply them."""
+        self.alpha = float(alpha)
+        class_probs = compute_class_sampling_probs(self.class_to_files, self.alpha)
+        self.set_class_probs(class_probs, verbose=verbose)
+
+    def __iter__(self) -> Iterator[Tuple[np.ndarray, np.int32] | Tuple[np.ndarray, Dict[str, np.generic]]]:
         while True:
             # 1) sample class
             cls = self.rng.choices(self.classes, weights=self.probs, k=1)[0]
@@ -615,14 +732,27 @@ class BalancedTCGenerator:
             if bt.ndim == 2:
                 bt = bt[..., None]
 
-            yield bt, np.int32(cls)
+            if not self.use_wind_speed:
+                yield bt, np.int32(cls)
+                continue
+
+            wind_kt = float(self.rel_path_to_wind_kt.get(rel_path, ss_class_midpoint_kt(cls)))
+            cond = {
+                "ss_cat": np.int32(cls),
+                "wind_kt": np.float32(wind_kt),
+            }
+            yield bt, cond
 
 
 # ------------------------------------------------------------
 # Public API
 # ------------------------------------------------------------
 
-def create_dataset(cfg, split) -> tf.data.Dataset:
+def create_dataset(
+    cfg,
+    split,
+    return_train_generator: bool = False,
+) -> tf.data.Dataset | Tuple[tf.data.Dataset, BalancedTCGenerator]:
     """
     Create a tf.data.Dataset.
 
@@ -636,6 +766,8 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
     """
 
     data_cfg = cfg["data"]
+    cond_cfg = cfg.get("conditioning", {})
+    use_wind_speed = bool(cond_cfg.get("use_wind_speed", False))
     index_path = Path(data_cfg["dataset_index"])
     backend = build_data_backend(data_cfg)
 
@@ -643,13 +775,21 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
     seed = int(cfg.get("seed", 42))
 
     # ---- load index ----
-    class_to_files = load_dataset_index(index_path)
+    if use_wind_speed:
+        class_to_files, sample_meta = load_dataset_index(index_path, return_sample_meta=True)
+    else:
+        class_to_files = load_dataset_index(index_path)
+        sample_meta = {}
     # apply split
     split_dir = Path(data_cfg.get("split_dir", "data/splits"))
     allowed = load_split_file_set(split_dir, split)
 
-    # Use alpha from config only for training; use empirical (alpha=1.0) for val/test
+    # Use alpha from config only for training; use empirical (alpha=1.0) for val/test.
+    # If curriculum is enabled, initialize at start_alpha (train_loop will update every epoch).
     alpha = float(data_cfg.get("class_balance_alpha", 1.0))
+    curr_cfg = data_cfg.get("class_balance_curriculum", {})
+    if split == "train" and isinstance(curr_cfg, dict) and bool(curr_cfg.get("enabled", False)):
+        alpha = float(curr_cfg.get("start_alpha", alpha))
 
     # Filter class->files to this split
     class_to_files = {
@@ -687,6 +827,20 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
                     f"balanced_fixed produced an empty subset (per_class={per_class})."
                 )
 
+        rel_path_to_wind_kt = None
+        if use_wind_speed:
+            rel_path_to_wind_kt, n_fallback = build_relpath_to_wind_kt(rel_paths, labels, sample_meta)
+            if n_fallback == len(rel_paths):
+                raise RuntimeError(
+                    "conditioning.use_wind_speed=true, but dataset_index has no usable per-sample wind metadata "
+                    "for this split. Rebuild data/dataset_index.json with scripts/create_dataset_index.py."
+                )
+            if n_fallback > 0:
+                print(
+                    f"[data] Warning: missing wind metadata for {n_fallback}/{len(rel_paths)} "
+                    "validation/test samples; using class-midpoint fallback."
+                )
+
         num_parallel_calls = resolve_eval_num_parallel_calls(data_cfg, backend)
         # NOTE: shuffle=False ensures a stable, full-pass metric per epoch.
         return _create_finite_eval_dataset(
@@ -697,18 +851,38 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
             seed=eval_seed,
             bt_range=bt_range,
             shuffle=False,
+            use_wind_speed=use_wind_speed,
+            rel_path_to_wind_kt=rel_path_to_wind_kt,
             num_parallel_calls=num_parallel_calls,
         )
 
+    train_rel_paths = []
+    train_labels = []
+    for c, paths in class_to_files.items():
+        for rel_path in paths:
+            train_rel_paths.append(rel_path)
+            train_labels.append(int(c))
+
+    rel_path_to_wind_kt = None
+    if use_wind_speed:
+        rel_path_to_wind_kt, n_fallback = build_relpath_to_wind_kt(
+            train_rel_paths,
+            train_labels,
+            sample_meta,
+        )
+        if n_fallback == len(train_rel_paths):
+            raise RuntimeError(
+                "conditioning.use_wind_speed=true, but dataset_index has no usable per-sample wind metadata "
+                "for training. Rebuild data/dataset_index.json with scripts/create_dataset_index.py."
+            )
+        if n_fallback > 0:
+            print(
+                f"[data] Warning: missing wind metadata for {n_fallback}/{len(train_rel_paths)} "
+                "training samples; using class-midpoint fallback."
+            )
+
     # ---- compute sampling probabilities ----
     class_probs = compute_class_sampling_probs(class_to_files, alpha)
-
-    # print once for sanity
-    print("\n[data] Class-balanced sampling probabilities:")
-    for c in sorted(class_probs):
-        print(f"  class {c}: p = {class_probs[c]:.4f} "
-              f"(n = {len(class_to_files[c])})")
-    print()
 
     # ---- generator ----
     gen = BalancedTCGenerator(
@@ -717,26 +891,50 @@ def create_dataset(cfg, split) -> tf.data.Dataset:
         class_probs=class_probs,
         seed=seed,
         bt_range=bt_range,
+        use_wind_speed=use_wind_speed,
+        rel_path_to_wind_kt=rel_path_to_wind_kt,
     )
 
     # ---- tf.data.Dataset ----
-    ds = tf.data.Dataset.from_generator(
-        lambda: iter(gen),
-        output_signature=(
+    if use_wind_speed:
+        output_signature = (
+            tf.TensorSpec(shape=(None, None, 1), dtype=tf.float32),
+            {
+                "ss_cat": tf.TensorSpec(shape=(), dtype=tf.int32),
+                "wind_kt": tf.TensorSpec(shape=(), dtype=tf.float32),
+            },
+        )
+    else:
+        output_signature = (
             tf.TensorSpec(shape=(None, None, 1), dtype=tf.float32),
             tf.TensorSpec(shape=(), dtype=tf.int32),
-        ),
+        )
+
+    ds = tf.data.Dataset.from_generator(
+        lambda: iter(gen),
+        output_signature=output_signature,
     )
 
     # shuffle only within small buffer (structure comes from sampler)
     ds = ds.shuffle(buffer_size=4 * batch_size, seed=seed)
     p_aug, max_shift, max_bars = _build_aug_policy(int(cfg["conditioning"]["num_ss_classes"]))
-    ds = ds.map(
-        lambda x, y: (augment_x_given_y(x, y, p_aug, max_shift, max_bars), y),
-        num_parallel_calls=tf.data.AUTOTUNE,
-    )
+    if use_wind_speed:
+        ds = ds.map(
+            lambda x, cond: (
+                augment_x_given_y(x, cond["ss_cat"], p_aug, max_shift, max_bars),
+                cond,
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+    else:
+        ds = ds.map(
+            lambda x, y: (augment_x_given_y(x, y, p_aug, max_shift, max_bars), y),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
 
     ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
 
+    if return_train_generator:
+        return ds, gen
     return ds
