@@ -47,6 +47,7 @@ def build_index(data_root: Path, output_path: Path):
         raise RuntimeError(f"No .nc files found under {data_root}")
 
     class_to_files = {str(i): [] for i in range(6)}
+    sample_meta: dict[str, dict] = {}
 
     skipped_no_wind = 0
     skipped_below_ts = 0
@@ -74,6 +75,10 @@ def build_index(data_root: Path, output_path: Path):
                 # Store relative path
                 rel_path = nc_path.relative_to(data_root).as_posix()
                 class_to_files[str(ss_cat)].append(rel_path)
+                sample_meta[rel_path] = {
+                    "ss_cat": int(ss_cat),
+                    "wmo_wind_kt": float(wind),
+                }
 
         except Exception as e:
             raise RuntimeError(f"Failed processing {nc_path}: {e}")
@@ -98,6 +103,7 @@ def build_index(data_root: Path, output_path: Path):
             },
         },
         "classes": class_to_files,
+        "samples": sample_meta,
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
