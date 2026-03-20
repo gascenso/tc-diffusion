@@ -91,6 +91,21 @@ class ClassifierFreeCondDropout(layers.Layer):
         self.null_label = int(null_label)
         self.null_wind_kt = float(null_wind_kt)
 
+    def _drop_conditioning(self, labels, wind_kt):
+        rnd = tf.random.uniform(tf.shape(labels), 0.0, 1.0, dtype=tf.float32)
+        drop = rnd < self.drop_prob
+        labels_out = tf.where(
+            drop,
+            tf.fill(tf.shape(labels), tf.cast(self.null_label, labels.dtype)),
+            labels,
+        )
+        wind_out = tf.where(
+            drop,
+            tf.fill(tf.shape(wind_kt), tf.cast(self.null_wind_kt, wind_kt.dtype)),
+            wind_kt,
+        )
+        return labels_out, wind_out
+
     def call(self, inputs, training=None):
         labels, wind_kt = inputs
         labels = tf.cast(labels, tf.int32)
@@ -99,17 +114,33 @@ class ClassifierFreeCondDropout(layers.Layer):
             return labels, wind_kt
 
         if training is None:
-            training = keras.backend.learning_phase()
+            training = False
+
+        if isinstance(training, bool):
+            if training:
+                return self._drop_conditioning(labels, wind_kt)
+            return labels, wind_kt
+
         training = tf.cast(training, tf.bool)
+        return tf.cond(
+            training,
+            lambda: self._drop_conditioning(labels, wind_kt),
+            lambda: (labels, wind_kt),
+        )
 
-        def _drop():
-            rnd = tf.random.uniform(tf.shape(labels), 0.0, 1.0)
-            drop = rnd < self.drop_prob
-            labels_out = tf.where(drop, tf.fill(tf.shape(labels), self.null_label), labels)
-            wind_out = tf.where(drop, tf.fill(tf.shape(wind_kt), self.null_wind_kt), wind_kt)
-            return labels_out, wind_out
+    def compute_output_shape(self, input_shape):
+        return tuple(input_shape)
 
-        return tf.cond(training, _drop, lambda: (labels, wind_kt))
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "drop_prob": self.drop_prob,
+                "null_label": self.null_label,
+                "null_wind_kt": self.null_wind_kt,
+            }
+        )
+        return config
 
 def make_res_block(x, emb, out_channels, name_prefix, gn_groups=32):
     """
