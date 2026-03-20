@@ -1,8 +1,8 @@
 data:
   data_root: "data/gridsat_patches"
-  dataset_index: "data/dataset_index.json"
-  backend: "netcdf"           # "netcdf" | "packed_memmap"
-  packed_manifest: null       # required when backend: packed_memmap
+  dataset_index: "data/dataset_index_wind.json"
+  backend: "packed_memmap"           # "netcdf" | "packed_memmap"
+  packed_manifest: "data/packed_tc_memmap/manifest.json"       # required when backend: packed_memmap
   netcdf_engine: "netcdf4"
   class_balance_alpha: 0.4
   class_balance_curriculum:
