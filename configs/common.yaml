@@ -1,0 +1,85 @@
+data:
+  data_root: "data/gridsat_patches"
+  dataset_index: "data/dataset_index_wind.json"
+  backend: "packed_memmap"           # local/HPC can override if needed
+  packed_manifest: "data/packed_tc_memmap/manifest.json"
+  netcdf_engine: "netcdf4"
+  class_balance_alpha: 0.4
+  class_balance_curriculum:
+    enabled: true
+    start_alpha: 1.0
+    end_alpha: 0.4
+    start_epoch: 0
+    ramp_epochs: 40
+    mode: "cosine"
+  batch_size: 8
+  image_size: 256
+  bt_min_k: 180.0 # q0.1; global min is 117.0
+  bt_max_k: 310.0 # q99.9; global max is 348.0
+  split_dir: data/splits
+  eval_num_parallel_calls: null  # null -> 1 for netcdf, AUTOTUNE for packed_memmap
+  eval_seed: 42
+  eval_mode: full
+  val_balanced_per_class: 5
+
+conditioning:
+  num_ss_classes: 6
+  use_wind_speed: true
+  wind_min_kt: 35.0
+  wind_max_kt: 170.0
+  wind_null_kt: 0.0
+  eval_wind_targets_kt:
+    "0": 49.0
+    "1": 73.0
+    "2": 89.0
+    "3": 104.0
+    "4": 124.5
+    "5": 145.0
+  use_basin: false
+  cfg_drop_prob: 0.1
+
+model:
+  base_channels: 32
+  channel_mults: [1, 2, 4, 8]
+  num_res_blocks: 2
+  attention_resolutions: []
+  attention_heads: 4
+  dropout: 0.0
+
+diffusion:
+  num_steps: 1000
+  beta_schedule: "linear"
+  loss_type: "v_mse"
+  min_snr_gamma: 2.5
+  dynamic_threshold: true
+  dynamic_threshold_p: 0.995
+
+training:
+  num_epochs: 100
+  steps_per_epoch: 2000
+  lr: 1e-4
+  ema_decay: 0.9999
+  log_interval_steps: 10
+  mixed_precision: false
+  val_every_epochs: 1
+  early_stopping:
+    enabled: true
+    patience_epochs: 15
+    min_delta: 1.0e-8
+
+evaluation:
+  n_per_class_heavy: 35
+  gen_batch_size: null
+  guidance_scale: 2.5
+  sampler: "ddpm"
+  seed: 123
+  real_seed: 123
+  profile_bins: 96
+  psd_bins: 96
+
+  proxy_classifier:
+    enabled: true
+    max_train_per_class: 2000
+    C: 1.0
+    solver: "lbfgs"
+    max_iter: 200

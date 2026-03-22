@@ -23,7 +23,7 @@ def parse_args():
     p.add_argument(
         "--config",
         type=str,
-        default="configs/base.yaml"
+        default="configs/local.yaml"
     )
     p.add_argument(
         "--override",

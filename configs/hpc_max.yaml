@@ -1,0 +1,25 @@
+_base_: common.yaml
+
+data:
+  backend: "packed_memmap"
+  packed_manifest: "data/packed_tc_memmap/manifest.json"
+  batch_size: 16          # if this OOMs on the HPC, reduce batch size first
+
+model:
+  base_channels: 64
+  channel_mults: [1, 2, 4, 8]
+  num_res_blocks: 3
+  attention_resolutions: [64, 32]
+  attention_heads: 8
+
+training:
+  num_epochs: 120
+  steps_per_epoch: 2500
+  early_stopping:
+    enabled: true
+    patience_epochs: 20
+    min_delta: 1.0e-8
+
+evaluation:
+  gen_batch_size: 4       # smaller eval micro-batch keeps heavy eval safer
+  guidance_scale: 1.0     # start lower; 2.5 looked too aggressive in prior sweeps
