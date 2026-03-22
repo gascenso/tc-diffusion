@@ -3,13 +3,16 @@ _base_: common.yaml
 data:
   backend: "packed_memmap"
   packed_manifest: "data/packed_tc_memmap/manifest.json"
-  batch_size: 16          # if this OOMs on the HPC, reduce batch size first
+  batch_size: 8           # prioritize model capacity over batch size
 
 model:
   base_channels: 64
   channel_mults: [1, 2, 4, 8]
   num_res_blocks: 3
-  attention_resolutions: [64, 32]
+  # Full attention at 64x64 creates 4096x4096 score maps per head and is
+  # too memory-hungry with the current implementation. Keep attention only
+  # at 32x32 unless we later add memory-efficient/windowed attention.
+  attention_resolutions: [32]
   attention_heads: 8
 
 training:
