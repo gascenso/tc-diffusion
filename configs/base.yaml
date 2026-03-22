@@ -42,7 +42,8 @@ model:
   base_channels: 32
   channel_mults: [1, 2, 4, 8]
   num_res_blocks: 2
-  attention_resolutions: []   # no attention yet
+  attention_resolutions: [32]   # keep [] for baseline; try [32] first for low-res attention
+  attention_heads: 4
   dropout: 0.0
 
 diffusion:

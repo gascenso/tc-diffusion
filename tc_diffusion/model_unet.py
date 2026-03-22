@@ -190,11 +190,43 @@ def make_res_block(x, emb, out_channels, name_prefix, gn_groups=32):
     return layers.Add(name=f"{name_prefix}_residual")([x, h])
 
 
+def make_attention_block(x, name_prefix, gn_groups=32, num_heads=4):
+    """
+    Lightweight residual self-attention over spatial tokens.
+
+    Kept separate from the resblock so it can be enabled per-resolution
+    without changing the baseline path when attention_resolutions == [].
+    """
+    channels = x.shape[-1]
+    if channels is None:
+        raise ValueError("Attention block requires a known channel dimension.")
+
+    channels = int(channels)
+    num_heads = max(1, min(int(num_heads), channels))
+    key_dim = max(channels // num_heads, 1)
+
+    h = GroupNorm(groups=gn_groups, name=f"{name_prefix}_gn")(x)
+    h = layers.Reshape((-1, channels), name=f"{name_prefix}_tokens")(h)
+    h = layers.MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=key_dim,
+        output_shape=channels,
+        name=f"{name_prefix}_mha",
+    )(h, h)
+    h = layers.Reshape(x.shape[1:], name=f"{name_prefix}_restore")(h)
+    return layers.Add(name=f"{name_prefix}_residual")([x, h])
+
+
 def build_unet(cfg):
     image_size = int(cfg["data"]["image_size"])
     base_channels = int(cfg["model"]["base_channels"])
     channel_mults = cfg["model"].get("channel_mults", [1, 2, 4])
     num_res_blocks = int(cfg["model"].get("num_res_blocks", 2))
+    attention_resolutions = {
+        int(res) for res in cfg["model"].get("attention_resolutions", [])
+    }
+    attention_heads = int(cfg["model"].get("attention_heads", 4))
+    level_resolutions = [image_size // (2 ** level) for level in range(len(channel_mults))]
 
     # Inputs
     x_in = keras.Input(shape=(image_size, image_size, 1), name="x_t")
@@ -306,6 +338,12 @@ def build_unet(cfg):
                 out_ch,
                 name_prefix=f"down_l{level}_b{b}",
             )
+        if level_resolutions[level] in attention_resolutions:
+            h = make_attention_block(
+                h,
+                name_prefix=f"down_l{level}_attn",
+                num_heads=attention_heads,
+            )
         hs.append(h)  # store skip at this resolution
 
         # don’t downsample after last level
@@ -315,6 +353,12 @@ def build_unet(cfg):
 
     # ---- Bottleneck ----
     h = make_res_block(h, tc_emb, in_ch, name_prefix="bottleneck_0")
+    if level_resolutions[-1] in attention_resolutions:
+        h = make_attention_block(
+            h,
+            name_prefix="bottleneck_attn",
+            num_heads=attention_heads,
+        )
     h = make_res_block(h, tc_emb, in_ch, name_prefix="bottleneck_1")
 
     # ---- Upsampling path ----
@@ -336,6 +380,12 @@ def build_unet(cfg):
                 tc_emb,
                 out_ch,
                 name_prefix=f"up_l{level}_b{b}",
+            )
+        if level_resolutions[level] in attention_resolutions:
+            h = make_attention_block(
+                h,
+                name_prefix=f"up_l{level}_attn",
+                num_heads=attention_heads,
             )
 
     # ---- Output ----
