@@ -2,6 +2,7 @@
 
 # Usage:
 # (evaluate finished run)     python -m scripts.eval --name <RUN_NAME>
+# (light evaluation)          python -m scripts.eval --name <RUN_NAME> --light
 # (override config)           python -m scripts.eval --name <RUN_NAME> --override evaluation.n_per_class_heavy=100
 # (show progress bar)         python -m scripts.eval --name <RUN_NAME> --show_progress
 
@@ -26,7 +27,10 @@ def parse_args():
     p.add_argument("--name", type=str, required=True, help="Name of run under runs/ to load weights from")
     p.add_argument("--out_dir", type=str, default=None, help="Output dir (defaults to run dir inferred from weights path)")
     p.add_argument("--tag", type=str, default="manual_eval")
-    p.add_argument("--heavy", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--heavy", dest="heavy", action="store_true", help="Run heavy evaluation (default).")
+    mode.add_argument("--light", dest="heavy", action="store_false", help="Run light evaluation.")
+    p.set_defaults(heavy=True)
     p.add_argument("--show_progress", action="store_true", help="Show progress bars during evaluation")
     return p.parse_args()
 

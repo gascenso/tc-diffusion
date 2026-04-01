@@ -68,7 +68,9 @@ training:
     min_delta: 1.0e-8
 
 evaluation:
+  n_per_class_light: 25
   n_per_class_heavy: 35
+  n_plot_per_group: 25   # plot up to 25 real + 25 generated samples per class
   gen_batch_size: null
   guidance_scale: 2.5
   sampler: "ddpm"

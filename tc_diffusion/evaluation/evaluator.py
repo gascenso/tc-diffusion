@@ -25,7 +25,7 @@ from .metrics import (
 )
 
 from .plots import plot_radial_profiles, plot_psd, plot_hist_overlay
-from ..plotting import save_image_grid
+from ..plotting import save_real_generated_comparison_grid
 from ..data import build_data_backend, load_dataset_index, load_split_file_set
 
 
@@ -38,7 +38,8 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ev.setdefault("enabled", True)
     ev.setdefault("every_epochs", 5)
     ev.setdefault("heavy_every_epochs", 25)
-    ev.setdefault("n_per_class_light", 5)
+    ev.setdefault("n_plot_per_group", 25)
+    ev.setdefault("n_per_class_light", ev["n_plot_per_group"])
     ev.setdefault("n_per_class_heavy", 50)
     ev.setdefault("gen_batch_size", None)
     ev.setdefault("guidance_scale", 0.0)
@@ -366,6 +367,15 @@ class TCEvaluator:
         n_per = int(ev["n_per_class_heavy"] if heavy else ev["n_per_class_light"])
         if n_per <= 0:
             raise ValueError(f"evaluation n_per_class must be > 0, got {n_per}")
+        n_plot = int(ev["n_plot_per_group"])
+        if n_plot <= 0:
+            raise ValueError(f"evaluation n_plot_per_group must be > 0, got {n_plot}")
+        if n_per < n_plot:
+            mode_name = "heavy" if heavy else "light"
+            print(
+                f"[eval] Requested n_plot_per_group={n_plot}, but {mode_name} evaluation only uses "
+                f"n_per_class={n_per}; plotting {n_per} per group instead."
+            )
 
         # Total generated samples per class is n_per; this only controls
         # micro-batch size to fit hardware limits.
@@ -418,15 +428,26 @@ class TCEvaluator:
             gen_k_raw = denorm_bt(x, bt_min_k, bt_max_k)[..., 0]
             gen_by_class[c] = gen_k_raw
 
-            save_image_grid(
-                x,
-                str(eval_root / f"samples_class_{c}.png"),
-                bt_min_k,
-                bt_max_k,
-                ncols=min(5, n_per),
-            )
-
         real_by_class = _sample_real_by_class(cfg, n_per, ev["real_seed"])
+
+        for c in range(num_classes):
+            if c not in real_by_class or c not in gen_by_class:
+                continue
+
+            n_show = min(n_plot, real_by_class[c].shape[0], gen_by_class[c].shape[0])
+            if n_show <= 0:
+                continue
+
+            save_real_generated_comparison_grid(
+                real_k=real_by_class[c],
+                gen_k=gen_by_class[c],
+                path=str(eval_root / f"samples_class_{c}.png"),
+                n_show=n_show,
+                ncols=min(5, n_show),
+                real_title=f"Real (n={n_show})",
+                gen_title=f"Generated (n={n_show})",
+                suptitle=f"Class {c}: Real vs Generated Samples",
+            )
 
         binner = PolarBinner(image_size, image_size, ev["profile_bins"], 360)
 
@@ -515,6 +536,7 @@ class TCEvaluator:
             "tag": tag,
             "heavy": heavy,
             "n_per_class": n_per,
+            "n_plot_per_group": n_plot,
             "gen_batch_size": gen_batch_size,
             "macro": _compute_macro_metrics(per_class_metrics),
             "per_class": per_class_metrics,
