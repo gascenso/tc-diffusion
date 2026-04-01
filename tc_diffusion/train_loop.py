@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 
 import tensorflow as tf
-from tensorflow import keras
+from tensorflow import keras #type: ignore
 from tqdm.auto import tqdm
 
 from .data import create_dataset
