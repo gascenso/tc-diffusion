@@ -4,9 +4,9 @@ import glob
 import math
 from pathlib import Path
 
-import tensorflow as tf
+import tensorflow as tf #type: ignore
 from tensorflow import keras #type: ignore
-from tqdm.auto import tqdm
+from tqdm.auto import tqdm # type: ignore
 
 from .data import create_dataset
 from .model_unet import build_unet
