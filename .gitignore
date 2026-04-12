@@ -39,3 +39,7 @@ Dockerfile
 
 # --- HPC stuff
 hpc/
+
+# --- LLM stuff
+.codex
+CLAUDE.md
