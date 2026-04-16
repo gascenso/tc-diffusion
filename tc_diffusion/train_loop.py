@@ -168,6 +168,14 @@ def train(cfg, resume: bool = False):
         except Exception:
             pass
 
+    # Mixed precision — must be set before any model or layer is built.
+    # With "mixed_float16", Keras layers compute in float16 but store weights in
+    # float32, cutting memory ~40% and boosting throughput on Tensor Core GPUs.
+    use_mixed_precision = bool(cfg["training"].get("mixed_precision", False))
+    if use_mixed_precision:
+        tf.keras.mixed_precision.set_global_policy("mixed_float16")
+        print("[train] Mixed precision enabled (mixed_float16)")
+
     # --- build train/val datasets ---
     data_cfg = cfg.setdefault("data", {})
 
@@ -205,6 +213,12 @@ def train(cfg, resume: bool = False):
     val_steps = int(cfg["training"].get("val_steps", 0))
     log_interval = int(cfg["training"]["log_interval_steps"])
     optimizer = keras.optimizers.Adam(learning_rate=lr)
+    if use_mixed_precision:
+        # LossScaleOptimizer multiplies the loss by a dynamic scale factor before
+        # the backward pass so float16 gradients don't underflow, then divides
+        # back before apply_gradients.  The scale is halved on any NaN/Inf step
+        # and doubled every 2000 finite steps.
+        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
     out_dir = Path(cfg["experiment"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -295,7 +309,12 @@ def train(cfg, resume: bool = False):
     def train_step(x0, cond):
         with tf.GradientTape() as tape:
             loss = diffusion.loss(model, x0, cond)
-        grads = tape.gradient(loss, model.trainable_variables)
+            # Loss scaling must happen inside the tape so that the scale factor
+            # is included in the gradient computation.
+            scaled_loss = optimizer.get_scaled_loss(loss) if use_mixed_precision else loss
+        grads = tape.gradient(scaled_loss, model.trainable_variables)
+        if use_mixed_precision:
+            grads = optimizer.get_unscaled_gradients(grads)
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         if use_ema and ema is not None:
             ema.update()

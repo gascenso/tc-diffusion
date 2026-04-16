@@ -64,6 +64,11 @@ class GroupNorm(layers.Layer):
 
     def call(self, x):
         # x: (B,H,W,C)
+        # Mean/variance statistics are computed in float32 to avoid numerical
+        # instability when the global dtype policy is mixed_float16.
+        input_dtype = x.dtype
+        x = tf.cast(x, tf.float32)
+
         B = tf.shape(x)[0]
         H = tf.shape(x)[1]
         W = tf.shape(x)[2]
@@ -78,7 +83,8 @@ class GroupNorm(layers.Layer):
         x = (x - mean) / tf.sqrt(var + self.eps)
         x = tf.reshape(x, [B, H, W, C])
 
-        return x * self.gamma[None, None, None, :] + self.beta[None, None, None, :]
+        out = x * tf.cast(self.gamma[None, None, None, :], tf.float32) + tf.cast(self.beta[None, None, None, :], tf.float32)
+        return tf.cast(out, input_dtype)
 
 
 
@@ -389,7 +395,10 @@ def build_unet(cfg):
             )
 
     # ---- Output ----
-    eps_out = layers.Conv2D(1, 3, padding="same", name="eps_out")(h)
+    # dtype="float32" overrides the global mixed_float16 policy so the model
+    # always returns float32.  This keeps the loss computation numerically stable
+    # regardless of whether mixed precision is enabled.
+    eps_out = layers.Conv2D(1, 3, padding="same", name="eps_out", dtype="float32")(h)
 
     model = keras.Model(
         inputs=[x_in, t_in, ss_cat_in, wind_kt_in],
