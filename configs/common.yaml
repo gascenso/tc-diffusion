@@ -35,7 +35,6 @@ conditioning:
     "3": 104.0
     "4": 124.5
     "5": 145.0
-  use_basin: false
   cfg_drop_prob: 0.1
 
 model:
@@ -44,7 +43,6 @@ model:
   num_res_blocks: 2
   attention_resolutions: []
   attention_heads: 4
-  dropout: 0.0
 
 diffusion:
   num_steps: 1000
@@ -86,9 +84,3 @@ evaluation:
   profile_bins: 96
   psd_bins: 96
 
-  proxy_classifier:
-    enabled: true
-    max_train_per_class: 2000
-    C: 1.0
-    solver: "lbfgs"
-    max_iter: 200

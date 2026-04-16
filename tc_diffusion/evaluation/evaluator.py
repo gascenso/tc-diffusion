@@ -49,13 +49,6 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ev.setdefault("profile_bins", 96)
     ev.setdefault("psd_bins", 96)
 
-    pcfg = dict(ev.get("proxy_classifier", {}))
-    pcfg.setdefault("enabled", True)
-    pcfg.setdefault("max_train_per_class", 2000)
-    pcfg.setdefault("C", 1.0)
-    pcfg.setdefault("solver", "lbfgs")
-    pcfg.setdefault("max_iter", 200)
-    ev["proxy_classifier"] = pcfg
     return ev
 
 
