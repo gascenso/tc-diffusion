@@ -23,8 +23,10 @@ def js_divergence(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> float:
     p = p / (p.sum() + eps)
     q = q / (q.sum() + eps)
     m = 0.5 * (p + q)
-    kl_pm = np.sum(p * np.log((p + eps) / (m + eps)))
-    kl_qm = np.sum(q * np.log((q + eps) / (m + eps)))
+    # eps only in the denominator: zero-probability bins contribute 0*log(0)=0
+    # exactly, without the small bias that adding eps to the numerator introduces.
+    kl_pm = np.sum(p * np.log(p / (m + eps)))
+    kl_qm = np.sum(q * np.log(q / (m + eps)))
     return float(0.5 * (kl_pm + kl_qm))
 
 
@@ -184,12 +186,17 @@ def cold_cloud_fraction(imgs_k: np.ndarray, threshold_k: float = 200.0) -> np.nd
     return np.mean(imgs_k < float(threshold_k), axis=(1, 2)).astype(np.float32)
 
 
-def eye_contrast_proxy(mean_profile_k: np.ndarray, inner_frac: float = 0.12, ring_frac: float = 0.25) -> np.ndarray:
+def eye_contrast_proxy(mean_profile_k: np.ndarray, inner_frac: float = 0.12, ring_frac: float = 0.12) -> np.ndarray:
     """
-    Uses radial mean profile: higher contrast between warm inner core and cold ring suggests eye+eyewall structure.
+    Uses radial mean profile: higher contrast between warm inner core and cold eyewall ring.
     mean_profile_k: (N, r_bins)
-    inner_frac: fraction of radius bins considered 'eye'
-    ring_frac:  fraction of radius bins around which we seek cold ring
+    inner_frac: fraction of radius considered 'eye' (default 0.12)
+    ring_frac:  fraction of radius marking the eyewall ring centre (default 0.12 ≈ ~10–30 km
+                for a 256-px patch at ~4–8 km/px, consistent with typical eyewall radii).
+                Previously 0.25, which placed the search in the outer rainband region.
+
+    Uses ring_mean instead of ring_min to avoid inflating the metric due to
+    a single anomalously cold pixel anywhere in the ring window.
     """
     N, R = mean_profile_k.shape
     inner_bins = max(1, int(R * inner_frac))
@@ -199,8 +206,8 @@ def eye_contrast_proxy(mean_profile_k: np.ndarray, inner_frac: float = 0.12, rin
     eye_mean = np.mean(mean_profile_k[:, :inner_bins], axis=1)
     lo = max(0, ring_center - ring_window)
     hi = min(R, ring_center + ring_window)
-    ring_min = np.min(mean_profile_k[:, lo:hi], axis=1)
-    return (eye_mean - ring_min).astype(np.float32)
+    ring_mean = np.mean(mean_profile_k[:, lo:hi], axis=1)
+    return (eye_mean - ring_mean).astype(np.float32)
 
 
 def psd_radial(img2d: np.ndarray, psd_bins: int = 96) -> np.ndarray:
