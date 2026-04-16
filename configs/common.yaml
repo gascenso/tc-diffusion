@@ -61,6 +61,10 @@ training:
   ema_decay: 0.9999
   log_interval_steps: 10
   mixed_precision: false
+  # Compile the train step with XLA (jit_compile=True). Gives an additional
+  # ~1.5-2x speedup on H100/RTX 50xx beyond plain @tf.function, but adds a
+  # long one-time compilation on the first batch. Test with a smoke run first.
+  jit_compile: false
   val_every_epochs: 1
   early_stopping:
     enabled: true
