@@ -15,6 +15,50 @@ from .model_unet import build_unet
 from .diffusion import Diffusion
 from .evaluation.evaluator import TCEvaluator
 
+
+class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Linear warmup followed by cosine decay to lr_min.
+
+    When warmup_steps=0 the warmup phase is skipped and cosine decay begins
+    immediately.  When lr_min==lr_peak the schedule is effectively constant
+    (zero-amplitude cosine).
+    """
+
+    def __init__(self, lr_peak: float, lr_min: float, warmup_steps: int, total_steps: int):
+        super().__init__()
+        self.lr_peak = float(lr_peak)
+        self.lr_min = float(lr_min)
+        self.warmup_steps = int(warmup_steps)
+        self.total_steps = int(total_steps)
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup_steps = tf.constant(float(self.warmup_steps), tf.float32)
+        total_steps = tf.constant(float(self.total_steps), tf.float32)
+        lr_peak = tf.constant(self.lr_peak, tf.float32)
+        lr_min = tf.constant(self.lr_min, tf.float32)
+
+        # Linear warmup: 0 → lr_peak over warmup_steps
+        warmup_lr = lr_peak * step / tf.maximum(warmup_steps, 1.0)
+
+        # Cosine decay: lr_peak → lr_min over (total_steps - warmup_steps)
+        decay_steps = tf.maximum(total_steps - warmup_steps, 1.0)
+        progress = tf.clip_by_value((step - warmup_steps) / decay_steps, 0.0, 1.0)
+        cosine_lr = lr_min + 0.5 * (lr_peak - lr_min) * (
+            1.0 + tf.cos(tf.constant(math.pi, tf.float32) * progress)
+        )
+
+        return tf.where(step < warmup_steps, warmup_lr, cosine_lr)
+
+    def get_config(self):
+        return {
+            "lr_peak": self.lr_peak,
+            "lr_min": self.lr_min,
+            "warmup_steps": self.warmup_steps,
+            "total_steps": self.total_steps,
+        }
+
+
 class EMA:
     """Exponential Moving Average (EMA) over model weights.
 
@@ -204,15 +248,25 @@ def train(cfg, resume: bool = False):
     ema = EMA(model, ema_decay) if use_ema else None
 
     lr = float(cfg["training"]["lr"])
+    lr_min = float(cfg["training"].get("lr_min", 1e-6))
+    warmup_steps = int(cfg["training"].get("warmup_steps", 500))
     num_epochs = int(cfg["training"]["num_epochs"])
     steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 2000))
+    total_steps = num_epochs * steps_per_epoch
     val_every_epochs = int(cfg["training"].get("val_every_epochs", 1))
     if val_every_epochs <= 0:
         raise ValueError(f"training.val_every_epochs must be >= 1, got {val_every_epochs}")
     # If val_steps <= 0, we will do a full deterministic pass.
     val_steps = int(cfg["training"].get("val_steps", 0))
     log_interval = int(cfg["training"]["log_interval_steps"])
-    optimizer = keras.optimizers.Adam(learning_rate=lr)
+
+    lr_schedule = WarmupCosineDecay(
+        lr_peak=lr,
+        lr_min=lr_min,
+        warmup_steps=warmup_steps,
+        total_steps=total_steps,
+    )
+    optimizer = keras.optimizers.Adam(learning_rate=lr_schedule)
     if use_mixed_precision:
         # LossScaleOptimizer multiplies the loss by a dynamic scale factor before
         # the backward pass so float16 gradients don't underflow, then divides

@@ -58,6 +58,8 @@ training:
   num_epochs: 100
   steps_per_epoch: 2000
   lr: 1e-4
+  lr_min: 1.0e-6        # cosine decay floor
+  warmup_steps: 500     # linear warmup from 0 → lr over this many optimizer steps
   ema_decay: 0.9999
   log_interval_steps: 10
   mixed_precision: true
