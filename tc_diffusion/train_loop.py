@@ -154,21 +154,25 @@ def _save_state(out_dir: Path, state: dict):
     tmp.replace(sp)
 
 def evaluate_loss(diffusion, model, ds_val, val_steps: int | None = None):
-    """Compute mean diffusion loss.
+    """Compute mean diffusion loss weighted by actual batch size.
 
     If val_steps is None or <=0, iterate over the *entire* ds_val.
     This is the recommended mode for finite, deterministic validation sets.
+
+    Weighting by sample count rather than batch count ensures the last
+    (potentially partial) batch does not get inflated weight.
     """
     full_pass = (val_steps is None) or (int(val_steps) <= 0)
     loss_sum = 0.0
-    n = 0
+    n_samples = 0
     for batch, (x0, cond) in enumerate(ds_val):
         if (not full_pass) and batch >= int(val_steps):
             break
+        batch_size = int(tf.shape(x0)[0])
         loss = diffusion.loss(model, x0, cond, training=False)
-        loss_sum += float(loss.numpy())
-        n += 1
-    return loss_sum / max(1, n)
+        loss_sum += float(loss.numpy()) * batch_size
+        n_samples += batch_size
+    return loss_sum / max(1, n_samples)
 
 
 def resolve_train_alpha(cfg, epoch_idx: int, num_epochs: int) -> float:
