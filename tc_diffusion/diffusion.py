@@ -241,11 +241,13 @@ class Diffusion:
             return snr_cap / tf.maximum(snr, 1e-8)
         return snr_cap / (snr + 1.0)
 
-    def loss(self, model, x0, cond):
+    def loss(self, model, x0, cond, training: bool = True):
         """
         One-step diffusion training loss.
         x0: (B, H, W, C) in [-1, 1]
         cond: int tensor (ss cat) or dict with {"ss_cat", "wind_kt"}
+        training: passed to the model call; set False during validation so
+                  CFG conditioning dropout is disabled and BN uses stored stats.
         """
         batch_size = tf.shape(x0)[0]
         # Uniform t from [0, num_steps-1]
@@ -256,7 +258,7 @@ class Diffusion:
 
         x_t = self.q_sample(x0, t, noise)
         ss_cat, wind_kt = self._prepare_condition_tensors(cond, batch_size)
-        pred = model([x_t, t, ss_cat, wind_kt], training=True)
+        pred = model([x_t, t, ss_cat, wind_kt], training=training)
 
         alpha_bar_t = tf.gather(self.alphas_cumprod, t)  # (B,)
         alpha_bar_t = tf.reshape(alpha_bar_t, (-1, 1, 1, 1))

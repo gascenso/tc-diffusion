@@ -115,7 +115,7 @@ def evaluate_loss(diffusion, model, ds_val, val_steps: int | None = None):
     for batch, (x0, cond) in enumerate(ds_val):
         if (not full_pass) and batch >= int(val_steps):
             break
-        loss = diffusion.loss(model, x0, cond)
+        loss = diffusion.loss(model, x0, cond, training=False)
         loss_sum += float(loss.numpy())
         n += 1
     return loss_sum / max(1, n)
