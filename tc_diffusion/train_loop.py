@@ -372,6 +372,13 @@ def train(cfg, resume: bool = False):
             grads = optimizer.get_unscaled_gradients(grads)
         # Clip after unscaling so the norm is in the natural gradient space.
         grads, _ = tf.clip_by_global_norm(grads, grad_clip_norm)
+        # Guard against non-finite loss (NaN/Inf): zero out all gradients so
+        # the weights are unchanged on this step.  The optimizer's step counter
+        # and the LR schedule still advance normally so one bad step doesn't
+        # stall training.  We can't use a Python `if` here (inside tf.function),
+        # so we use tf.where with a scalar finite flag broadcast over each tensor.
+        finite = tf.math.is_finite(loss)
+        grads = [tf.where(finite, g, tf.zeros_like(g)) for g in grads]
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         if use_ema and ema is not None:
             ema.update()
@@ -397,7 +404,9 @@ def train(cfg, resume: bool = False):
             loss = train_step(x0, cond)
             global_step += 1
             loss_value = float(loss.numpy())
-            epoch_loss_sum += loss_value
+            if not np.isfinite(loss_value):
+                print(f"\n[warn] step {global_step}: non-finite loss ({loss_value}), update skipped")
+            epoch_loss_sum += loss_value if np.isfinite(loss_value) else 0.0
             epoch_batches += 1
 
             if global_step % log_interval == 0:
