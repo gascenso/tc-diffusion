@@ -4,6 +4,8 @@ import glob
 import math
 from pathlib import Path
 
+import numpy as np
+
 import tensorflow as tf #type: ignore
 from tensorflow import keras #type: ignore
 from tqdm.auto import tqdm # type: ignore
@@ -55,6 +57,10 @@ class EMA:
 
 def _state_path(out_dir: Path) -> Path:
     return out_dir / "run_state.json"
+
+
+def _optimizer_state_path(out_dir: Path) -> Path:
+    return out_dir / "optimizer_state.npy"
 
 
 def _find_latest_last_weights(out_dir: Path) -> Path | None:
@@ -264,6 +270,18 @@ def train(cfg, resume: bool = False):
                 f"best_loss={best_epoch_loss:.6f}, global_step={global_step}"
             )
 
+            opt_state_path = _optimizer_state_path(out_dir)
+            if opt_state_path.exists():
+                # Adam slots are created lazily on first apply_gradients.
+                # Trigger slot creation with zero gradients, then overwrite with saved state.
+                dummy_grads = [tf.zeros_like(v) for v in model.trainable_variables]
+                optimizer.apply_gradients(zip(dummy_grads, model.trainable_variables))
+                saved_opt_weights = list(np.load(str(opt_state_path), allow_pickle=True))
+                optimizer.set_weights(saved_opt_weights)
+                print(f"[resume] Restored optimizer state from {opt_state_path}")
+            else:
+                print("[resume] No optimizer state found; optimizer starts fresh.")
+
     active_alpha = None
 
     for epoch in range(start_epoch, num_epochs):
@@ -328,6 +346,9 @@ def train(cfg, resume: bool = False):
             _delete_other_ema_last_weights(out_dir, keep=ema_last_path)
             print(f"  Saved EMA last weights to {ema_last_path}")
         print(f"  Saved last weights to {last_path}")
+
+        # ----- save optimizer state for resume -----
+        np.save(str(_optimizer_state_path(out_dir)), optimizer.get_weights(), allow_pickle=True)
 
         # ----- check for improvement (best) on FULL validation only -----
         if val_loss is not None:
