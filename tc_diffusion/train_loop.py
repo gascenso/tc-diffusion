@@ -358,6 +358,7 @@ def train(cfg, resume: bool = False):
     # use_ema is a Python bool resolved at trace time → the EMA branch is either
     # always present or always absent in the compiled graph, with zero runtime overhead.
     jit_compile = bool(cfg["training"].get("jit_compile", False))
+    grad_clip_norm = float(cfg["training"].get("grad_clip_norm", 1.0))
 
     @tf.function(reduce_retracing=True, jit_compile=jit_compile)
     def train_step(x0, cond):
@@ -369,6 +370,8 @@ def train(cfg, resume: bool = False):
         grads = tape.gradient(scaled_loss, model.trainable_variables)
         if use_mixed_precision:
             grads = optimizer.get_unscaled_gradients(grads)
+        # Clip after unscaling so the norm is in the natural gradient space.
+        grads, _ = tf.clip_by_global_norm(grads, grad_clip_norm)
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         if use_ema and ema is not None:
             ema.update()
