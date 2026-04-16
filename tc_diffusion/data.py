@@ -9,7 +9,7 @@ import numpy as np
 import tensorflow as tf
 import xarray as xr
 
-def _build_aug_policy(num_classes: int) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+def _build_aug_policy(num_classes: int) -> Tuple[tf.Tensor, tf.Tensor]:
     """Return classwise augmentation parameters sized to num_classes."""
     if int(num_classes) <= 0:
         raise ValueError(f"num_classes must be > 0, got {num_classes}")
@@ -17,12 +17,10 @@ def _build_aug_policy(num_classes: int) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor
     # Anchor policy for the canonical 6 SS classes; resampled for other counts.
     p_anchor = np.array([0.15, 0.20, 0.35, 0.60, 0.75, 0.85], dtype=np.float32)
     shift_anchor = np.array([2, 2, 2, 2, 2, 2], dtype=np.int32)
-    bars_anchor = np.array([1, 1, 1, 2, 2, 3], dtype=np.int32)
 
     if int(num_classes) == int(p_anchor.shape[0]):
         p_aug = p_anchor
         max_shift = shift_anchor
-        max_bars = bars_anchor
     else:
         src = np.linspace(0.0, 1.0, num=p_anchor.shape[0], dtype=np.float32)
         dst = np.linspace(0.0, 1.0, num=int(num_classes), dtype=np.float32)
@@ -30,16 +28,11 @@ def _build_aug_policy(num_classes: int) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor
         max_shift = np.rint(
             np.interp(dst, src, shift_anchor.astype(np.float32))
         ).astype(np.int32)
-        max_bars = np.rint(
-            np.interp(dst, src, bars_anchor.astype(np.float32))
-        ).astype(np.int32)
 
     max_shift = np.maximum(max_shift, 0)
-    max_bars = np.maximum(max_bars, 0)
     return (
         tf.constant(p_aug, dtype=tf.float32),
         tf.constant(max_shift, dtype=tf.int32),
-        tf.constant(max_bars, dtype=tf.int32),
     )
 
 # ------------------------------------------------------------
@@ -81,98 +74,11 @@ def random_shift_reflect(x, max_shift):
         out = tf.image.crop_to_bounding_box(x_pad3, y0, x0, h, w)
         return tf.squeeze(out, axis=-1)
 
-def random_bar_erasing(x, max_bars, min_w=1, max_w=5, fill_mode="local"):
-    """
-    Erase bars spanning full height or width.
-    TF-graph-safe + shape-invariant in while_loop.
-    """
-
-    # Ensure [H, W, C]
-    if x.shape.rank == 2:
-        x3 = x[..., None]
-        squeeze_back = True
-    else:
-        x3 = x
-        squeeze_back = False
-
-    # Dynamic spatial dims
-    H = tf.shape(x3)[0]
-    W = tf.shape(x3)[1]
-
-    # IMPORTANT: keep a *static* channel dim if available (e.g., 1)
-    C_static = x3.shape[-1]  # python int or None
-    if C_static is None:
-        C = tf.shape(x3)[2]   # fallback dynamic
-    else:
-        C = C_static          # use static for shapes below
-
-    def no_erase():
-        return x3
-
-    def do_erase():
-        nbars = tf.random.uniform([], 0, max_bars + 1, dtype=tf.int32)
-
-        def body(i, img):
-            horiz = tf.random.uniform([], 0, 2, dtype=tf.int32)  # 0=vertical, 1=horizontal
-            bw = tf.random.uniform([], min_w, max_w + 1, dtype=tf.int32)
-
-            if fill_mode == "local":
-                mu = tf.reduce_mean(img, axis=[0, 1], keepdims=True)
-                sigma = tf.math.reduce_std(img, axis=[0, 1], keepdims=True)
-                fill = mu + tf.random.normal([H, W, C], dtype=img.dtype) * (0.1 * (sigma + 1e-6))
-            else:
-                fill = tf.random.normal([H, W, C], dtype=img.dtype)
-
-            def vertical():
-                x0 = tf.random.uniform([], 0, W - bw + 1, dtype=tf.int32)
-                mask = tf.concat([
-                    tf.ones([H, x0, C], dtype=img.dtype),
-                    tf.zeros([H, bw, C], dtype=img.dtype),
-                    tf.ones([H, W - x0 - bw, C], dtype=img.dtype),
-                ], axis=1)
-                return img * mask + fill * (1.0 - mask)
-
-            def horizontal():
-                y0 = tf.random.uniform([], 0, H - bw + 1, dtype=tf.int32)
-                mask = tf.concat([
-                    tf.ones([y0, W, C], dtype=img.dtype),
-                    tf.zeros([bw, W, C], dtype=img.dtype),
-                    tf.ones([H - y0 - bw, W, C], dtype=img.dtype),
-                ], axis=0)
-                return img * mask + fill * (1.0 - mask)
-
-            img2 = tf.cond(horiz == 0, vertical, horizontal)
-
-            # Force static shape preservation (critical for while_loop)
-            img2.set_shape(x3.shape)
-            return i + 1, img2
-
-        # Shape invariants: allow H,W to be unknown, but keep channel rank consistent
-        img_inv = tf.TensorShape([None, None, C_static if C_static is not None else None])
-
-        _, out = tf.while_loop(
-            lambda i, _: i < nbars,
-            body,
-            loop_vars=[tf.constant(0, tf.int32), x3],
-            shape_invariants=[tf.TensorShape([]), img_inv],
-        )
-
-        out.set_shape(x3.shape)
-        return out
-
-    out = tf.cond(max_bars > 0, do_erase, no_erase)
-    out.set_shape(x3.shape)
-
-    if squeeze_back:
-        return tf.squeeze(out, axis=-1)
-    return out
-
 def augment_x_given_y(
     x,
     y,
     p_aug: tf.Tensor,
     max_shift_per_class: tf.Tensor,
-    max_bars_per_class: tf.Tensor,
 ):
     """
     x: [H,W,1] (or [H,W]) normalized already (e.g., to [-1,1])
@@ -182,12 +88,10 @@ def augment_x_given_y(
 
     p = tf.gather(p_aug, y)
     max_shift = tf.gather(max_shift_per_class, y)
-    max_bars = tf.gather(max_bars_per_class, y)
 
     def do_aug():
         x1 = rot90_only(x)
         x2 = random_shift_reflect(x1, max_shift=max_shift)
-        #x3 = random_bar_erasing(x2, max_bars=max_bars, min_w=1, max_w=5, fill_mode="local")
         return x2
 
     return tf.cond(tf.random.uniform([]) < p, do_aug, lambda: x)
@@ -917,18 +821,18 @@ def create_dataset(
 
     # shuffle only within small buffer (structure comes from sampler)
     ds = ds.shuffle(buffer_size=4 * batch_size, seed=seed)
-    p_aug, max_shift, max_bars = _build_aug_policy(int(cfg["conditioning"]["num_ss_classes"]))
+    p_aug, max_shift = _build_aug_policy(int(cfg["conditioning"]["num_ss_classes"]))
     if use_wind_speed:
         ds = ds.map(
             lambda x, cond: (
-                augment_x_given_y(x, cond["ss_cat"], p_aug, max_shift, max_bars),
+                augment_x_given_y(x, cond["ss_cat"], p_aug, max_shift),
                 cond,
             ),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
     else:
         ds = ds.map(
-            lambda x, y: (augment_x_given_y(x, y, p_aug, max_shift, max_bars), y),
+            lambda x, y: (augment_x_given_y(x, y, p_aug, max_shift), y),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
 
