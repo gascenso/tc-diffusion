@@ -284,6 +284,23 @@ def train(cfg, resume: bool = False):
 
     active_alpha = None
 
+    # ----- compile the train step -----
+    # All TF ops (tape, grads, apply, EMA) go inside the compiled function.
+    # Python bookkeeping (step counter, loss accumulation, tqdm) stays outside.
+    # use_ema is a Python bool resolved at trace time → the EMA branch is either
+    # always present or always absent in the compiled graph, with zero runtime overhead.
+    jit_compile = bool(cfg["training"].get("jit_compile", False))
+
+    @tf.function(reduce_retracing=True, jit_compile=jit_compile)
+    def train_step(x0, cond):
+        with tf.GradientTape() as tape:
+            loss = diffusion.loss(model, x0, cond)
+        grads = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+        if use_ema and ema is not None:
+            ema.update()
+        return loss
+
     for epoch in range(start_epoch, num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
 
@@ -301,13 +318,7 @@ def train(cfg, resume: bool = False):
         for batch, (x0, cond) in enumerate(pbar):
             if batch >= steps_per_epoch:
                 break
-            with tf.GradientTape() as tape:
-                loss = diffusion.loss(model, x0, cond)
-
-            grads = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-            if use_ema and ema is not None:
-                ema.update()
+            loss = train_step(x0, cond)
             global_step += 1
             loss_value = float(loss.numpy())
             epoch_loss_sum += loss_value
