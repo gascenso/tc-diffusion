@@ -2,6 +2,7 @@
 import json
 import glob
 import math
+import random
 from pathlib import Path
 
 import numpy as np
@@ -215,6 +216,18 @@ def train(cfg, resume: bool = False):
                 tf.config.experimental.set_memory_growth(gpu, True)
         except Exception:
             pass
+
+    # Global seeds — set before any data pipeline or model construction so that
+    # weight initialisation, data shuffling, and augmentation are reproducible.
+    # Set training.seed: null in config to skip (non-reproducible but slightly
+    # faster on some backends).
+    seed_cfg = cfg["training"].get("seed", 42)
+    if seed_cfg is not None:
+        seed_val = int(seed_cfg)
+        random.seed(seed_val)
+        np.random.seed(seed_val)
+        tf.random.set_seed(seed_val)
+        print(f"[train] Global seed set to {seed_val}")
 
     # Mixed precision — must be set before any model or layer is built.
     # With "mixed_float16", Keras layers compute in float16 but store weights in

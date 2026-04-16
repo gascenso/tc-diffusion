@@ -53,6 +53,7 @@ diffusion:
   dynamic_threshold_p: 0.995
 
 training:
+  seed: 42              # global seed for Python/NumPy/TF; set to null to disable
   num_epochs: 100
   steps_per_epoch: 2000
   lr: 1e-4
