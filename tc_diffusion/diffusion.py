@@ -375,10 +375,22 @@ class Diffusion:
         else:
             cls = int(cond_value)
             if wind_value_kt is None:
-                wind_value_kt = _ss_class_midpoint_kt_scalar(cls)
+                # Single scalar: broadcast to whole batch
+                wind_kt_t = tf.fill(
+                    [batch_size],
+                    tf.cast(_ss_class_midpoint_kt_scalar(cls), tf.float32),
+                )
+            elif np.ndim(wind_value_kt) == 0:
+                # Scalar numpy value or Python float
+                wind_kt_t = tf.fill(
+                    [batch_size], tf.cast(float(wind_value_kt), tf.float32)
+                )
+            else:
+                # Per-sample array: shape (batch_size,) — enables matched conditioning
+                wind_kt_t = tf.cast(wind_value_kt, tf.float32)
             cond = {
                 "ss_cat": tf.fill([batch_size], tf.cast(cls, tf.int32)),
-                "wind_kt": tf.fill([batch_size], tf.cast(float(wind_value_kt), tf.float32)),
+                "wind_kt": wind_kt_t,
             }
 
         t_iter = reversed(range(self.num_steps))

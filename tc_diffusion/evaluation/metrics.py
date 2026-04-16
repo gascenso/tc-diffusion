@@ -283,14 +283,39 @@ def rbf_mmd2(X: np.ndarray, Y: np.ndarray, gamma: Optional[float] = None) -> flo
     return float(mmd2)
 
 
-def flatten_features_for_diversity(mean_prof: np.ndarray, psd_prof: np.ndarray, extra: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    Construct a compact feature vector per sample, interpretable but useful for coverage/diversity metrics.
+def flatten_features_for_diversity(
+    mean_prof: np.ndarray,
+    psd_prof: np.ndarray,
+    extra: Optional[np.ndarray] = None,
+    scaler: Optional[tuple] = None,
+) -> tuple:
+    """Compact per-sample feature matrix for coverage/diversity metrics.
+
+    Standardisation uses a scaler fitted on the *real* distribution so that
+    both real and generated features live in the same coordinate system.
+
+    Args:
+        mean_prof: (N, radial_bins) radial-profile matrix.
+        psd_prof:  (N, psd_bins)    PSD profile matrix.
+        extra:     optional (N, K)  additional features.
+        scaler:    optional (mean, std) tuple from a prior call.  When None,
+                   the scaler is fitted on the data passed here (use for real
+                   samples).  Pass the returned scaler when standardising
+                   generated samples.
+
+    Returns:
+        (X, (mean, std)) — the standardised feature matrix and the scaler.
     """
     feats = [mean_prof, psd_prof]
     if extra is not None:
         feats.append(extra)
-    X = np.concatenate(feats, axis=1)
-    # standardize for distances
-    X = (X - X.mean(axis=0, keepdims=True)) / (X.std(axis=0, keepdims=True) + 1e-12)
-    return X.astype(np.float32)
+    X = np.concatenate(feats, axis=1).astype(np.float64)
+
+    if scaler is None:
+        feat_mean = X.mean(axis=0, keepdims=True)
+        feat_std = X.std(axis=0, keepdims=True)
+    else:
+        feat_mean, feat_std = scaler
+
+    X = (X - feat_mean) / (feat_std + 1e-12)
+    return X.astype(np.float32), (feat_mean, feat_std)

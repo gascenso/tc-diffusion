@@ -161,7 +161,14 @@ def _sample_real_by_class(
     cfg: Dict[str, Any],
     n_per_class: int,
     seed: int,
-) -> Dict[int, np.ndarray]:
+) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
+    """Load real BT images and their wind speeds, grouped by SS class.
+
+    Returns:
+        images_by_class:  class → (N, H, W) float32 array of BT in Kelvin
+        winds_by_class:   class → (N,) float32 array of wind speed in kt
+                          (falls back to class midpoint when metadata absent)
+    """
     data_cfg = cfg["data"]
     index_path = Path(data_cfg["dataset_index"])
     split_dir = Path(data_cfg["split_dir"])
@@ -169,11 +176,12 @@ def _sample_real_by_class(
     bt_max_k = float(data_cfg["bt_max_k"])
     backend = build_data_backend(data_cfg)
 
-    class_to_files = load_dataset_index(index_path)
+    class_to_files, sample_meta = load_dataset_index(index_path, return_sample_meta=True)
     allowed = load_split_file_set(split_dir, split="val")
 
     rng = np.random.default_rng(seed)
-    out: Dict[int, np.ndarray] = {}
+    out_imgs: Dict[int, np.ndarray] = {}
+    out_winds: Dict[int, np.ndarray] = {}
 
     for c, rels in sorted(class_to_files.items()):
         rels = [r for r in rels if r in allowed]
@@ -184,12 +192,21 @@ def _sample_real_by_class(
         pick = rng.choice(len(rels), size=k, replace=False)
 
         imgs = []
+        winds = []
         for idx in pick:
-            imgs.append(_load_one_bt_k(backend, rels[int(idx)], bt_min_k, bt_max_k))
+            rel = rels[int(idx)]
+            imgs.append(_load_one_bt_k(backend, rel, bt_min_k, bt_max_k))
+            meta = sample_meta.get(rel, {})
+            w = meta.get("wmo_wind_kt")
+            if w is not None and np.isfinite(float(w)):
+                winds.append(float(w))
+            else:
+                winds.append(_ss_class_midpoint_kt(c))
 
-        out[int(c)] = np.stack(imgs, axis=0)
+        out_imgs[int(c)] = np.stack(imgs, axis=0)
+        out_winds[int(c)] = np.array(winds, dtype=np.float32)
 
-    return out
+    return out_imgs, out_winds
 
 
 # -----------------------------------------------------------------------------
@@ -268,8 +285,10 @@ def _compute_suite_for_class(
     r_psd_mu, r_psd_sd = r_psd.mean(0), r_psd.std(0)
     g_psd_mu, g_psd_sd = g_psd.mean(0), g_psd.std(0)
 
-    r_feat = flatten_features_for_diversity(r_mean, r_psd)
-    g_feat = flatten_features_for_diversity(g_mean, g_psd)
+    # Fit the scaler on real features only, then apply the same scaler to
+    # generated features so both sets live in the same coordinate system.
+    r_feat, feat_scaler = flatten_features_for_diversity(r_mean, r_psd)
+    g_feat, _ = flatten_features_for_diversity(g_mean, g_psd, scaler=feat_scaler)
 
     mmd2 = rbf_mmd2(r_feat, g_feat)
 
@@ -394,6 +413,9 @@ class TCEvaluator:
         eval_root = out_dir / "eval" / tag
         eval_root.mkdir(parents=True, exist_ok=True)
 
+        # Load real samples first so we can match wind conditioning exactly.
+        real_by_class, real_wind_by_class = _sample_real_by_class(cfg, n_per, ev["real_seed"])
+
         gen_by_class: Dict[int, np.ndarray] = {}
         wind_targets_kt: Dict[int, float] = {}
 
@@ -402,33 +424,50 @@ class TCEvaluator:
             class_iter = tqdm(class_iter, desc="Eval: generating", leave=True)
 
         for c in class_iter:
-            wind_target = None
+            # Determine per-sample wind speeds used for this class's generation.
+            # If we have real wind speeds, use them directly so the generated
+            # conditioning distribution matches the real one.  If there are fewer
+            # real samples than n_per (rare classes), resample with replacement.
             if use_wind_speed:
-                wind_target = _resolve_eval_wind_target_kt(cfg, c)
-                wind_targets_kt[int(c)] = float(wind_target)
+                real_winds_c = real_wind_by_class.get(c)
+                if real_winds_c is not None and len(real_winds_c) > 0:
+                    if len(real_winds_c) >= n_per:
+                        wind_schedule = real_winds_c[:n_per]
+                    else:
+                        rng_w = np.random.default_rng(ev["seed"] + c)
+                        idx = rng_w.choice(len(real_winds_c), size=n_per, replace=True)
+                        wind_schedule = real_winds_c[idx]
+                    wind_targets_kt[int(c)] = float(wind_schedule.mean())
+                else:
+                    # No real samples for this class; fall back to fixed midpoint
+                    wind_schedule = np.full(n_per, _resolve_eval_wind_target_kt(cfg, c), dtype=np.float32)
+                    wind_targets_kt[int(c)] = float(wind_schedule[0])
+            else:
+                wind_schedule = None
 
             chunks = []
+            offset = 0
             remaining = n_per
             while remaining > 0:
                 bsz = min(gen_batch_size, remaining)
+                wind_batch = wind_schedule[offset:offset + bsz] if wind_schedule is not None else None
                 x_chunk = diffusion.sample(
                     model,
                     batch_size=bsz,
                     image_size=image_size,
                     cond_value=c,
-                    wind_value_kt=wind_target,
+                    wind_value_kt=wind_batch,
                     guidance_scale=float(ev["guidance_scale"]),
                     show_progress=show_progress,
                 ).numpy()
                 chunks.append(x_chunk)
                 remaining -= bsz
+                offset += bsz
 
             x = np.concatenate(chunks, axis=0)
 
             gen_k_raw = denorm_bt(x, bt_min_k, bt_max_k)[..., 0]
             gen_by_class[c] = gen_k_raw
-
-        real_by_class = _sample_real_by_class(cfg, n_per, ev["real_seed"])
 
         for c in range(num_classes):
             if c not in real_by_class or c not in gen_by_class:
