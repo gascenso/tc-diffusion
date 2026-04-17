@@ -187,6 +187,7 @@ def _decode_py_state(encoded: str):
 
 @dataclass
 class InputPipelineSummary:
+    profile: str
     loader: str
     backend: str
     prefetch_batches: int
@@ -204,6 +205,7 @@ class InputPipelineSummary:
     def to_json(self, epoch: int) -> dict:
         out = {
             "epoch": int(epoch),
+            "profile": self.profile,
             "loader": self.loader,
             "backend": self.backend,
             "prefetch_batches": int(self.prefetch_batches),
@@ -301,6 +303,7 @@ class InputPipelineProfiler:
 
         avg_step = self.total_step_time / max(1, self.step_count)
         summary = InputPipelineSummary(
+            profile=str(loader_info.get("profile", "unknown")),
             loader=str(loader_info.get("loader", "unknown")),
             backend=str(loader_info.get("backend", "unknown")),
             prefetch_batches=int(loader_info.get("prefetch_batches", 0)),
@@ -442,12 +445,16 @@ def train(cfg, resume: bool = False):
 
     ds_train, train_sampler = create_dataset(cfg, split="train", return_train_generator=True)
     train_loader_info = train_sampler.describe() if hasattr(train_sampler, "describe") else {}
-    print(
-        "[data] Train pipeline: "
-        f"loader={train_loader_info.get('loader', 'unknown')}, "
-        f"backend={train_loader_info.get('backend', 'unknown')}, "
-        f"prefetch_batches={train_loader_info.get('prefetch_batches', 0)}"
-    )
+    pipeline_bits = [
+        f"profile={train_loader_info.get('profile', 'unknown')}",
+        f"loader={train_loader_info.get('loader', 'unknown')}",
+        f"backend={train_loader_info.get('backend', 'unknown')}",
+        f"prefetch_batches={train_loader_info.get('prefetch_batches', 0)}",
+    ]
+    for key in ("sort_within_shard", "max_samples_per_read", "warmup_shards"):
+        if key in train_loader_info:
+            pipeline_bits.append(f"{key}={train_loader_info[key]}")
+    print("[data] Train pipeline: " + ", ".join(pipeline_bits))
 
     # Validation: build two deterministic finite sets:
     #   1) full pass over the val split (micro average)
@@ -781,7 +788,8 @@ def train(cfg, resume: bool = False):
             if pipe_summary is not None:
                 print(
                     "[profile] "
-                    f"epoch {epoch+1}: avg_batch_prep={pipe_summary.avg_batch_prep_time_sec:.4f}s, "
+                    f"epoch {epoch+1} ({pipe_summary.profile}): "
+                    f"avg_batch_prep={pipe_summary.avg_batch_prep_time_sec:.4f}s, "
                     f"avg_wait={pipe_summary.avg_data_wait_time_sec:.4f}s, "
                     f"avg_compute={pipe_summary.avg_compute_time_sec:.4f}s, "
                     f"avg_step={pipe_summary.avg_step_time_sec:.4f}s, "

@@ -435,10 +435,33 @@ class PackedMemmapBackend(BTDataBackend):
         local_index = int(global_index) - shard.start
         return np.asarray(mm[local_index], dtype=np.float32)
 
-    def load_bt_batch_by_index(self, global_indices: Sequence[int]) -> np.ndarray:
+    def _copy_rows_into_output(
+        self,
+        shard_idx: int,
+        items: Sequence[Tuple[int, int]],
+        out: np.ndarray,
+    ):
+        mm = self._shard_memmaps[shard_idx]
+        out_pos = np.fromiter((item[0] for item in items), dtype=np.int64, count=len(items))
+        local_idx = np.fromiter((item[1] for item in items), dtype=np.int64, count=len(items))
+        out[out_pos] = np.asarray(mm[local_idx], dtype=np.float32)
+
+    def load_bt_batch_by_index(
+        self,
+        global_indices: Sequence[int],
+        *,
+        sort_within_shard: bool = False,
+        max_samples_per_read: int | None = None,
+    ) -> np.ndarray:
         indices = np.asarray(global_indices, dtype=np.int64).reshape(-1)
         if indices.size == 0:
             raise ValueError("load_bt_batch_by_index requires at least one index.")
+        if max_samples_per_read is not None:
+            max_samples_per_read = int(max_samples_per_read)
+            if max_samples_per_read <= 0:
+                raise ValueError(
+                    f"max_samples_per_read must be > 0 when set, got {max_samples_per_read}"
+                )
 
         out = np.empty((indices.shape[0], *self.sample_shape), dtype=np.float32)
         by_shard: Dict[int, List[Tuple[int, int]]] = {}
@@ -448,12 +471,28 @@ class PackedMemmapBackend(BTDataBackend):
             by_shard.setdefault(shard_idx, []).append((out_pos, local_index))
 
         for shard_idx, items in by_shard.items():
-            mm = self._shard_memmaps[shard_idx]
-            out_pos = np.asarray([item[0] for item in items], dtype=np.int64)
-            local_idx = np.asarray([item[1] for item in items], dtype=np.int64)
-            out[out_pos] = np.asarray(mm[local_idx], dtype=np.float32)
+            read_items = (
+                sorted(items, key=lambda item: item[1])
+                if sort_within_shard
+                else list(items)
+            )
+            if max_samples_per_read is None or len(read_items) <= max_samples_per_read:
+                self._copy_rows_into_output(shard_idx, read_items, out)
+                continue
+
+            for start in range(0, len(read_items), max_samples_per_read):
+                chunk = read_items[start : start + max_samples_per_read]
+                self._copy_rows_into_output(shard_idx, chunk, out)
 
         return out
+
+    def warmup_shards(self, rows_per_shard: int = 1):
+        rows_per_shard = max(1, int(rows_per_shard))
+        for mm in self._shard_memmaps:
+            rows = min(rows_per_shard, int(mm.shape[0]))
+            if rows <= 0:
+                continue
+            np.asarray(mm[:rows], dtype=np.float32)
 
     def load_bt(self, rel_path: str) -> np.ndarray:
         try:
@@ -692,8 +731,9 @@ def _create_finite_eval_dataset(
 @dataclass(frozen=True)
 class SampledTrainBatchRequest:
     state_before_batch: Any
-    rel_paths: Tuple[str, ...]
     labels: np.ndarray
+    rel_paths: Tuple[str, ...] | None = None
+    global_indices: np.ndarray | None = None
     wind_kt: np.ndarray | None = None
 
 
@@ -740,10 +780,12 @@ class BalancedTCGenerator:
 
         self.rng = random.Random(seed)
         self.pipeline_name = "legacy_sample_generator"
+        self.profile_name = "legacy"
         self.prefetch_batches = 0
 
     def describe(self) -> Dict[str, Any]:
         return {
+            "profile": self.profile_name,
             "loader": self.pipeline_name,
             "backend": self.backend.name,
             "prefetch_batches": int(self.prefetch_batches),
@@ -873,6 +915,7 @@ class BalancedTCBatchGenerator(BalancedTCGenerator):
         self.batch_size = int(batch_size)
         self.prefetch_batches = int(prefetch_batches)
         self.pipeline_name = "balanced_batch_generator"
+        self.profile_name = "local_5090"
         self._pending: deque[PendingTrainBatch] = deque()
         self._last_batch_info: Dict[str, float] | None = None
         self._executor = (
@@ -929,6 +972,8 @@ class BalancedTCBatchGenerator(BalancedTCGenerator):
         self,
         request: SampledTrainBatchRequest,
     ) -> Tuple[np.ndarray, Any, Dict[str, float]]:
+        if request.rel_paths is None:
+            raise ValueError("BalancedTCBatchGenerator expects rel_paths in the batch request.")
         t0 = time.perf_counter()
         bt = self.backend.load_bt_batch(request.rel_paths)
         t1 = time.perf_counter()
@@ -1018,24 +1063,202 @@ class BalancedTCBatchGenerator(BalancedTCGenerator):
             yield self._next_batch()
 
 
-def resolve_train_loader_name(data_cfg) -> str:
-    raw = str(data_cfg.get("train_loader", "legacy_sample_generator")).strip().lower()
-    aliases = {
-        "legacy": "legacy_sample_generator",
-        "legacy_generator": "legacy_sample_generator",
-        "sample_generator": "legacy_sample_generator",
-        "legacy_sample_generator": "legacy_sample_generator",
-        "batch": "balanced_batch_generator",
-        "batch_generator": "balanced_batch_generator",
-        "balanced_batch": "balanced_batch_generator",
-        "balanced_batch_generator": "balanced_batch_generator",
-    }
-    if raw not in aliases:
-        raise ValueError(
-            "Unsupported data.train_loader="
-            f"{raw!r}. Expected 'legacy_sample_generator' or 'balanced_batch_generator'."
+class CassandraHPCBatchGenerator(BalancedTCBatchGenerator):
+    """Cassandra/GPFS-optimized packed-memmap batch generator."""
+
+    def __init__(
+        self,
+        backend: PackedMemmapBackend,
+        class_to_files: Dict[int, List[str]],
+        class_probs: Dict[int, float],
+        seed: int = 42,
+        bt_range: Tuple[float, float] = (117.0, 348.0),
+        use_wind_speed: bool = False,
+        rel_path_to_wind_kt: Dict[str, float] | None = None,
+        batch_size: int = 8,
+        prefetch_batches: int = 2,
+        sort_within_shard: bool = True,
+        max_samples_per_read: int | None = None,
+        warmup_shards: bool = False,
+    ):
+        if not isinstance(backend, PackedMemmapBackend):
+            raise TypeError(
+                "CassandraHPCBatchGenerator requires PackedMemmapBackend to preserve "
+                "the packed-memmap transport path."
+            )
+        super().__init__(
+            backend=backend,
+            class_to_files=class_to_files,
+            class_probs=class_probs,
+            seed=seed,
+            bt_range=bt_range,
+            use_wind_speed=use_wind_speed,
+            rel_path_to_wind_kt=rel_path_to_wind_kt,
+            batch_size=batch_size,
+            prefetch_batches=prefetch_batches,
         )
-    return aliases[raw]
+        self.pipeline_name = "cassandra_hpc_batch_generator"
+        self.profile_name = "cassandra_hpc"
+        self.sort_within_shard = bool(sort_within_shard)
+        self.max_samples_per_read = (
+            None if max_samples_per_read is None else int(max_samples_per_read)
+        )
+        if self.max_samples_per_read is not None and self.max_samples_per_read <= 0:
+            raise ValueError(
+                f"max_samples_per_read must be > 0 when set, got {self.max_samples_per_read}"
+            )
+        self.warmup_shards = bool(warmup_shards)
+        self.class_to_global_indices: Dict[int, Tuple[int, ...]] = {}
+        self.global_index_to_wind_kt: Dict[int, float] = {}
+
+        for cls, rel_paths in self.class_to_files.items():
+            global_indices: List[int] = []
+            for rel_path in rel_paths:
+                try:
+                    global_index = int(self.backend.path_to_index[rel_path])
+                except KeyError as exc:
+                    raise KeyError(
+                        f"Packed manifest does not contain training rel_path '{rel_path}'"
+                    ) from exc
+                global_indices.append(global_index)
+                if self.use_wind_speed:
+                    self.global_index_to_wind_kt[global_index] = float(
+                        self.rel_path_to_wind_kt.get(rel_path, ss_class_midpoint_kt(cls))
+                    )
+            self.class_to_global_indices[int(cls)] = tuple(global_indices)
+
+        if self.warmup_shards:
+            self.backend.warmup_shards(rows_per_shard=1)
+
+    def describe(self) -> Dict[str, Any]:
+        info = super().describe()
+        info.update(
+            {
+                "sort_within_shard": self.sort_within_shard,
+                "max_samples_per_read": self.max_samples_per_read,
+                "warmup_shards": self.warmup_shards,
+            }
+        )
+        return info
+
+    def _make_batch_request(self) -> SampledTrainBatchRequest:
+        state_before = self.rng.getstate()
+        global_indices = np.empty((self.batch_size,), dtype=np.int64)
+        labels = np.empty((self.batch_size,), dtype=np.int32)
+        wind_arr = np.empty((self.batch_size,), dtype=np.float32) if self.use_wind_speed else None
+
+        for batch_idx in range(self.batch_size):
+            cls = self.rng.choices(self.classes, weights=self.probs, k=1)[0]
+            global_index = int(self.rng.choice(self.class_to_global_indices[int(cls)]))
+            global_indices[batch_idx] = np.int64(global_index)
+            labels[batch_idx] = np.int32(cls)
+            if wind_arr is not None:
+                wind_arr[batch_idx] = np.float32(
+                    self.global_index_to_wind_kt[global_index]
+                )
+
+        return SampledTrainBatchRequest(
+            state_before_batch=state_before,
+            labels=labels,
+            global_indices=global_indices,
+            wind_kt=wind_arr,
+        )
+
+    def _materialize_batch(
+        self,
+        request: SampledTrainBatchRequest,
+    ) -> Tuple[np.ndarray, Any, Dict[str, float]]:
+        if request.global_indices is None:
+            raise ValueError("CassandraHPCBatchGenerator expects global_indices in the batch request.")
+        t0 = time.perf_counter()
+        bt = self.backend.load_bt_batch_by_index(
+            request.global_indices,
+            sort_within_shard=self.sort_within_shard,
+            max_samples_per_read=self.max_samples_per_read,
+        )
+        t1 = time.perf_counter()
+        bt = preprocess_bt(bt, self.bt_range)
+        bt = _ensure_channel_axis(bt)
+        t2 = time.perf_counter()
+
+        if request.wind_kt is None:
+            cond: Any = request.labels.copy()
+        else:
+            cond = {
+                "ss_cat": request.labels.copy(),
+                "wind_kt": request.wind_kt.copy(),
+            }
+
+        info = {
+            "batch_size": float(request.labels.shape[0]),
+            "load_time_sec": float(t1 - t0),
+            "preprocess_time_sec": float(t2 - t1),
+            "batch_prep_time_sec": float(t2 - t0),
+        }
+        return bt, cond, info
+
+
+def _resolve_profile_alias(raw: str) -> str:
+    aliases = {
+        "legacy": "legacy",
+        "legacy_sample_generator": "legacy",
+        "legacy_generator": "legacy",
+        "sample_generator": "legacy",
+        "local": "local_5090",
+        "local_5090": "local_5090",
+        "local_batch": "local_5090",
+        "balanced_batch": "local_5090",
+        "balanced_batch_generator": "local_5090",
+        "batch": "local_5090",
+        "batch_generator": "local_5090",
+        "cassandra": "cassandra_hpc",
+        "cassandra_hpc": "cassandra_hpc",
+        "cassandra_batch": "cassandra_hpc",
+        "cassandra_hpc_batch_generator": "cassandra_hpc",
+        "hpc": "cassandra_hpc",
+        "hpc_batch": "cassandra_hpc",
+    }
+    key = str(raw).strip().lower()
+    if key not in aliases:
+        raise ValueError(
+            "Unsupported training pipeline selector "
+            f"{raw!r}. Expected one of: 'legacy', 'local_5090', 'cassandra_hpc'."
+        )
+    return aliases[key]
+
+
+def resolve_train_pipeline_profile(data_cfg) -> str:
+    # Backward-compatible rule: if the deprecated train_loader key is set, let
+    # it override the higher-level profile so existing CLI overrides still work.
+    raw_loader = data_cfg.get("train_loader")
+    if raw_loader is not None:
+        return _resolve_profile_alias(str(raw_loader))
+
+    raw_profile = data_cfg.get("train_pipeline_profile", "local_5090")
+    return _resolve_profile_alias(str(raw_profile))
+
+
+def resolve_hpc_loader_cfg(data_cfg) -> Dict[str, Any]:
+    cfg = data_cfg.get("hpc_loader", {})
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise ValueError("data.hpc_loader must be a mapping when set.")
+
+    max_samples_per_read = cfg.get("max_samples_per_read")
+    if max_samples_per_read is not None:
+        max_samples_per_read = int(max_samples_per_read)
+        if max_samples_per_read <= 0:
+            raise ValueError(
+                f"data.hpc_loader.max_samples_per_read must be > 0 when set, got {max_samples_per_read}"
+            )
+
+    return {
+        "prefetch_batches": int(cfg.get("prefetch_batches", 2)),
+        "sort_within_shard": bool(cfg.get("sort_within_shard", True)),
+        "max_samples_per_read": max_samples_per_read,
+        "warmup_shards": bool(cfg.get("warmup_shards", False)),
+    }
 
 
 # ------------------------------------------------------------
@@ -1051,8 +1274,9 @@ def create_dataset(
     Create a dataset-like iterable.
 
     - For split=='train': infinite class-balanced sampling from either the
-      legacy per-sample generator or the new batch-aware generator, selected by
-      data.train_loader.
+      legacy per-sample generator, the local 5090 batch generator, or the
+      Cassandra HPC batch generator, selected by data.train_pipeline_profile
+      (or the deprecated data.train_loader alias).
     - For split in {'val','test'}: by default, a finite, deterministic dataset that
       makes exactly one pass over the split files (robust validation).
 
@@ -1181,9 +1405,31 @@ def create_dataset(
     # ---- compute sampling probabilities ----
     class_probs = compute_class_sampling_probs(class_to_files, alpha)
 
-    train_loader = resolve_train_loader_name(data_cfg)
+    train_pipeline_profile = resolve_train_pipeline_profile(data_cfg)
 
-    if train_loader == "balanced_batch_generator":
+    if train_pipeline_profile == "cassandra_hpc":
+        if not isinstance(backend, PackedMemmapBackend):
+            raise ValueError(
+                "data.train_pipeline_profile='cassandra_hpc' requires "
+                "data.backend='packed_memmap'."
+            )
+        hpc_cfg = resolve_hpc_loader_cfg(data_cfg)
+        gen = CassandraHPCBatchGenerator(
+            backend=backend,
+            class_to_files=class_to_files,
+            class_probs=class_probs,
+            seed=seed,
+            bt_range=bt_range,
+            use_wind_speed=use_wind_speed,
+            rel_path_to_wind_kt=rel_path_to_wind_kt,
+            batch_size=batch_size,
+            prefetch_batches=hpc_cfg["prefetch_batches"],
+            sort_within_shard=hpc_cfg["sort_within_shard"],
+            max_samples_per_read=hpc_cfg["max_samples_per_read"],
+            warmup_shards=hpc_cfg["warmup_shards"],
+        )
+        ds = gen
+    elif train_pipeline_profile == "local_5090":
         prefetch_batches = int(data_cfg.get("train_prefetch_batches", 1))
         gen = BalancedTCBatchGenerator(
             backend=backend,

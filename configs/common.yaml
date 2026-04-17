@@ -13,8 +13,13 @@ data:
     ramp_epochs: 40
     mode: "cosine"
   batch_size: 8
-  train_loader: balanced_batch_generator  # legacy_sample_generator | balanced_batch_generator
-  train_prefetch_batches: 1  # new batch loader only; 0 disables lookahead
+  train_pipeline_profile: local_5090  # legacy | local_5090 | cassandra_hpc
+  train_prefetch_batches: 1  # local_5090 only; 0 disables lookahead
+  hpc_loader:                # cassandra_hpc only
+    prefetch_batches: 2
+    sort_within_shard: true
+    max_samples_per_read: null
+    warmup_shards: false
   image_size: 256
   bt_min_k: 180.0 # q0.1; global min is 117.0
   bt_max_k: 310.0 # q99.9; global max is 348.0

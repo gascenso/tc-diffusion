@@ -3,7 +3,13 @@ _base_: common.yaml
 data:
   backend: "packed_memmap"
   packed_manifest: "../data/packed_tc_memmap/manifest.json"
+  train_pipeline_profile: cassandra_hpc
   batch_size: 8           # prioritize model capacity over batch size
+  hpc_loader:
+    prefetch_batches: 2
+    sort_within_shard: true
+    max_samples_per_read: null
+    warmup_shards: false
 
 model:
   base_channels: 64
