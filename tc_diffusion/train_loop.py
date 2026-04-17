@@ -432,7 +432,13 @@ def train(cfg, resume: bool = False):
     # use_ema is a Python bool resolved at trace time → the EMA branch is either
     # always present or always absent in the compiled graph, with zero runtime overhead.
     jit_compile = bool(cfg["training"].get("jit_compile", False))
-    grad_clip_norm = float(cfg["training"].get("grad_clip_norm", 1.0))
+    grad_clip_norm_cfg = cfg["training"].get("grad_clip_norm", 1.0)
+    if grad_clip_norm_cfg is None:
+        grad_clip_norm = None
+        clip_gradients = False
+    else:
+        grad_clip_norm = float(grad_clip_norm_cfg)
+        clip_gradients = grad_clip_norm > 0.0
     use_wind_speed = bool(cfg.get("conditioning", {}).get("use_wind_speed", False))
     p_aug, max_shift = _build_aug_policy(int(cfg["conditioning"]["num_ss_classes"]))
 
@@ -475,7 +481,9 @@ def train(cfg, resume: bool = False):
             if hasattr(optimizer, "get_unscaled_gradients"):
                 grads = optimizer.get_unscaled_gradients(grads)
         # Clip after unscaling so the norm is in the natural gradient space.
-        grads, _ = tf.clip_by_global_norm(grads, grad_clip_norm)
+        # A non-positive or null grad_clip_norm disables clipping entirely.
+        if clip_gradients:
+            grads, _ = tf.clip_by_global_norm(grads, grad_clip_norm)
         # Guard against non-finite loss (NaN/Inf): zero out all gradients so
         # the weights are unchanged on this step.  The optimizer's step counter
         # and the LR schedule still advance normally so one bad step doesn't
