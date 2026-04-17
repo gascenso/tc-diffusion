@@ -241,7 +241,11 @@ class Diffusion:
             return snr_cap / tf.maximum(snr, 1e-8)
         return snr_cap / (snr + 1.0)
 
-    def loss(self, model, x0, cond, training: bool = True, t=None, noise=None):
+    def _seed_with_offset(self, seed, offset: int):
+        seed = tf.convert_to_tensor(seed, dtype=tf.int32)
+        return tf.stack([seed[0], seed[1] + tf.cast(offset, tf.int32)])
+
+    def loss(self, model, x0, cond, training: bool = True, t=None, noise=None, seed=None):
         """
         One-step diffusion training loss.
         x0: (B, H, W, C) in [-1, 1]
@@ -250,13 +254,23 @@ class Diffusion:
                   CFG conditioning dropout is disabled and BN uses stored stats.
         t: optional int32 tensor of shape (B,) with explicit diffusion timesteps.
         noise: optional tensor with the same shape as x0 containing explicit noise.
+        seed: optional stateless RNG seed of shape (2,) used when t/noise are not supplied.
         """
         batch_size = tf.shape(x0)[0]
         if t is None:
-            # Uniform t from [0, num_steps-1]
-            t = tf.random.uniform(
-                shape=(batch_size,), minval=0, maxval=self.num_steps, dtype=tf.int32
-            )
+            if seed is None:
+                # Uniform t from [0, num_steps-1]
+                t = tf.random.uniform(
+                    shape=(batch_size,), minval=0, maxval=self.num_steps, dtype=tf.int32
+                )
+            else:
+                t = tf.random.stateless_uniform(
+                    shape=(batch_size,),
+                    seed=self._seed_with_offset(seed, 0),
+                    minval=0,
+                    maxval=self.num_steps,
+                    dtype=tf.int32,
+                )
         else:
             t = tf.convert_to_tensor(t, dtype=tf.int32)
             tf.debugging.assert_rank(t, 1, message="Diffusion.loss expects t to have shape (B,)")
@@ -277,7 +291,14 @@ class Diffusion:
             )
 
         if noise is None:
-            noise = tf.random.normal(shape=tf.shape(x0), dtype=x0.dtype)
+            if seed is None:
+                noise = tf.random.normal(shape=tf.shape(x0), dtype=x0.dtype)
+            else:
+                noise = tf.random.stateless_normal(
+                    shape=tf.shape(x0),
+                    seed=self._seed_with_offset(seed, 1),
+                    dtype=x0.dtype,
+                )
         else:
             noise = tf.convert_to_tensor(noise, dtype=x0.dtype)
             tf.debugging.assert_equal(
