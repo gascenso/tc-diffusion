@@ -25,8 +25,14 @@ def js_divergence(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> float:
     m = 0.5 * (p + q)
     # eps only in the denominator: zero-probability bins contribute 0*log(0)=0
     # exactly, without the small bias that adding eps to the numerator introduces.
-    kl_pm = np.sum(p * np.log(p / (m + eps)))
-    kl_qm = np.sum(q * np.log(q / (m + eps)))
+    kl_pm_terms = np.zeros_like(p)
+    kl_qm_terms = np.zeros_like(q)
+    p_mask = p > 0.0
+    q_mask = q > 0.0
+    kl_pm_terms[p_mask] = p[p_mask] * np.log(p[p_mask] / (m[p_mask] + eps))
+    kl_qm_terms[q_mask] = q[q_mask] * np.log(q[q_mask] / (m[q_mask] + eps))
+    kl_pm = np.sum(kl_pm_terms)
+    kl_qm = np.sum(kl_qm_terms)
     return float(0.5 * (kl_pm + kl_qm))
 
 

@@ -374,8 +374,9 @@ class Diffusion:
             x_prev = model_mean + tf.sqrt(posterior_var_t) * noise
             return x_prev
 
-        # t == 0: return x0 prediction (NOT model_mean), clipped to expected data range.
-        return tf.clip_by_value(x0_pred, -1.0, 1.0)
+        # t == 0: return the stabilized x0 prediction without hard clipping so
+        # evaluation can inspect out-of-range behavior honestly.
+        return x0_pred
 
     def sample(
         self,
@@ -386,12 +387,15 @@ class Diffusion:
         wind_value_kt=None,
         show_progress=True,
         guidance_scale=0.0,
+        return_both: bool = False,
     ):
         """
         Generate samples starting from pure noise.
 
         cond_value: integer SS category index (0..5), or None for unconditional.
         wind_value_kt: optional wind conditioning value. If None, uses class midpoint.
+        return_both: if True, return both the post-threshold raw final sample and
+                     a hard-clipped sibling for diagnostic use.
         """
         x_t = tf.random.normal(
             shape=(batch_size, image_size, image_size, 1), dtype=tf.float32
@@ -435,4 +439,11 @@ class Diffusion:
         for t_int in t_iter:
             x_t = self.p_sample_step(model, x_t, t_int, cond, guidance_scale=guidance_scale)
 
-        return x_t
+        raw_final = x_t
+        clipped_final = tf.clip_by_value(raw_final, -1.0, 1.0)
+        if return_both:
+            return {
+                "raw_final": raw_final,
+                "clipped_final": clipped_final,
+            }
+        return raw_final

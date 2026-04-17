@@ -8,7 +8,8 @@ import matplotlib.pyplot as plt
 
 def save_image_grid(x, path, bt_min_k, bt_max_k, ncols=4):
     """
-    x: np.array or tf.Tensor of shape (B, H, W, 1) in [-1, 1].
+    x: np.array or tf.Tensor of shape (B, H, W, 1) in normalized space.
+       Raw diffusion samples may legitimately exceed [-1, 1].
     Save a grid of images to 'path' (PNG).
     """
     Path(os.path.dirname(path)).mkdir(parents=True, exist_ok=True)
@@ -17,7 +18,8 @@ def save_image_grid(x, path, bt_min_k, bt_max_k, ncols=4):
     B, H, W, C = x.shape
     assert C == 1
 
-    # Map back from [-1, 1] to [bt_min, bt_max] for nicer display
+    # Map back from normalized space to Kelvin without clipping so raw
+    # out-of-range samples remain visible in saved PNGs.
     bt_norm01 = (x + 1.0) / 2.0
     bt_k = bt_norm01 * (bt_max_k - bt_min_k) + bt_min_k
 

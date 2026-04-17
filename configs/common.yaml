@@ -75,7 +75,7 @@ training:
 
 evaluation:
   n_per_class_light: 25
-  n_per_class_heavy: 35
+  n_per_class_heavy: 50
   n_plot_per_group: 25   # plot up to 25 real + 25 generated samples per class
   gen_batch_size: null
   guidance_scale: 2.5
@@ -84,4 +84,5 @@ evaluation:
   real_seed: 123
   profile_bins: 96
   psd_bins: 96
-
+  bootstrap_reps: 500
+  bootstrap_ci_level: 0.95

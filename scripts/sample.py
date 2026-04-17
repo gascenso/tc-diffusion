@@ -123,14 +123,16 @@ if __name__ == "__main__":
     wind_value_kt = None if args.uncond else args.wind_kt
 
     print("Sampling...")
-    x_samples = diffusion.sample(
+    sample_outputs = diffusion.sample(
         model=model,
         batch_size=args.batch_size,
         image_size=image_size,
         cond_value=cond_value,
         wind_value_kt=wind_value_kt,
         guidance_scale=args.guidance_scale,
+        return_both=True,
     )
+    x_samples = sample_outputs["raw_final"]
 
     out_path = f"runs/{args.name}/sample.png"
     save_image_grid(
