@@ -71,7 +71,7 @@ training:
   early_stopping:
     enabled: true
     monitor: "ema"         # "ema" (recommended when EMA is used) or "raw"
-    patience_epochs: 15
+    patience_epochs: 25
     min_delta: 1.0e-8
 
 evaluation:
