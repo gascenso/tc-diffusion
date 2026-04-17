@@ -3,6 +3,14 @@ from pathlib import Path
 from copy import deepcopy
 
 
+_DATA_PATH_KEYS = (
+    ("data", "data_root"),
+    ("data", "dataset_index"),
+    ("data", "packed_manifest"),
+    ("data", "split_dir"),
+)
+
+
 def load_config(path, overrides=None):
     """
     Load a YAML config, optionally inheriting from one or more base configs,
@@ -11,11 +19,13 @@ def load_config(path, overrides=None):
     overrides example:
         ["training.lr=5e-4", "data.batch_size=16"]
     """
-    cfg = _load_config_recursive(Path(path))
+    path = Path(path).resolve()
+    cfg = _load_config_recursive(path)
 
     if overrides:
         cfg = apply_overrides(cfg, overrides)
 
+    cfg = resolve_config_paths(cfg, base_dir=path.parent)
     return cfg
 
 
@@ -34,6 +44,8 @@ def _load_config_recursive(path: Path, seen=None):
 
     if not isinstance(cfg, dict):
         raise ValueError(f"Top-level config must be a mapping: {path}")
+
+    cfg = resolve_config_paths(cfg, base_dir=path.parent)
 
     base_spec = cfg.pop("_base_", None)
     if base_spec is None:
@@ -69,6 +81,37 @@ def deep_merge_dicts(base, override):
         else:
             base[key] = deepcopy(value)
     return base
+
+
+def resolve_config_paths(cfg, base_dir: Path):
+    cfg = deepcopy(cfg)
+    base_dir = Path(base_dir).resolve()
+    for path_keys in _DATA_PATH_KEYS:
+        _resolve_one_path(cfg, path_keys, base_dir)
+    return cfg
+
+
+def _resolve_one_path(cfg, keys, base_dir: Path):
+    d = cfg
+    for key in keys[:-1]:
+        if not isinstance(d, dict) or key not in d:
+            return
+        d = d[key]
+
+    if not isinstance(d, dict):
+        return
+
+    leaf = keys[-1]
+    value = d.get(leaf)
+    if value is None or not isinstance(value, (str, Path)):
+        return
+
+    value_path = Path(value)
+    if value_path.is_absolute():
+        d[leaf] = str(value_path)
+        return
+
+    d[leaf] = str((base_dir / value_path).resolve())
 
 
 def apply_overrides(cfg, overrides):

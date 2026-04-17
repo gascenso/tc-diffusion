@@ -9,6 +9,8 @@
 import argparse
 from pathlib import Path
 
+import tensorflow as tf
+
 from tc_diffusion.config import load_config
 from tc_diffusion.model_unet import build_unet
 from tc_diffusion.diffusion import Diffusion
@@ -35,6 +37,21 @@ def parse_args():
     return p.parse_args()
 
 
+def configure_runtime(cfg):
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except Exception:
+            pass
+
+    use_mixed_precision = bool(cfg.get("training", {}).get("mixed_precision", False))
+    if use_mixed_precision:
+        tf.keras.mixed_precision.set_global_policy("mixed_float16")
+        print("[eval] Mixed precision enabled (mixed_float16)")
+
+
 if __name__ == "__main__":
     args = parse_args()
 
@@ -46,6 +63,7 @@ if __name__ == "__main__":
             "Pass --config explicitly or ensure the run has a saved config.yaml."
         )
     cfg = load_config(str(config_path), overrides=args.override)
+    configure_runtime(cfg)
 
     if args.out_dir is None:
         out_dir = run_dir
