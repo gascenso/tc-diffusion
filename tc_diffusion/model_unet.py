@@ -313,8 +313,9 @@ def build_unet(cfg):
     c_emb = layers.Dense(t_emb_dim, activation="swish", name="c_emb_dense2")(c_emb)
 
     if use_wind_speed:
-        wind_scaled = layers.Lambda(
-            lambda w: tf.where(
+        def _scale_wind_conditioning(w):
+            w = tf.cast(w, tf.float32)
+            return tf.where(
                 tf.equal(w, tf.cast(wind_null_kt, tf.float32)),
                 tf.fill(tf.shape(w), tf.cast(-2.0, tf.float32)),
                 tf.clip_by_value(
@@ -322,7 +323,10 @@ def build_unet(cfg):
                     -1.0,
                     1.0,
                 ),
-            ),
+            )
+
+        wind_scaled = layers.Lambda(
+            _scale_wind_conditioning,
             name="wind_scaled",
         )(wind_kt_dropped)
         wind_feats = layers.Lambda(

@@ -507,7 +507,8 @@ def train(cfg, resume: bool = False):
         for batch, (x0, cond) in enumerate(pbar):
             if batch >= steps_per_epoch:
                 break
-            loss = train_step(x0, cond, step_index=global_step)
+            step_index = tf.convert_to_tensor(global_step, dtype=tf.int32)
+            loss = train_step(x0, cond, step_index=step_index)
             global_step += 1
             checkpoint.global_step.assign(global_step)
             loss_value = float(loss.numpy())
