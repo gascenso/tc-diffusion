@@ -93,7 +93,8 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ev.setdefault("n_per_class_heavy", 100)
     ev.setdefault("gen_batch_size", None)
     ev.setdefault("guidance_scale", 0.0)
-    ev.setdefault("sampler", "ddpm")
+    ev.setdefault("sampler", "dpmpp_2m")
+    ev.setdefault("sampling_steps", 25)
     ev.setdefault("ddim_steps", None)
     ev.setdefault("ddim_eta", 0.0)
     ev.setdefault("seed", 123)
@@ -774,6 +775,7 @@ class TCEvaluator:
             while remaining > 0:
                 bsz = min(gen_batch_size, remaining)
                 wind_batch = wind_schedule[offset:offset + bsz] if wind_schedule is not None else None
+                sampling_steps = ev.get("sampling_steps", ev.get("ddim_steps", None))
                 sample_outputs = diffusion.sample(
                     model,
                     batch_size=bsz,
@@ -782,7 +784,7 @@ class TCEvaluator:
                     wind_value_kt=wind_batch,
                     guidance_scale=float(ev["guidance_scale"]),
                     sampler=str(ev["sampler"]),
-                    num_sampling_steps=ev.get("ddim_steps", None),
+                    num_sampling_steps=sampling_steps,
                     ddim_eta=float(ev.get("ddim_eta", 0.0)),
                     show_progress=show_progress,
                     return_both=True,
@@ -924,7 +926,7 @@ class TCEvaluator:
             "sampling": {
                 "sampler": str(ev["sampler"]),
                 "guidance_scale": float(ev["guidance_scale"]),
-                "ddim_steps": ev.get("ddim_steps", None),
+                "sampling_steps": ev.get("sampling_steps", ev.get("ddim_steps", None)),
                 "ddim_eta": float(ev.get("ddim_eta", 0.0)),
             },
             "bootstrap": {

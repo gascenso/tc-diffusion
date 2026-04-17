@@ -245,6 +245,13 @@ class Diffusion:
         seed = tf.convert_to_tensor(seed, dtype=tf.int32)
         return tf.stack([seed[0], seed[1] + tf.cast(offset, tf.int32)])
 
+    def _alpha_sigma_lambda(self, t_int: int):
+        alpha_bar_t = tf.cast(self.alphas_cumprod[t_int], tf.float32)
+        alpha_t = tf.sqrt(alpha_bar_t)
+        sigma_t = tf.sqrt(1.0 - alpha_bar_t)
+        lambda_t = tf.math.log(alpha_t + 1e-12) - tf.math.log(sigma_t + 1e-12)
+        return alpha_t, sigma_t, lambda_t
+
     def _predict_x0_and_eps(self, model, x_t, t_int, cond, guidance_scale=0.0):
         """Run the denoiser once and return a stabilized x0 prediction plus eps."""
         bsz = tf.shape(x_t)[0]
@@ -437,14 +444,59 @@ class Diffusion:
             x_prev = x_prev + sigma_t * noise
         return x_prev
 
-    def _build_ddim_timesteps(self, num_sampling_steps):
+    def dpmpp_2m_step(
+        self,
+        model,
+        x_t,
+        t_int,
+        t_prev_int,
+        cond,
+        guidance_scale=0.0,
+        prev_x0_pred=None,
+        prev_t_int=None,
+    ):
+        """Single deterministic DPM-Solver++(2M, midpoint) step."""
+        x0_pred, _ = self._predict_x0_and_eps(
+            model,
+            x_t,
+            t_int,
+            cond,
+            guidance_scale=guidance_scale,
+        )
+
+        if t_prev_int < 0:
+            return x0_pred, x0_pred
+
+        alpha_t, sigma_t, lambda_t = self._alpha_sigma_lambda(int(t_prev_int))
+        _, sigma_s0, lambda_s0 = self._alpha_sigma_lambda(int(t_int))
+        h = lambda_t - lambda_s0
+
+        expm1_neg_h = tf.exp(-h) - 1.0
+
+        if prev_x0_pred is None or prev_t_int is None:
+            x_prev = (sigma_t / sigma_s0) * x_t - alpha_t * expm1_neg_h * x0_pred
+            return x_prev, x0_pred
+
+        _, _, lambda_s1 = self._alpha_sigma_lambda(int(prev_t_int))
+        h_0 = lambda_s0 - lambda_s1
+        r0 = h_0 / tf.maximum(h, 1e-12)
+        d0 = x0_pred
+        d1 = (x0_pred - prev_x0_pred) / tf.maximum(r0, 1e-12)
+        x_prev = (
+            (sigma_t / sigma_s0) * x_t
+            - alpha_t * expm1_neg_h * d0
+            - 0.5 * alpha_t * expm1_neg_h * d1
+        )
+        return x_prev, x0_pred
+
+    def _build_sampling_timesteps(self, num_sampling_steps, *, sampler_name: str):
         if num_sampling_steps is None:
             steps = self.num_steps
         else:
             steps = int(num_sampling_steps)
         if steps <= 0 or steps > self.num_steps:
             raise ValueError(
-                f"DDIM num_sampling_steps must be in [1, {self.num_steps}], got {steps}."
+                f"{sampler_name.upper()} num_sampling_steps must be in [1, {self.num_steps}], got {steps}."
             )
         schedule = np.round(np.linspace(0, self.num_steps - 1, steps)).astype(np.int32)
         schedule = np.unique(schedule)
@@ -459,7 +511,7 @@ class Diffusion:
         wind_value_kt=None,
         show_progress=True,
         guidance_scale=0.0,
-        sampler: str = "ddpm",
+        sampler: str = "dpmpp_2m",
         num_sampling_steps: int | None = None,
         ddim_eta: float = 0.0,
         return_both: bool = False,
@@ -469,8 +521,8 @@ class Diffusion:
 
         cond_value: integer SS category index (0..5), or None for unconditional.
         wind_value_kt: optional wind conditioning value. If None, uses class midpoint.
-        sampler: reverse-process sampler to use. Supported: "ddpm", "ddim".
-        num_sampling_steps: optional number of DDIM steps (defaults to full schedule).
+        sampler: reverse-process sampler to use. Supported: "ddpm", "ddim", "dpmpp_2m".
+        num_sampling_steps: optional number of inference steps for DDIM / DPM-Solver++(2M).
         ddim_eta: DDIM stochasticity. 0.0 is deterministic DDIM.
         return_both: if True, return both the post-threshold raw final sample and
                      a hard-clipped sibling for diagnostic use.
@@ -506,13 +558,20 @@ class Diffusion:
             }
 
         sampler_name = str(sampler).strip().lower()
-        if sampler_name not in {"ddpm", "ddim"}:
-            raise ValueError(f"Unsupported sampler '{sampler}'. Expected 'ddpm' or 'ddim'.")
+        if sampler_name == "dpm_solverpp_2m":
+            sampler_name = "dpmpp_2m"
+        if sampler_name not in {"ddpm", "ddim", "dpmpp_2m"}:
+            raise ValueError(
+                f"Unsupported sampler '{sampler}'. Expected 'ddpm', 'ddim', or 'dpmpp_2m'."
+            )
 
         if sampler_name == "ddpm":
             timesteps = list(range(self.num_steps - 1, -1, -1))
         else:
-            timesteps = self._build_ddim_timesteps(num_sampling_steps)
+            timesteps = self._build_sampling_timesteps(
+                num_sampling_steps,
+                sampler_name=sampler_name,
+            )
 
         t_iter = timesteps
         if show_progress:
@@ -526,7 +585,7 @@ class Diffusion:
         if sampler_name == "ddpm":
             for t_int in t_iter:
                 x_t = self.p_sample_step(model, x_t, t_int, cond, guidance_scale=guidance_scale)
-        else:
+        elif sampler_name == "ddim":
             for idx, t_int in enumerate(t_iter):
                 t_prev_int = timesteps[idx + 1] if idx + 1 < len(timesteps) else -1
                 x_t = self.ddim_step(
@@ -538,6 +597,22 @@ class Diffusion:
                     guidance_scale=guidance_scale,
                     eta=ddim_eta,
                 )
+        else:
+            prev_x0_pred = None
+            prev_t_int = None
+            for idx, t_int in enumerate(t_iter):
+                t_prev_int = timesteps[idx + 1] if idx + 1 < len(timesteps) else -1
+                x_t, prev_x0_pred = self.dpmpp_2m_step(
+                    model,
+                    x_t,
+                    t_int,
+                    t_prev_int,
+                    cond,
+                    guidance_scale=guidance_scale,
+                    prev_x0_pred=prev_x0_pred,
+                    prev_t_int=prev_t_int,
+                )
+                prev_t_int = t_int
 
         raw_final = x_t
         clipped_final = tf.clip_by_value(raw_final, -1.0, 1.0)

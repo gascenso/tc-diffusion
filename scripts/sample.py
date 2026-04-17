@@ -4,7 +4,8 @@
 # (unconditional sampling)      python -m scripts.sample --name <RUN_NAME> --uncond
 # (conditional sampling, Cat3)  python -m scripts.sample --name <RUN_NAME> --ss_cat 3
 # (conditional with CFG)        python -m scripts.sample --name <RUN_NAME> --ss_cat 3 --guidance_scale 2.0
-# (DDIM sampling)               python -m scripts.sample --name <RUN_NAME> --sampler ddim --ddim_steps 50
+# (DDIM sampling)               python -m scripts.sample --name <RUN_NAME> --sampler ddim --sampling_steps 50
+# (DPM++ 2M sampling)           python -m scripts.sample --name <RUN_NAME> --sampler dpmpp_2m --sampling_steps 25
 
 import argparse
 from pathlib import Path
@@ -61,20 +62,22 @@ def parse_args():
         "--sampler",
         type=str,
         default=None,
-        choices=["ddpm", "ddim"],
+        choices=["ddpm", "ddim", "dpmpp_2m"],
         help="Sampler to use. Defaults to evaluation.sampler from the config.",
     )
     p.add_argument(
+        "--sampling_steps",
         "--ddim_steps",
+        dest="sampling_steps",
         type=int,
         default=None,
-        help="Number of DDIM steps. Defaults to evaluation.ddim_steps or the full schedule.",
+        help="Number of sampling steps for DDIM / DPM++ 2M. Defaults to evaluation.sampling_steps.",
     )
     p.add_argument(
         "--ddim_eta",
         type=float,
         default=None,
-        help="DDIM stochasticity. 0.0 gives deterministic DDIM. Defaults to evaluation.ddim_eta.",
+        help="DDIM stochasticity. 0.0 gives deterministic DDIM. Ignored by other samplers.",
     )
     p.add_argument(
         "--uncond",
@@ -142,8 +145,12 @@ if __name__ == "__main__":
     cond_value = None if args.uncond else args.ss_cat
     wind_value_kt = None if args.uncond else args.wind_kt
     eval_cfg = cfg.get("evaluation", {})
-    sampler = args.sampler or str(eval_cfg.get("sampler", "ddpm"))
-    ddim_steps = args.ddim_steps if args.ddim_steps is not None else eval_cfg.get("ddim_steps", None)
+    sampler = args.sampler or str(eval_cfg.get("sampler", "dpmpp_2m"))
+    sampling_steps = (
+        args.sampling_steps
+        if args.sampling_steps is not None
+        else eval_cfg.get("sampling_steps", eval_cfg.get("ddim_steps", None))
+    )
     ddim_eta = (
         float(args.ddim_eta)
         if args.ddim_eta is not None
@@ -159,7 +166,7 @@ if __name__ == "__main__":
         wind_value_kt=wind_value_kt,
         guidance_scale=args.guidance_scale,
         sampler=sampler,
-        num_sampling_steps=ddim_steps,
+        num_sampling_steps=sampling_steps,
         ddim_eta=ddim_eta,
         return_both=True,
     )

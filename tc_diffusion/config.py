@@ -9,6 +9,7 @@ _DATA_PATH_KEYS = (
     ("data", "packed_manifest"),
     ("data", "split_dir"),
 )
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_config(path, overrides=None):
@@ -111,7 +112,24 @@ def _resolve_one_path(cfg, keys, base_dir: Path):
         d[leaf] = str(value_path)
         return
 
-    d[leaf] = str((base_dir / value_path).resolve())
+    resolved = (base_dir / value_path).resolve()
+    if resolved.exists() or not _looks_like_legacy_repo_relative_path(value_path):
+        d[leaf] = str(resolved)
+        return
+
+    repo_relative = (_PROJECT_ROOT / value_path).resolve()
+    if repo_relative.exists():
+        d[leaf] = str(repo_relative)
+        return
+
+    d[leaf] = str(resolved)
+
+
+def _looks_like_legacy_repo_relative_path(value_path: Path) -> bool:
+    parts = value_path.parts
+    if not parts:
+        return False
+    return parts[0] in {"data", "runs"}
 
 
 def apply_overrides(cfg, overrides):

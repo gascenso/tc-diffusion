@@ -79,8 +79,9 @@ evaluation:
   n_plot_per_group: 25   # plot up to 25 real + 25 generated samples per class
   gen_batch_size: null
   guidance_scale: 2.5
-  sampler: "ddpm"        # "ddpm" | "ddim"
-  ddim_steps: null       # null -> full diffusion.num_steps schedule
+  sampler: "dpmpp_2m"    # "ddpm" | "ddim" | "dpmpp_2m"
+  sampling_steps: 25     # used by DDIM / DPM++ 2M; DDPM ignores it
+  ddim_steps: null       # legacy alias for sampling_steps
   ddim_eta: 0.0          # 0.0 -> deterministic DDIM
   seed: 123
   real_seed: 123
