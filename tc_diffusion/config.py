@@ -1,6 +1,7 @@
 import yaml
 from pathlib import Path
 from copy import deepcopy
+import os
 
 
 _DATA_PATH_KEYS = (
@@ -12,6 +13,21 @@ _DATA_PATH_KEYS = (
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _absolute_preserving_symlinks(path: str | Path, cwd: Path | None = None) -> Path:
+    """Return an absolute path without collapsing symlink components.
+
+    This matters for Cassandra jobs that launch from `/work/...` while
+    `configs/`, `scripts/`, and `tc_diffusion/` are symlinked back to
+    `/users_home/...`. Relative data paths in configs must stay anchored to the
+    invoked `/work` tree rather than the symlink target in `/users_home`.
+    """
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        base = Path.cwd() if cwd is None else Path(cwd)
+        path = base / path
+    return Path(os.path.abspath(os.fspath(path)))
+
+
 def load_config(path, overrides=None):
     """
     Load a YAML config, optionally inheriting from one or more base configs,
@@ -20,7 +36,7 @@ def load_config(path, overrides=None):
     overrides example:
         ["training.lr=5e-4", "data.batch_size=16"]
     """
-    path = Path(path).resolve()
+    path = _absolute_preserving_symlinks(path)
     cfg = _load_config_recursive(path)
 
     if overrides:
@@ -31,14 +47,15 @@ def load_config(path, overrides=None):
 
 
 def _load_config_recursive(path: Path, seen=None):
-    path = Path(path).resolve()
+    path = _absolute_preserving_symlinks(path)
     if seen is None:
         seen = set()
-    if path in seen:
+    cycle_key = path.resolve()
+    if cycle_key in seen:
         raise ValueError(f"Config inheritance cycle detected at: {path}")
 
     seen = set(seen)
-    seen.add(path)
+    seen.add(cycle_key)
 
     with path.open("r") as f:
         cfg = yaml.safe_load(f) or {}
@@ -63,7 +80,7 @@ def _load_config_recursive(path: Path, seen=None):
 
     merged = {}
     for base_entry in base_paths:
-        base_path = (path.parent / Path(base_entry)).resolve()
+        base_path = _absolute_preserving_symlinks(Path(path.parent) / Path(base_entry))
         base_cfg = _load_config_recursive(base_path, seen=seen)
         merged = deep_merge_dicts(merged, base_cfg)
 
@@ -86,7 +103,7 @@ def deep_merge_dicts(base, override):
 
 def resolve_config_paths(cfg, base_dir: Path):
     cfg = deepcopy(cfg)
-    base_dir = Path(base_dir).resolve()
+    base_dir = _absolute_preserving_symlinks(base_dir)
     for path_keys in _DATA_PATH_KEYS:
         _resolve_one_path(cfg, path_keys, base_dir)
     return cfg
@@ -112,7 +129,7 @@ def _resolve_one_path(cfg, keys, base_dir: Path):
         d[leaf] = str(value_path)
         return
 
-    resolved = (base_dir / value_path).resolve()
+    resolved = _absolute_preserving_symlinks(base_dir / value_path)
     if resolved.exists() or not _looks_like_legacy_repo_relative_path(value_path):
         d[leaf] = str(resolved)
         return
