@@ -4,6 +4,7 @@
 # (unconditional sampling)      python -m scripts.sample --name <RUN_NAME> --uncond
 # (conditional sampling, Cat3)  python -m scripts.sample --name <RUN_NAME> --ss_cat 3
 # (conditional with CFG)        python -m scripts.sample --name <RUN_NAME> --ss_cat 3 --guidance_scale 2.0
+# (DDIM sampling)               python -m scripts.sample --name <RUN_NAME> --sampler ddim --ddim_steps 50
 
 import argparse
 from pathlib import Path
@@ -55,6 +56,25 @@ def parse_args():
         type=float,
         default=0.0,
         help="Classifier-free guidance scale. 0 disables CFG. Typical: 1-5."
+    )
+    p.add_argument(
+        "--sampler",
+        type=str,
+        default=None,
+        choices=["ddpm", "ddim"],
+        help="Sampler to use. Defaults to evaluation.sampler from the config.",
+    )
+    p.add_argument(
+        "--ddim_steps",
+        type=int,
+        default=None,
+        help="Number of DDIM steps. Defaults to evaluation.ddim_steps or the full schedule.",
+    )
+    p.add_argument(
+        "--ddim_eta",
+        type=float,
+        default=None,
+        help="DDIM stochasticity. 0.0 gives deterministic DDIM. Defaults to evaluation.ddim_eta.",
     )
     p.add_argument(
         "--uncond",
@@ -121,6 +141,14 @@ if __name__ == "__main__":
 
     cond_value = None if args.uncond else args.ss_cat
     wind_value_kt = None if args.uncond else args.wind_kt
+    eval_cfg = cfg.get("evaluation", {})
+    sampler = args.sampler or str(eval_cfg.get("sampler", "ddpm"))
+    ddim_steps = args.ddim_steps if args.ddim_steps is not None else eval_cfg.get("ddim_steps", None)
+    ddim_eta = (
+        float(args.ddim_eta)
+        if args.ddim_eta is not None
+        else float(eval_cfg.get("ddim_eta", 0.0))
+    )
 
     print("Sampling...")
     sample_outputs = diffusion.sample(
@@ -130,6 +158,9 @@ if __name__ == "__main__":
         cond_value=cond_value,
         wind_value_kt=wind_value_kt,
         guidance_scale=args.guidance_scale,
+        sampler=sampler,
+        num_sampling_steps=ddim_steps,
+        ddim_eta=ddim_eta,
         return_both=True,
     )
     x_samples = sample_outputs["raw_final"]

@@ -245,6 +245,45 @@ class Diffusion:
         seed = tf.convert_to_tensor(seed, dtype=tf.int32)
         return tf.stack([seed[0], seed[1] + tf.cast(offset, tf.int32)])
 
+    def _predict_x0_and_eps(self, model, x_t, t_int, cond, guidance_scale=0.0):
+        """Run the denoiser once and return a stabilized x0 prediction plus eps."""
+        bsz = tf.shape(x_t)[0]
+        t = tf.fill([bsz], tf.cast(t_int, tf.int32))
+        cond_ss, cond_wind = self._prepare_condition_tensors(cond, bsz)
+
+        alpha_bar_t = tf.cast(self.alphas_cumprod[t_int], tf.float32)
+        sqrt_one_minus_alpha_bar = tf.sqrt(1.0 - alpha_bar_t)
+        gs = 0.0 if guidance_scale is None else float(guidance_scale)
+
+        if gs > 0.0:
+            cond_null_ss = tf.fill([bsz], tf.cast(self.null_label, tf.int32))
+            cond_null_wind = tf.fill([bsz], tf.cast(self.null_wind_kt, tf.float32))
+
+            x_in = tf.concat([x_t, x_t], axis=0)
+            t_in = tf.concat([t, t], axis=0)
+            ss_in = tf.concat([cond_ss, cond_null_ss], axis=0)
+            wind_in = tf.concat([cond_wind, cond_null_wind], axis=0)
+
+            pred_all = model([x_in, t_in, ss_in, wind_in], training=False)
+            pred_cond, pred_uncond = tf.split(pred_all, num_or_size_splits=2, axis=0)
+            pred_theta = pred_uncond + tf.cast(gs, tf.float32) * (pred_cond - pred_uncond)
+        else:
+            pred_theta = model([x_t, t, cond_ss, cond_wind], training=False)
+
+        if self.prediction_type == "eps":
+            eps_theta = pred_theta
+            x0_pred = self._predict_x0_from_eps(x_t, t_int, eps_theta)
+        else:
+            x0_pred = self._predict_x0_from_v(x_t, alpha_bar_t, pred_theta)
+            eps_theta = self._predict_eps_from_v(x_t, alpha_bar_t, pred_theta)
+
+        if self.dynamic_threshold:
+            x0_pred, _ = self._dynamic_threshold_x0(x0_pred, p=self.dynamic_threshold_p)
+
+        sqrt_alpha_bar = tf.sqrt(alpha_bar_t)
+        eps_theta = (x_t - sqrt_alpha_bar * x0_pred) / (sqrt_one_minus_alpha_bar + 1e-8)
+        return x0_pred, eps_theta
+
     def loss(self, model, x0, cond, training: bool = True, t=None, noise=None, seed=None):
         """
         One-step diffusion training loss.
@@ -334,10 +373,6 @@ class Diffusion:
         t_int: Python int in [0, T-1], same for whole batch.
         cond: int tensor (ss cat) or dict with {"ss_cat", "wind_kt"}.
         """
-        bsz = tf.shape(x_t)[0]
-        t = tf.fill([bsz], tf.cast(t_int, tf.int32))  # (B,)
-        cond_ss, cond_wind = self._prepare_condition_tensors(cond, bsz)
-
         beta_t = self.betas[t_int]              # scalar
         alpha_t = self.alphas[t_int]            # scalar
         alpha_bar_t = self.alphas_cumprod[t_int]  # scalar
@@ -348,40 +383,13 @@ class Diffusion:
 
         sqrt_one_minus_alpha_bar = tf.sqrt(1.0 - alpha_bar_t)
         sqrt_recip_alpha_t = 1.0 / tf.sqrt(alpha_t)
-
-        gs = 0.0 if guidance_scale is None else float(guidance_scale)
-
-        if gs > 0.0:
-            # unconditional labels: the special null id
-            cond_null_ss = tf.fill([bsz], tf.cast(self.null_label, tf.int32))
-            cond_null_wind = tf.fill([bsz], tf.cast(self.null_wind_kt, tf.float32))
-
-            # One forward pass: [cond batch; uncond batch]
-            x_in = tf.concat([x_t, x_t], axis=0)
-            t_in = tf.concat([t, t], axis=0)
-            ss_in = tf.concat([cond_ss, cond_null_ss], axis=0)
-            wind_in = tf.concat([cond_wind, cond_null_wind], axis=0)
-
-            pred_all = model([x_in, t_in, ss_in, wind_in], training=False)
-            pred_cond, pred_uncond = tf.split(pred_all, num_or_size_splits=2, axis=0)
-            pred_theta = pred_uncond + tf.cast(gs, tf.float32) * (pred_cond - pred_uncond)
-        else:
-            pred_theta = model([x_t, t, cond_ss, cond_wind], training=False)
-
-        if self.prediction_type == "eps":
-            eps_theta = pred_theta
-            x0_pred = self._predict_x0_from_eps(x_t, t_int, eps_theta)
-        else:
-            x0_pred = self._predict_x0_from_v(x_t, alpha_bar_t, pred_theta)
-            eps_theta = self._predict_eps_from_v(x_t, alpha_bar_t, pred_theta)
-
-        if self.dynamic_threshold:
-            x0_pred, _ = self._dynamic_threshold_x0(x0_pred, p=self.dynamic_threshold_p)
-
-        # Recompute eps consistent with stabilized x0 (important)
-        # eps = (x_t - sqrt(alpha_bar) * x0) / sqrt(1 - alpha_bar)
-        sqrt_alpha_bar = tf.sqrt(alpha_bar_t)
-        eps_theta = (x_t - sqrt_alpha_bar * x0_pred) / (sqrt_one_minus_alpha_bar + 1e-8)
+        x0_pred, eps_theta = self._predict_x0_and_eps(
+            model,
+            x_t,
+            t_int,
+            cond,
+            guidance_scale=guidance_scale,
+        )
 
         # DDPM mean using stabilized eps (equivalently stabilized x0)
         model_mean = sqrt_recip_alpha_t * (
@@ -399,6 +407,49 @@ class Diffusion:
         # evaluation can inspect out-of-range behavior honestly.
         return x0_pred
 
+    def ddim_step(self, model, x_t, t_int, t_prev_int, cond, guidance_scale=0.0, eta=0.0):
+        """Single DDIM reverse step x_t -> x_{t_prev}."""
+        alpha_bar_t = tf.cast(self.alphas_cumprod[t_int], tf.float32)
+        x0_pred, eps_theta = self._predict_x0_and_eps(
+            model,
+            x_t,
+            t_int,
+            cond,
+            guidance_scale=guidance_scale,
+        )
+
+        if t_prev_int < 0:
+            return x0_pred
+
+        alpha_bar_prev = tf.cast(self.alphas_cumprod[t_prev_int], tf.float32)
+        eta = tf.cast(eta, tf.float32)
+        sigma_t = eta * tf.sqrt(
+            tf.maximum((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t), 0.0)
+        ) * tf.sqrt(
+            tf.maximum(1.0 - (alpha_bar_t / alpha_bar_prev), 0.0)
+        )
+
+        pred_dir = tf.sqrt(tf.maximum(1.0 - alpha_bar_prev - sigma_t ** 2, 0.0)) * eps_theta
+        x_prev = tf.sqrt(alpha_bar_prev) * x0_pred + pred_dir
+
+        if float(eta) > 0.0:
+            noise = tf.random.normal(shape=tf.shape(x_t), dtype=x_t.dtype)
+            x_prev = x_prev + sigma_t * noise
+        return x_prev
+
+    def _build_ddim_timesteps(self, num_sampling_steps):
+        if num_sampling_steps is None:
+            steps = self.num_steps
+        else:
+            steps = int(num_sampling_steps)
+        if steps <= 0 or steps > self.num_steps:
+            raise ValueError(
+                f"DDIM num_sampling_steps must be in [1, {self.num_steps}], got {steps}."
+            )
+        schedule = np.round(np.linspace(0, self.num_steps - 1, steps)).astype(np.int32)
+        schedule = np.unique(schedule)
+        return list(schedule[::-1])
+
     def sample(
         self,
         model,
@@ -408,6 +459,9 @@ class Diffusion:
         wind_value_kt=None,
         show_progress=True,
         guidance_scale=0.0,
+        sampler: str = "ddpm",
+        num_sampling_steps: int | None = None,
+        ddim_eta: float = 0.0,
         return_both: bool = False,
     ):
         """
@@ -415,6 +469,9 @@ class Diffusion:
 
         cond_value: integer SS category index (0..5), or None for unconditional.
         wind_value_kt: optional wind conditioning value. If None, uses class midpoint.
+        sampler: reverse-process sampler to use. Supported: "ddpm", "ddim".
+        num_sampling_steps: optional number of DDIM steps (defaults to full schedule).
+        ddim_eta: DDIM stochasticity. 0.0 is deterministic DDIM.
         return_both: if True, return both the post-threshold raw final sample and
                      a hard-clipped sibling for diagnostic use.
         """
@@ -448,17 +505,39 @@ class Diffusion:
                 "wind_kt": wind_kt_t,
             }
 
-        t_iter = reversed(range(self.num_steps))
+        sampler_name = str(sampler).strip().lower()
+        if sampler_name not in {"ddpm", "ddim"}:
+            raise ValueError(f"Unsupported sampler '{sampler}'. Expected 'ddpm' or 'ddim'.")
+
+        if sampler_name == "ddpm":
+            timesteps = list(range(self.num_steps - 1, -1, -1))
+        else:
+            timesteps = self._build_ddim_timesteps(num_sampling_steps)
+
+        t_iter = timesteps
         if show_progress:
             t_iter = tqdm(
                 t_iter,
-                total=self.num_steps,
-                desc="Sampling diffusion steps",
+                total=len(timesteps),
+                desc=f"Sampling diffusion steps ({sampler_name.upper()})",
                 leave=True,
             )
 
-        for t_int in t_iter:
-            x_t = self.p_sample_step(model, x_t, t_int, cond, guidance_scale=guidance_scale)
+        if sampler_name == "ddpm":
+            for t_int in t_iter:
+                x_t = self.p_sample_step(model, x_t, t_int, cond, guidance_scale=guidance_scale)
+        else:
+            for idx, t_int in enumerate(t_iter):
+                t_prev_int = timesteps[idx + 1] if idx + 1 < len(timesteps) else -1
+                x_t = self.ddim_step(
+                    model,
+                    x_t,
+                    t_int,
+                    t_prev_int,
+                    cond,
+                    guidance_scale=guidance_scale,
+                    eta=ddim_eta,
+                )
 
         raw_final = x_t
         clipped_final = tf.clip_by_value(raw_final, -1.0, 1.0)

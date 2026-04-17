@@ -94,6 +94,8 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ev.setdefault("gen_batch_size", None)
     ev.setdefault("guidance_scale", 0.0)
     ev.setdefault("sampler", "ddpm")
+    ev.setdefault("ddim_steps", None)
+    ev.setdefault("ddim_eta", 0.0)
     ev.setdefault("seed", 123)
     ev.setdefault("real_seed", 123)
     ev.setdefault("profile_bins", 96)
@@ -779,6 +781,9 @@ class TCEvaluator:
                     cond_value=c,
                     wind_value_kt=wind_batch,
                     guidance_scale=float(ev["guidance_scale"]),
+                    sampler=str(ev["sampler"]),
+                    num_sampling_steps=ev.get("ddim_steps", None),
+                    ddim_eta=float(ev.get("ddim_eta", 0.0)),
                     show_progress=show_progress,
                     return_both=True,
                 )
@@ -916,6 +921,12 @@ class TCEvaluator:
             "n_per_class": n_per,
             "n_plot_per_group": n_plot,
             "gen_batch_size": gen_batch_size,
+            "sampling": {
+                "sampler": str(ev["sampler"]),
+                "guidance_scale": float(ev["guidance_scale"]),
+                "ddim_steps": ev.get("ddim_steps", None),
+                "ddim_eta": float(ev.get("ddim_eta", 0.0)),
+            },
             "bootstrap": {
                 "reps": bootstrap_reps,
                 "ci_level": bootstrap_ci_level,
