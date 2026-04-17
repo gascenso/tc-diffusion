@@ -192,14 +192,15 @@ def cold_cloud_fraction(imgs_k: np.ndarray, threshold_k: float = 200.0) -> np.nd
     return np.mean(imgs_k < float(threshold_k), axis=(1, 2)).astype(np.float32)
 
 
-def eye_contrast_proxy(mean_profile_k: np.ndarray, inner_frac: float = 0.12, ring_frac: float = 0.12) -> np.ndarray:
+def eye_contrast_proxy(mean_profile_k: np.ndarray, inner_frac: float = 0.12, ring_frac: float = 0.20) -> np.ndarray:
     """
     Uses radial mean profile: higher contrast between warm inner core and cold eyewall ring.
     mean_profile_k: (N, r_bins)
     inner_frac: fraction of radius considered 'eye' (default 0.12)
-    ring_frac:  fraction of radius marking the eyewall ring centre (default 0.12 ≈ ~10–30 km
-                for a 256-px patch at ~4–8 km/px, consistent with typical eyewall radii).
-                Previously 0.25, which placed the search in the outer rainband region.
+    ring_frac:  fraction of radius marking the eyewall ring centre. The default
+                is set far enough outside the inner-eye window that the ring
+                search does not overlap the eye region on the common 96-bin
+                setup, while still staying well inside the outer rainband region.
 
     Uses ring_mean instead of ring_min to avoid inflating the metric due to
     a single anomalously cold pixel anywhere in the ring window.
@@ -210,8 +211,9 @@ def eye_contrast_proxy(mean_profile_k: np.ndarray, inner_frac: float = 0.12, rin
     ring_window = max(2, int(R * 0.05))
 
     eye_mean = np.mean(mean_profile_k[:, :inner_bins], axis=1)
-    lo = max(0, ring_center - ring_window)
-    hi = min(R, ring_center + ring_window)
+    lo = max(inner_bins, ring_center - ring_window)
+    lo = min(lo, max(R - 1, 0))
+    hi = min(R, max(lo + 1, ring_center + ring_window))
     ring_mean = np.mean(mean_profile_k[:, lo:hi], axis=1)
     return (eye_mean - ring_mean).astype(np.float32)
 
