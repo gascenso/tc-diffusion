@@ -70,6 +70,7 @@ training:
   val_every_epochs: 1
   early_stopping:
     enabled: true
+    monitor: "ema"         # "ema" (recommended when EMA is used) or "raw"
     patience_epochs: 15
     min_delta: 1.0e-8
 

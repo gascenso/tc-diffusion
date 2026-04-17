@@ -5,6 +5,7 @@ import math
 import random
 import base64
 import pickle
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -102,6 +103,20 @@ class EMA(tf.Module):
     def restore_model_weights_snapshot(self, snapshot):
         for arr, w in zip(snapshot, self.model.weights):
             w.assign(arr)
+
+@contextmanager
+def _ema_weights_applied(ema):
+    """Temporarily swap the live model weights to EMA weights."""
+    if ema is None:
+        yield
+        return
+
+    snapshot = ema.get_model_weights_snapshot()
+    ema.copy_to_model()
+    try:
+        yield
+    finally:
+        ema.restore_model_weights_snapshot(snapshot)
 
 def _state_path(out_dir: Path) -> Path:
     return out_dir / "run_state.json"
@@ -364,18 +379,36 @@ def train(cfg, resume: bool = False):
     es_enabled = bool(es_cfg.get("enabled", False))
     patience_epochs = int(es_cfg.get("patience_epochs", 10))
     min_delta = float(es_cfg.get("min_delta", 0.0))
+    early_stopping_monitor = str(
+        es_cfg.get("monitor", "ema" if use_ema else "raw")
+    ).strip().lower()
+    if early_stopping_monitor not in {"raw", "ema"}:
+        raise ValueError(
+            "training.early_stopping.monitor must be 'raw' or 'ema', "
+            f"got {early_stopping_monitor!r}"
+        )
+    if early_stopping_monitor == "ema" and not use_ema:
+        raise ValueError(
+            "training.early_stopping.monitor='ema' requires training.ema_decay > 0."
+        )
+    print(f"[train] Early stopping monitor: {early_stopping_monitor}")
 
     # ----- resume state -----
     start_epoch = 0
     best_epoch_loss = float("inf")
     best_epoch_balanced = float("inf")
     best_epoch_idx = -1
+    best_epoch_loss_ema = float("inf")
+    best_epoch_balanced_ema = float("inf")
+    best_epoch_idx_ema = -1
     epochs_without_improvement = 0
 
     epoch_indices = []
     epoch_losses = []
     val_losses = []
     val_losses_balanced = []
+    val_losses_ema = []
+    val_losses_balanced_ema = []
     state = _load_state(out_dir)
 
     if resume:
@@ -398,11 +431,16 @@ def train(cfg, resume: bool = False):
                 best_epoch_loss = float(state.get("best_epoch_loss", best_epoch_loss))
                 best_epoch_balanced = float(state.get("best_epoch_balanced", best_epoch_balanced))
                 best_epoch_idx = int(state.get("best_epoch", best_epoch_idx))
+                best_epoch_loss_ema = float(state.get("best_epoch_loss_ema", best_epoch_loss_ema))
+                best_epoch_balanced_ema = float(state.get("best_epoch_balanced_ema", best_epoch_balanced_ema))
+                best_epoch_idx_ema = int(state.get("best_epoch_ema", best_epoch_idx_ema))
                 epochs_without_improvement = int(state.get("epochs_without_improvement", 0))
                 epoch_indices = list(state.get("epoch_indices", []))
                 epoch_losses = list(state.get("epoch_losses", []))
                 val_losses = list(state.get("val_losses", []))
                 val_losses_balanced = list(state.get("val_losses_balanced", []))
+                val_losses_ema = list(state.get("val_losses_ema", []))
+                val_losses_balanced_ema = list(state.get("val_losses_balanced_ema", []))
 
                 py_state = state.get("python_random_state")
                 if py_state is not None:
@@ -421,7 +459,8 @@ def train(cfg, resume: bool = False):
 
             print(
                 f"[resume] start_epoch={start_epoch}, best_epoch={best_epoch_idx}, "
-                f"best_loss={best_epoch_loss:.6f}, global_step={int(checkpoint.global_step.numpy())}"
+                f"best_loss={best_epoch_loss:.6f}, best_epoch_ema={best_epoch_idx_ema}, "
+                f"best_loss_ema={best_epoch_loss_ema:.6f}, global_step={int(checkpoint.global_step.numpy())}"
             )
 
     active_alpha = None
@@ -537,6 +576,8 @@ def train(cfg, resume: bool = False):
         print(f"Epoch {epoch+1} mean loss: {epoch_loss:.6f}")
         val_loss = None
         val_loss_balanced = None
+        val_loss_ema = None
+        val_loss_balanced_ema = None
         if (epoch + 1) % val_every_epochs == 0:
             val_loss = evaluate_loss(
                 diffusion,
@@ -558,6 +599,28 @@ def train(cfg, resume: bool = False):
             val_losses_balanced.append(val_loss_balanced)
             print(f"Epoch {epoch+1} val mean loss (full): {val_loss:.6f}")
             print(f"Epoch {epoch+1} val mean loss (balanced_fixed): {val_loss_balanced:.6f}")
+            if use_ema and ema is not None:
+                with _ema_weights_applied(ema):
+                    val_loss_ema = evaluate_loss(
+                        diffusion,
+                        model,
+                        ds_val_full,
+                        val_steps=val_steps,
+                        base_seed=val_base_seed,
+                        split_seed_offset=0,
+                    )
+                    val_loss_balanced_ema = evaluate_loss(
+                        diffusion,
+                        model,
+                        ds_val_balanced,
+                        val_steps=val_steps,
+                        base_seed=val_base_seed,
+                        split_seed_offset=10_000,
+                    )
+                val_losses_ema.append(val_loss_ema)
+                val_losses_balanced_ema.append(val_loss_balanced_ema)
+                print(f"Epoch {epoch+1} EMA val mean loss (full): {val_loss_ema:.6f}")
+                print(f"Epoch {epoch+1} EMA val mean loss (balanced_fixed): {val_loss_balanced_ema:.6f}")
 
         # ----- ALWAYS save "last" -----
         last_path = out_dir / f"weights_last.epoch_{epoch+1}.weights.h5"
@@ -565,37 +628,63 @@ def train(cfg, resume: bool = False):
         _delete_other_last_weights(out_dir, keep=last_path)
         if use_ema and ema is not None:
             ema_last_path = out_dir / f"weights_ema_last.epoch_{epoch+1}.weights.h5"
-            snap = ema.get_model_weights_snapshot()
-            ema.copy_to_model()
-            model.save_weights(ema_last_path)
-            ema.restore_model_weights_snapshot(snap)
+            with _ema_weights_applied(ema):
+                model.save_weights(ema_last_path)
             _delete_other_ema_last_weights(out_dir, keep=ema_last_path)
             print(f"  Saved EMA last weights to {ema_last_path}")
         print(f"  Saved last weights to {last_path}")
 
         # ----- check for improvement (best) on FULL validation only -----
+        raw_improved = val_loss is not None and (best_epoch_loss - val_loss > min_delta)
+        ema_improved = (
+            val_loss_ema is not None
+            and use_ema
+            and ema is not None
+            and (best_epoch_loss_ema - val_loss_ema > min_delta)
+        )
+
         if val_loss is not None:
-            metric = val_loss
-            improved = (best_epoch_loss - metric > min_delta)
-            if improved:
-                best_epoch_loss = metric
+            if raw_improved:
+                best_epoch_loss = val_loss
                 best_epoch_idx = epoch + 1
-                epochs_without_improvement = 0
 
                 best_path = out_dir / "weights_best_val.weights.h5"
                 model.save_weights(best_path)
                 print(f"  New best model (epoch {best_epoch_idx}), saved to {best_path} (metric={best_epoch_loss:.6f})")
 
-                if use_ema and ema is not None:
-                    best_ema_path = out_dir / "weights_ema_best_val.weights.h5"
-                    snap = ema.get_model_weights_snapshot()
-                    ema.copy_to_model()
+        if val_loss_ema is not None and use_ema and ema is not None:
+            if ema_improved:
+                best_epoch_loss_ema = val_loss_ema
+                best_epoch_idx_ema = epoch + 1
+                best_ema_path = out_dir / "weights_ema_best_val.weights.h5"
+                with _ema_weights_applied(ema):
                     model.save_weights(best_ema_path)
-                    ema.restore_model_weights_snapshot(snap)
-                    print(f"  New best EMA model (epoch {best_epoch_idx}), saved to {best_ema_path}")
+                print(
+                    f"  New best EMA model (epoch {best_epoch_idx_ema}), "
+                    f"saved to {best_ema_path} (metric={best_epoch_loss_ema:.6f})"
+                )
+
+        if val_loss is not None:
+            if early_stopping_monitor == "ema":
+                monitor_improved = ema_improved
+                monitor_metric = val_loss_ema
+            else:
+                monitor_improved = raw_improved
+                monitor_metric = val_loss
+
+            if monitor_metric is None:
+                raise RuntimeError(
+                    f"Early-stopping monitor '{early_stopping_monitor}' has no validation metric for epoch {epoch+1}."
+                )
+
+            if monitor_improved:
+                epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
-                print(f"  No significant improvement ({epochs_without_improvement}/{patience_epochs})")
+                print(
+                    f"  No significant improvement on early-stopping monitor "
+                    f"({early_stopping_monitor}) ({epochs_without_improvement}/{patience_epochs})"
+                )
         else:
             print("  Skipping early-stopping update (validation not run this epoch).")
 
@@ -605,13 +694,20 @@ def train(cfg, resume: bool = False):
             best_bal_path = out_dir / "weights_best_balanced_val.weights.h5"
             model.save_weights(best_bal_path)
             print(f"  New best BALANCED model, saved to {best_bal_path} (metric={best_epoch_balanced:.6f})")
-            if use_ema and ema is not None:
-                best_bal_ema_path = out_dir / "weights_ema_best_balanced_val.weights.h5"
-                snap = ema.get_model_weights_snapshot()
-                ema.copy_to_model()
+        if (
+            val_loss_balanced_ema is not None
+            and use_ema
+            and ema is not None
+            and (best_epoch_balanced_ema - val_loss_balanced_ema > min_delta)
+        ):
+            best_epoch_balanced_ema = val_loss_balanced_ema
+            best_bal_ema_path = out_dir / "weights_ema_best_balanced_val.weights.h5"
+            with _ema_weights_applied(ema):
                 model.save_weights(best_bal_ema_path)
-                ema.restore_model_weights_snapshot(snap)
-                print(f"  New best BALANCED EMA model, saved to {best_bal_ema_path}")
+            print(
+                f"  New best BALANCED EMA model, saved to {best_bal_ema_path} "
+                f"(metric={best_epoch_balanced_ema:.6f})"
+            )
 
         checkpoint.epoch.assign(epoch + 1)
         ckpt_path = checkpoint_manager.save(checkpoint_number=epoch + 1)
@@ -626,11 +722,16 @@ def train(cfg, resume: bool = False):
                 "best_epoch": best_epoch_idx,
                 "best_epoch_loss": best_epoch_loss,
                 "best_epoch_balanced": best_epoch_balanced,
+                "best_epoch_ema": best_epoch_idx_ema,
+                "best_epoch_loss_ema": best_epoch_loss_ema,
+                "best_epoch_balanced_ema": best_epoch_balanced_ema,
                 "epochs_without_improvement": epochs_without_improvement,
                 "epoch_indices": epoch_indices,
                 "epoch_losses": epoch_losses,
                 "val_losses": val_losses,
                 "val_losses_balanced": val_losses_balanced,
+                "val_losses_ema": val_losses_ema,
+                "val_losses_balanced_ema": val_losses_balanced_ema,
                 "python_random_state": _encode_py_state(random.getstate()),
                 "numpy_random_state": _encode_py_state(np.random.get_state()),
                 "train_sampler_state": _encode_py_state(train_sampler.get_state()),
@@ -639,9 +740,12 @@ def train(cfg, resume: bool = False):
 
         # ----- early stopping -----
         if es_enabled and epochs_without_improvement >= patience_epochs:
+            stop_best_epoch = best_epoch_idx_ema if early_stopping_monitor == "ema" else best_epoch_idx
+            stop_best_loss = best_epoch_loss_ema if early_stopping_monitor == "ema" else best_epoch_loss
             print(
                 f"\n Early stopping at epoch {epoch+1} "
-                f"(best epoch: {best_epoch_idx}, with loss {best_epoch_loss:.6f})"
+                f"(monitor={early_stopping_monitor}, best epoch: {stop_best_epoch}, "
+                f"best loss {stop_best_loss:.6f})"
             )
             break
     
@@ -670,5 +774,8 @@ def train(cfg, resume: bool = False):
         "epoch_loss": epoch_losses,
         "best_epoch": best_epoch_idx,
         "best_epoch_loss": best_epoch_loss,
+        "best_epoch_ema": best_epoch_idx_ema,
+        "best_epoch_loss_ema": best_epoch_loss_ema,
+        "early_stopping_monitor": early_stopping_monitor,
         "stopped_early": es_enabled and epochs_without_improvement >= patience_epochs,
     }
