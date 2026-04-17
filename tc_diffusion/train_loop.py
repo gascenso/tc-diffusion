@@ -154,11 +154,20 @@ def _save_state(out_dir: Path, state: dict):
         json.dump(state, f, indent=2)
     tmp.replace(sp)
 
-def evaluate_loss(diffusion, model, ds_val, val_steps: int | None = None):
+def evaluate_loss(
+    diffusion,
+    model,
+    ds_val,
+    val_steps: int | None = None,
+    *,
+    base_seed: int = 42,
+    split_seed_offset: int = 0,
+):
     """Compute mean diffusion loss weighted by actual batch size.
 
     If val_steps is None or <=0, iterate over the *entire* ds_val.
-    This is the recommended mode for finite, deterministic validation sets.
+    For validation we also use stateless per-batch timestep/noise draws, so the
+    result is deterministic for a fixed model state and dataset.
 
     Weighting by sample count rather than batch count ensures the last
     (potentially partial) batch does not get inflated weight.
@@ -170,7 +179,27 @@ def evaluate_loss(diffusion, model, ds_val, val_steps: int | None = None):
         if (not full_pass) and batch >= int(val_steps):
             break
         batch_size = int(tf.shape(x0)[0])
-        loss = diffusion.loss(model, x0, cond, training=False)
+        t_seed = tf.constant(
+            [int(base_seed) + int(split_seed_offset), int(batch)],
+            dtype=tf.int32,
+        )
+        noise_seed = tf.constant(
+            [int(base_seed) + int(split_seed_offset) + 1, int(batch)],
+            dtype=tf.int32,
+        )
+        t = tf.random.stateless_uniform(
+            shape=(batch_size,),
+            seed=t_seed,
+            minval=0,
+            maxval=diffusion.num_steps,
+            dtype=tf.int32,
+        )
+        noise = tf.random.stateless_normal(
+            shape=tf.shape(x0),
+            seed=noise_seed,
+            dtype=x0.dtype,
+        )
+        loss = diffusion.loss(model, x0, cond, training=False, t=t, noise=noise)
         loss_sum += float(loss.numpy()) * batch_size
         n_samples += batch_size
     return loss_sum / max(1, n_samples)
@@ -248,6 +277,7 @@ def train(cfg, resume: bool = False):
     # Validation: build two deterministic finite sets:
     #   1) full pass over the val split (micro average)
     #   2) fixed balanced subset (tail-sensitive but stable)
+    # Validation loss itself is made deterministic later via stateless RNG.
     data_cfg["eval_mode"] = "full"
     ds_val_full = create_dataset(cfg, split="val")
 
@@ -273,8 +303,15 @@ def train(cfg, resume: bool = False):
     val_every_epochs = int(cfg["training"].get("val_every_epochs", 1))
     if val_every_epochs <= 0:
         raise ValueError(f"training.val_every_epochs must be >= 1, got {val_every_epochs}")
-    # If val_steps <= 0, we will do a full deterministic pass.
+    # If val_steps <= 0, we will do a full deterministic pass with fixed
+    # timestep/noise draws as well as a fixed sample order.
     val_steps = int(cfg["training"].get("val_steps", 0))
+    train_seed_cfg = cfg.get("training", {}).get("seed", None)
+    if train_seed_cfg is not None:
+        val_base_seed = int(train_seed_cfg)
+    else:
+        eval_seed_cfg = cfg.get("data", {}).get("eval_seed", None)
+        val_base_seed = 42 if eval_seed_cfg is None else int(eval_seed_cfg)
     log_interval = int(cfg["training"]["log_interval_steps"])
 
     lr_schedule = WarmupCosineDecay(
@@ -439,8 +476,22 @@ def train(cfg, resume: bool = False):
         val_loss = None
         val_loss_balanced = None
         if (epoch + 1) % val_every_epochs == 0:
-            val_loss = evaluate_loss(diffusion, model, ds_val_full, val_steps=val_steps)
-            val_loss_balanced = evaluate_loss(diffusion, model, ds_val_balanced, val_steps=val_steps)
+            val_loss = evaluate_loss(
+                diffusion,
+                model,
+                ds_val_full,
+                val_steps=val_steps,
+                base_seed=val_base_seed,
+                split_seed_offset=0,
+            )
+            val_loss_balanced = evaluate_loss(
+                diffusion,
+                model,
+                ds_val_balanced,
+                val_steps=val_steps,
+                base_seed=val_base_seed,
+                split_seed_offset=10_000,
+            )
             val_losses.append(val_loss)
             val_losses_balanced.append(val_loss_balanced)
             print(f"Epoch {epoch+1} val mean loss (full): {val_loss:.6f}")

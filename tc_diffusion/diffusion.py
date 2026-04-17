@@ -241,20 +241,50 @@ class Diffusion:
             return snr_cap / tf.maximum(snr, 1e-8)
         return snr_cap / (snr + 1.0)
 
-    def loss(self, model, x0, cond, training: bool = True):
+    def loss(self, model, x0, cond, training: bool = True, t=None, noise=None):
         """
         One-step diffusion training loss.
         x0: (B, H, W, C) in [-1, 1]
         cond: int tensor (ss cat) or dict with {"ss_cat", "wind_kt"}
         training: passed to the model call; set False during validation so
                   CFG conditioning dropout is disabled and BN uses stored stats.
+        t: optional int32 tensor of shape (B,) with explicit diffusion timesteps.
+        noise: optional tensor with the same shape as x0 containing explicit noise.
         """
         batch_size = tf.shape(x0)[0]
-        # Uniform t from [0, num_steps-1]
-        t = tf.random.uniform(
-            shape=(batch_size,), minval=0, maxval=self.num_steps, dtype=tf.int32
-        )
-        noise = tf.random.normal(shape=tf.shape(x0))
+        if t is None:
+            # Uniform t from [0, num_steps-1]
+            t = tf.random.uniform(
+                shape=(batch_size,), minval=0, maxval=self.num_steps, dtype=tf.int32
+            )
+        else:
+            t = tf.convert_to_tensor(t, dtype=tf.int32)
+            tf.debugging.assert_rank(t, 1, message="Diffusion.loss expects t to have shape (B,)")
+            tf.debugging.assert_equal(
+                tf.shape(t)[0],
+                batch_size,
+                message="Diffusion.loss expects len(t) to match the batch size.",
+            )
+            tf.debugging.assert_greater_equal(
+                t,
+                tf.zeros_like(t),
+                message="Diffusion.loss expects all timesteps to be >= 0.",
+            )
+            tf.debugging.assert_less(
+                t,
+                tf.fill(tf.shape(t), tf.cast(self.num_steps, tf.int32)),
+                message="Diffusion.loss expects all timesteps to be < num_steps.",
+            )
+
+        if noise is None:
+            noise = tf.random.normal(shape=tf.shape(x0), dtype=x0.dtype)
+        else:
+            noise = tf.convert_to_tensor(noise, dtype=x0.dtype)
+            tf.debugging.assert_equal(
+                tf.shape(noise),
+                tf.shape(x0),
+                message="Diffusion.loss expects noise to have the same shape as x0.",
+            )
 
         x_t = self.q_sample(x0, t, noise)
         ss_cat, wind_kt = self._prepare_condition_tensors(cond, batch_size)
