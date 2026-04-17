@@ -13,6 +13,8 @@ data:
     ramp_epochs: 40
     mode: "cosine"
   batch_size: 8
+  train_loader: balanced_batch_generator  # legacy_sample_generator | balanced_batch_generator
+  train_prefetch_batches: 1  # new batch loader only; 0 disables lookahead
   image_size: 256
   bt_min_k: 180.0 # q0.1; global min is 117.0
   bt_max_k: 310.0 # q99.9; global max is 348.0
@@ -68,6 +70,9 @@ training:
   jit_compile: false
   grad_clip_norm: 1.0   # global gradient norm clipping (0 or null to disable)
   val_every_epochs: 1
+  input_pipeline_profile:
+    enabled: false
+    window_steps: 50
   early_stopping:
     enabled: true
     monitor: "ema"         # "ema" (recommended when EMA is used) or "raw"

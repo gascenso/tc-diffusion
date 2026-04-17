@@ -1,9 +1,12 @@
 import json
 import random
+import time
 from bisect import bisect_right
+from collections import deque
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Sequence, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -193,6 +196,17 @@ def preprocess_bt(bt: np.ndarray, bt_range: Tuple[float, float]) -> np.ndarray:
     bt = bt * 2.0 - 1.0                     # [-1,1]
     return bt
 
+
+def _ensure_channel_axis(bt: np.ndarray) -> np.ndarray:
+    """Normalize train/eval arrays to [..., H, W, 1] or [H, W, 1]."""
+    if bt.ndim == 2:
+        return bt[..., None]
+    if bt.ndim == 3:
+        if bt.shape[-1] == 1:
+            return bt
+        return bt[..., None]
+    return bt
+
 def ss_class_midpoint_kt(ss_cat: int) -> float:
     """Representative wind speed [kt] for each SS class."""
     cls = int(ss_cat)
@@ -276,9 +290,16 @@ class BTDataBackend:
 
     name = "base"
     supports_parallel_reads = False
+    supports_vectorized_batch_loads = False
 
     def load_bt(self, rel_path: str) -> np.ndarray:
         raise NotImplementedError
+
+    def load_bt_batch(self, rel_paths: Sequence[str]) -> np.ndarray:
+        if len(rel_paths) == 0:
+            raise ValueError("load_bt_batch requires at least one rel_path.")
+        rows = [self.load_bt(str(rel_path)) for rel_path in rel_paths]
+        return np.stack(rows, axis=0).astype(np.float32, copy=False)
 
 
 class NetCDFBTBackend(BTDataBackend):
@@ -307,6 +328,7 @@ class PackedMemmapBackend(BTDataBackend):
 
     name = "packed_memmap"
     supports_parallel_reads = True
+    supports_vectorized_batch_loads = True
 
     def __init__(self, manifest_path: Path):
         self.manifest_path = Path(manifest_path)
@@ -413,12 +435,41 @@ class PackedMemmapBackend(BTDataBackend):
         local_index = int(global_index) - shard.start
         return np.asarray(mm[local_index], dtype=np.float32)
 
+    def load_bt_batch_by_index(self, global_indices: Sequence[int]) -> np.ndarray:
+        indices = np.asarray(global_indices, dtype=np.int64).reshape(-1)
+        if indices.size == 0:
+            raise ValueError("load_bt_batch_by_index requires at least one index.")
+
+        out = np.empty((indices.shape[0], *self.sample_shape), dtype=np.float32)
+        by_shard: Dict[int, List[Tuple[int, int]]] = {}
+        for out_pos, global_index in enumerate(indices.tolist()):
+            shard_idx, shard = self._resolve_shard(int(global_index))
+            local_index = int(global_index) - shard.start
+            by_shard.setdefault(shard_idx, []).append((out_pos, local_index))
+
+        for shard_idx, items in by_shard.items():
+            mm = self._shard_memmaps[shard_idx]
+            out_pos = np.asarray([item[0] for item in items], dtype=np.int64)
+            local_idx = np.asarray([item[1] for item in items], dtype=np.int64)
+            out[out_pos] = np.asarray(mm[local_idx], dtype=np.float32)
+
+        return out
+
     def load_bt(self, rel_path: str) -> np.ndarray:
         try:
             global_index = self.path_to_index[rel_path]
         except KeyError as exc:
             raise KeyError(f"Packed manifest does not contain rel_path '{rel_path}'") from exc
         return self.load_bt_by_index(global_index)
+
+    def load_bt_batch(self, rel_paths: Sequence[str]) -> np.ndarray:
+        indices = []
+        for rel_path in rel_paths:
+            try:
+                indices.append(self.path_to_index[str(rel_path)])
+            except KeyError as exc:
+                raise KeyError(f"Packed manifest does not contain rel_path '{rel_path}'") from exc
+        return self.load_bt_batch_by_index(indices)
 
 
 def build_data_backend(data_cfg) -> BTDataBackend:
@@ -558,8 +609,7 @@ def _tf_load_one_sample(
         y = int(label)
         bt = backend.load_bt(rel_path)
         bt = preprocess_bt(bt, (bt_min, bt_max))
-        if bt.ndim == 2:
-            bt = bt[..., None]
+        bt = _ensure_channel_axis(bt)
         if not use_wind_speed:
             return bt, np.int32(y)
 
@@ -637,7 +687,22 @@ def _create_finite_eval_dataset(
     ds = ds.with_options(opts)
 
     return ds
-    
+
+
+@dataclass(frozen=True)
+class SampledTrainBatchRequest:
+    state_before_batch: Any
+    rel_paths: Tuple[str, ...]
+    labels: np.ndarray
+    wind_kt: np.ndarray | None = None
+
+
+@dataclass
+class PendingTrainBatch:
+    request: SampledTrainBatchRequest
+    payload: Tuple[np.ndarray, Any, Dict[str, float]] | Future
+
+
 # ------------------------------------------------------------
 # Generator
 # ------------------------------------------------------------
@@ -674,6 +739,18 @@ class BalancedTCGenerator:
         self.set_class_probs(self.class_probs, verbose=True)
 
         self.rng = random.Random(seed)
+        self.pipeline_name = "legacy_sample_generator"
+        self.prefetch_batches = 0
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "loader": self.pipeline_name,
+            "backend": self.backend.name,
+            "prefetch_batches": int(self.prefetch_batches),
+            "supports_vectorized_batch_loads": bool(
+                getattr(self.backend, "supports_vectorized_batch_loads", False)
+            ),
+        }
 
     def set_class_probs(self, class_probs: Dict[int, float], verbose: bool = False):
         """Update class sampling probabilities for curriculum schedules."""
@@ -729,32 +806,236 @@ class BalancedTCGenerator:
         if rng_state is not None:
             self.rng.setstate(rng_state)
 
+    def rewind_unconsumed(self) -> int:
+        return 0
+
+    def consume_last_batch_info(self) -> Dict[str, float] | None:
+        return None
+
+    def close(self):
+        return None
+
+    def _sample_one(self) -> Tuple[int, str]:
+        cls = self.rng.choices(self.classes, weights=self.probs, k=1)[0]
+        rel_path = self.rng.choice(self.class_to_files[cls])
+        return int(cls), str(rel_path)
+
+    def _build_cond_value(self, cls: int, rel_path: str) -> np.int32 | Dict[str, np.generic]:
+        if not self.use_wind_speed:
+            return np.int32(cls)
+
+        wind_kt = float(self.rel_path_to_wind_kt.get(rel_path, ss_class_midpoint_kt(cls)))
+        return {
+            "ss_cat": np.int32(cls),
+            "wind_kt": np.float32(wind_kt),
+        }
+
     def __iter__(self) -> Iterator[Tuple[np.ndarray, np.int32] | Tuple[np.ndarray, Dict[str, np.generic]]]:
         while True:
-            # 1) sample class
-            cls = self.rng.choices(self.classes, weights=self.probs, k=1)[0]
-
-            # 2) sample file within class
-            rel_path = self.rng.choice(self.class_to_files[cls])
+            cls, rel_path = self._sample_one()
 
             # 3) load BT and normalize
             bt = self.backend.load_bt(rel_path)
             bt = preprocess_bt(bt, self.bt_range)
-            
-            # ensure shape (H, W, 1)
-            if bt.ndim == 2:
-                bt = bt[..., None]
+            bt = _ensure_channel_axis(bt)
+            yield bt, self._build_cond_value(cls, rel_path)
 
-            if not self.use_wind_speed:
-                yield bt, np.int32(cls)
-                continue
 
-            wind_kt = float(self.rel_path_to_wind_kt.get(rel_path, ss_class_midpoint_kt(cls)))
+class BalancedTCBatchGenerator(BalancedTCGenerator):
+    """Infinite generator yielding already-formed balanced batches."""
+
+    def __init__(
+        self,
+        backend: BTDataBackend,
+        class_to_files: Dict[int, List[str]],
+        class_probs: Dict[int, float],
+        seed: int = 42,
+        bt_range: Tuple[float, float] = (117.0, 348.0),
+        use_wind_speed: bool = False,
+        rel_path_to_wind_kt: Dict[str, float] | None = None,
+        batch_size: int = 8,
+        prefetch_batches: int = 1,
+    ):
+        super().__init__(
+            backend=backend,
+            class_to_files=class_to_files,
+            class_probs=class_probs,
+            seed=seed,
+            bt_range=bt_range,
+            use_wind_speed=use_wind_speed,
+            rel_path_to_wind_kt=rel_path_to_wind_kt,
+        )
+        if int(batch_size) <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}")
+        if int(prefetch_batches) < 0:
+            raise ValueError(f"prefetch_batches must be >= 0, got {prefetch_batches}")
+
+        self.batch_size = int(batch_size)
+        self.prefetch_batches = int(prefetch_batches)
+        self.pipeline_name = "balanced_batch_generator"
+        self._pending: deque[PendingTrainBatch] = deque()
+        self._last_batch_info: Dict[str, float] | None = None
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=max(1, self.prefetch_batches),
+                thread_name_prefix="tc-train-batch",
+            )
+            if self.prefetch_batches > 0
+            else None
+        )
+
+    def get_state(self) -> Dict[str, Any]:
+        state = super().get_state()
+        if self._pending:
+            state["rng_state"] = self._pending[0].request.state_before_batch
+            state["pending_prefetch_batches"] = len(self._pending)
+        return state
+
+    def set_state(self, state: Dict[str, Any]):
+        self.rewind_unconsumed()
+        super().set_state(state)
+        self._last_batch_info = None
+
+    def consume_last_batch_info(self) -> Dict[str, float] | None:
+        info = self._last_batch_info
+        self._last_batch_info = None
+        return info
+
+    def _make_batch_request(self) -> SampledTrainBatchRequest:
+        state_before = self.rng.getstate()
+        rel_paths: List[str] = []
+        labels = np.empty((self.batch_size,), dtype=np.int32)
+        wind_arr = np.empty((self.batch_size,), dtype=np.float32) if self.use_wind_speed else None
+
+        for batch_idx in range(self.batch_size):
+            # Keep the legacy law exactly: sample each example independently as
+            # (class -> file within class), then materialize the whole batch.
+            cls, rel_path = self._sample_one()
+            rel_paths.append(rel_path)
+            labels[batch_idx] = np.int32(cls)
+            if wind_arr is not None:
+                wind_arr[batch_idx] = np.float32(
+                    self.rel_path_to_wind_kt.get(rel_path, ss_class_midpoint_kt(cls))
+                )
+
+        return SampledTrainBatchRequest(
+            state_before_batch=state_before,
+            rel_paths=tuple(rel_paths),
+            labels=labels,
+            wind_kt=wind_arr,
+        )
+
+    def _materialize_batch(
+        self,
+        request: SampledTrainBatchRequest,
+    ) -> Tuple[np.ndarray, Any, Dict[str, float]]:
+        t0 = time.perf_counter()
+        bt = self.backend.load_bt_batch(request.rel_paths)
+        t1 = time.perf_counter()
+        bt = preprocess_bt(bt, self.bt_range)
+        bt = _ensure_channel_axis(bt)
+        t2 = time.perf_counter()
+
+        if request.wind_kt is None:
+            cond: Any = request.labels.copy()
+        else:
             cond = {
-                "ss_cat": np.int32(cls),
-                "wind_kt": np.float32(wind_kt),
+                "ss_cat": request.labels.copy(),
+                "wind_kt": request.wind_kt.copy(),
             }
-            yield bt, cond
+
+        info = {
+            "batch_size": float(request.labels.shape[0]),
+            "load_time_sec": float(t1 - t0),
+            "preprocess_time_sec": float(t2 - t1),
+            "batch_prep_time_sec": float(t2 - t0),
+        }
+        return bt, cond, info
+
+    def _submit_one(self):
+        request = self._make_batch_request()
+        if self._executor is None:
+            payload = self._materialize_batch(request)
+        else:
+            payload = self._executor.submit(self._materialize_batch, request)
+        self._pending.append(PendingTrainBatch(request=request, payload=payload))
+
+    def _fill_prefetch_queue(self, target_size: int):
+        while len(self._pending) < int(target_size):
+            self._submit_one()
+
+    def _resolve_pending(
+        self,
+        pending: PendingTrainBatch,
+    ) -> Tuple[np.ndarray, Any, Dict[str, float]]:
+        payload = pending.payload
+        if isinstance(payload, Future):
+            return payload.result()
+        return payload
+
+    def _next_batch(self) -> Tuple[np.ndarray, Any]:
+        self._fill_prefetch_queue(self.prefetch_batches + 1)
+        pending = self._pending.popleft()
+        bt, cond, info = self._resolve_pending(pending)
+        self._last_batch_info = info
+        self._fill_prefetch_queue(self.prefetch_batches)
+        return bt, cond
+
+    def rewind_unconsumed(self) -> int:
+        if not self._pending:
+            self._last_batch_info = None
+            return 0
+
+        # Prefetch intentionally samples future batches ahead of consumption.
+        # Before an epoch boundary or checkpoint save, rewind to the first
+        # not-yet-consumed batch so resumable training tracks consumed data.
+        rewind_state = self._pending[0].request.state_before_batch
+        pending_count = len(self._pending)
+        while self._pending:
+            pending = self._pending.popleft()
+            payload = pending.payload
+            if isinstance(payload, Future):
+                payload.cancel()
+                try:
+                    payload.result()
+                except CancelledError:
+                    pass
+        self.rng.setstate(rewind_state)
+        self._last_batch_info = None
+        return pending_count
+
+    def close(self):
+        self.rewind_unconsumed()
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                self._executor.shutdown(wait=True)
+            self._executor = None
+
+    def __iter__(self) -> Iterator[Tuple[np.ndarray, Any]]:
+        while True:
+            yield self._next_batch()
+
+
+def resolve_train_loader_name(data_cfg) -> str:
+    raw = str(data_cfg.get("train_loader", "legacy_sample_generator")).strip().lower()
+    aliases = {
+        "legacy": "legacy_sample_generator",
+        "legacy_generator": "legacy_sample_generator",
+        "sample_generator": "legacy_sample_generator",
+        "legacy_sample_generator": "legacy_sample_generator",
+        "batch": "balanced_batch_generator",
+        "batch_generator": "balanced_batch_generator",
+        "balanced_batch": "balanced_batch_generator",
+        "balanced_batch_generator": "balanced_batch_generator",
+    }
+    if raw not in aliases:
+        raise ValueError(
+            "Unsupported data.train_loader="
+            f"{raw!r}. Expected 'legacy_sample_generator' or 'balanced_batch_generator'."
+        )
+    return aliases[raw]
 
 
 # ------------------------------------------------------------
@@ -765,11 +1046,13 @@ def create_dataset(
     cfg,
     split,
     return_train_generator: bool = False,
-) -> tf.data.Dataset | Tuple[tf.data.Dataset, BalancedTCGenerator]:
+) -> tf.data.Dataset | Tuple[Any, BalancedTCGenerator]:
     """
-    Create a tf.data.Dataset.
+    Create a dataset-like iterable.
 
-    - For split=='train': infinite class-balanced sampling (BalancedTCGenerator).
+    - For split=='train': infinite class-balanced sampling from either the
+      legacy per-sample generator or the new batch-aware generator, selected by
+      data.train_loader.
     - For split in {'val','test'}: by default, a finite, deterministic dataset that
       makes exactly one pass over the split files (robust validation).
 
@@ -898,41 +1181,56 @@ def create_dataset(
     # ---- compute sampling probabilities ----
     class_probs = compute_class_sampling_probs(class_to_files, alpha)
 
-    # ---- generator ----
-    gen = BalancedTCGenerator(
-        backend=backend,
-        class_to_files=class_to_files,
-        class_probs=class_probs,
-        seed=seed,
-        bt_range=bt_range,
-        use_wind_speed=use_wind_speed,
-        rel_path_to_wind_kt=rel_path_to_wind_kt,
-    )
+    train_loader = resolve_train_loader_name(data_cfg)
 
-    # ---- tf.data.Dataset ----
-    if use_wind_speed:
-        output_signature = (
-            tf.TensorSpec(shape=(None, None, 1), dtype=tf.float32),
-            {
-                "ss_cat": tf.TensorSpec(shape=(), dtype=tf.int32),
-                "wind_kt": tf.TensorSpec(shape=(), dtype=tf.float32),
-            },
+    if train_loader == "balanced_batch_generator":
+        prefetch_batches = int(data_cfg.get("train_prefetch_batches", 1))
+        gen = BalancedTCBatchGenerator(
+            backend=backend,
+            class_to_files=class_to_files,
+            class_probs=class_probs,
+            seed=seed,
+            bt_range=bt_range,
+            use_wind_speed=use_wind_speed,
+            rel_path_to_wind_kt=rel_path_to_wind_kt,
+            batch_size=batch_size,
+            prefetch_batches=prefetch_batches,
         )
+        ds = gen
     else:
-        output_signature = (
-            tf.TensorSpec(shape=(None, None, 1), dtype=tf.float32),
-            tf.TensorSpec(shape=(), dtype=tf.int32),
+        gen = BalancedTCGenerator(
+            backend=backend,
+            class_to_files=class_to_files,
+            class_probs=class_probs,
+            seed=seed,
+            bt_range=bt_range,
+            use_wind_speed=use_wind_speed,
+            rel_path_to_wind_kt=rel_path_to_wind_kt,
         )
 
-    ds = tf.data.Dataset.from_generator(
-        lambda: iter(gen),
-        output_signature=output_signature,
-    )
+        if use_wind_speed:
+            output_signature = (
+                tf.TensorSpec(shape=(None, None, 1), dtype=tf.float32),
+                {
+                    "ss_cat": tf.TensorSpec(shape=(), dtype=tf.int32),
+                    "wind_kt": tf.TensorSpec(shape=(), dtype=tf.float32),
+                },
+            )
+        else:
+            output_signature = (
+                tf.TensorSpec(shape=(None, None, 1), dtype=tf.float32),
+                tf.TensorSpec(shape=(), dtype=tf.int32),
+            )
 
-    ds = ds.batch(batch_size, drop_remainder=True)
-    opts = tf.data.Options()
-    opts.deterministic = True
-    ds = ds.with_options(opts)
+        ds = tf.data.Dataset.from_generator(
+            lambda: iter(gen),
+            output_signature=output_signature,
+        )
+
+        ds = ds.batch(batch_size, drop_remainder=True)
+        opts = tf.data.Options()
+        opts.deterministic = True
+        ds = ds.with_options(opts)
 
     if return_train_generator:
         return ds, gen

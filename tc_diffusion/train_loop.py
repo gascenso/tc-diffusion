@@ -5,7 +5,10 @@ import math
 import random
 import base64
 import pickle
+import time
 from contextlib import contextmanager
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -181,6 +184,146 @@ def _encode_py_state(obj) -> str:
 def _decode_py_state(encoded: str):
     return pickle.loads(base64.b64decode(encoded.encode("ascii")))
 
+
+@dataclass
+class InputPipelineSummary:
+    loader: str
+    backend: str
+    prefetch_batches: int
+    steps: int
+    samples: int
+    avg_batch_prep_time_sec: float
+    avg_data_wait_time_sec: float
+    avg_compute_time_sec: float
+    avg_step_time_sec: float
+    wait_fraction_pct: float
+    throughput_samples_per_sec: float
+    avg_backend_load_time_sec: float | None = None
+    avg_preprocess_time_sec: float | None = None
+
+    def to_json(self, epoch: int) -> dict:
+        out = {
+            "epoch": int(epoch),
+            "loader": self.loader,
+            "backend": self.backend,
+            "prefetch_batches": int(self.prefetch_batches),
+            "steps": int(self.steps),
+            "samples": int(self.samples),
+            "avg_batch_prep_time_sec": float(self.avg_batch_prep_time_sec),
+            "avg_data_wait_time_sec": float(self.avg_data_wait_time_sec),
+            "avg_compute_time_sec": float(self.avg_compute_time_sec),
+            "avg_step_time_sec": float(self.avg_step_time_sec),
+            "wait_fraction_pct": float(self.wait_fraction_pct),
+            "throughput_samples_per_sec": float(self.throughput_samples_per_sec),
+        }
+        if self.avg_backend_load_time_sec is not None:
+            out["avg_backend_load_time_sec"] = float(self.avg_backend_load_time_sec)
+        if self.avg_preprocess_time_sec is not None:
+            out["avg_preprocess_time_sec"] = float(self.avg_preprocess_time_sec)
+        return out
+
+
+class InputPipelineProfiler:
+    def __init__(self, enabled: bool, window_steps: int, out_dir: Path):
+        self.enabled = bool(enabled)
+        self.window_steps = max(1, int(window_steps))
+        self.out_dir = Path(out_dir)
+        self.jsonl_path = self.out_dir / "data_pipeline_profile.jsonl"
+        self._epoch_reset()
+
+    def _epoch_reset(self):
+        self.step_count = 0
+        self.sample_count = 0
+        self.total_batch_prep_time = 0.0
+        self.total_data_wait_time = 0.0
+        self.total_compute_time = 0.0
+        self.total_step_time = 0.0
+        self.total_backend_load_time = 0.0
+        self.total_preprocess_time = 0.0
+        self.batch_info_count = 0
+        self.wait_window = deque(maxlen=self.window_steps)
+        self.step_window = deque(maxlen=self.window_steps)
+        self.throughput_window = deque(maxlen=self.window_steps)
+        self.batch_prep_window = deque(maxlen=self.window_steps)
+
+    def start_epoch(self):
+        self._epoch_reset()
+
+    def record(
+        self,
+        *,
+        batch_size: int,
+        data_wait_time_sec: float,
+        compute_time_sec: float,
+        batch_info: dict | None = None,
+    ):
+        if not self.enabled:
+            return
+
+        batch_prep_time_sec = float(
+            batch_info.get("batch_prep_time_sec", data_wait_time_sec)
+            if batch_info is not None
+            else data_wait_time_sec
+        )
+        step_time_sec = float(data_wait_time_sec + compute_time_sec)
+
+        self.step_count += 1
+        self.sample_count += int(batch_size)
+        self.total_batch_prep_time += batch_prep_time_sec
+        self.total_data_wait_time += float(data_wait_time_sec)
+        self.total_compute_time += float(compute_time_sec)
+        self.total_step_time += step_time_sec
+
+        if batch_info is not None:
+            self.total_backend_load_time += float(batch_info.get("load_time_sec", 0.0))
+            self.total_preprocess_time += float(batch_info.get("preprocess_time_sec", 0.0))
+            self.batch_info_count += 1
+
+        throughput = float(batch_size) / max(step_time_sec, 1e-12)
+        self.batch_prep_window.append(batch_prep_time_sec)
+        self.wait_window.append(float(data_wait_time_sec))
+        self.step_window.append(step_time_sec)
+        self.throughput_window.append(throughput)
+
+    def running(self) -> dict | None:
+        if not self.enabled or self.step_count <= 0:
+            return None
+        return {
+            "batch_prep_ms": 1000.0 * (sum(self.batch_prep_window) / max(1, len(self.batch_prep_window))),
+            "wait_ms": 1000.0 * (sum(self.wait_window) / max(1, len(self.wait_window))),
+            "step_ms": 1000.0 * (sum(self.step_window) / max(1, len(self.step_window))),
+            "samples_per_sec": sum(self.throughput_window) / max(1, len(self.throughput_window)),
+        }
+
+    def finish_epoch(self, *, epoch: int, loader_info: dict) -> InputPipelineSummary | None:
+        if not self.enabled or self.step_count <= 0:
+            return None
+
+        avg_step = self.total_step_time / max(1, self.step_count)
+        summary = InputPipelineSummary(
+            loader=str(loader_info.get("loader", "unknown")),
+            backend=str(loader_info.get("backend", "unknown")),
+            prefetch_batches=int(loader_info.get("prefetch_batches", 0)),
+            steps=int(self.step_count),
+            samples=int(self.sample_count),
+            avg_batch_prep_time_sec=self.total_batch_prep_time / max(1, self.step_count),
+            avg_data_wait_time_sec=self.total_data_wait_time / max(1, self.step_count),
+            avg_compute_time_sec=self.total_compute_time / max(1, self.step_count),
+            avg_step_time_sec=avg_step,
+            wait_fraction_pct=100.0 * self.total_data_wait_time / max(self.total_step_time, 1e-12),
+            throughput_samples_per_sec=self.sample_count / max(self.total_step_time, 1e-12),
+            avg_backend_load_time_sec=(
+                self.total_backend_load_time / self.batch_info_count if self.batch_info_count > 0 else None
+            ),
+            avg_preprocess_time_sec=(
+                self.total_preprocess_time / self.batch_info_count if self.batch_info_count > 0 else None
+            ),
+        )
+
+        with self.jsonl_path.open("a") as f:
+            f.write(json.dumps(summary.to_json(epoch=epoch)) + "\n")
+        return summary
+
 def evaluate_loss(
     diffusion,
     model,
@@ -298,6 +441,13 @@ def train(cfg, resume: bool = False):
     orig_eval_mode = data_cfg.get("eval_mode", "full")
 
     ds_train, train_sampler = create_dataset(cfg, split="train", return_train_generator=True)
+    train_loader_info = train_sampler.describe() if hasattr(train_sampler, "describe") else {}
+    print(
+        "[data] Train pipeline: "
+        f"loader={train_loader_info.get('loader', 'unknown')}, "
+        f"backend={train_loader_info.get('backend', 'unknown')}, "
+        f"prefetch_batches={train_loader_info.get('prefetch_batches', 0)}"
+    )
 
     # Validation: build two deterministic finite sets:
     #   1) full pass over the val split (micro average)
@@ -352,6 +502,17 @@ def train(cfg, resume: bool = False):
 
     out_dir = Path(cfg["experiment"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
+    pipe_profile_cfg = cfg["training"].get("input_pipeline_profile", {})
+    pipe_profiler = InputPipelineProfiler(
+        enabled=bool(pipe_profile_cfg.get("enabled", False)),
+        window_steps=int(pipe_profile_cfg.get("window_steps", 50)),
+        out_dir=out_dir,
+    )
+    if pipe_profiler.enabled:
+        print(
+            "[profile] Input-pipeline timing enabled "
+            f"(window_steps={pipe_profiler.window_steps}, jsonl={pipe_profiler.jsonl_path.name})"
+        )
     checkpoint_items = {
         "model": model,
         "optimizer": optimizer,
@@ -537,217 +698,279 @@ def train(cfg, resume: bool = False):
 
     global_step = int(checkpoint.global_step.numpy())
 
-    for epoch in range(start_epoch, num_epochs):
-        print(f"\nEpoch {epoch+1}/{num_epochs}")
+    try:
+        for epoch in range(start_epoch, num_epochs):
+            print(f"\nEpoch {epoch+1}/{num_epochs}")
 
-        epoch_alpha = resolve_train_alpha(cfg, epoch_idx=epoch, num_epochs=num_epochs)
-        if active_alpha is None or abs(epoch_alpha - active_alpha) > 1e-12:
-            train_sampler.set_alpha(epoch_alpha, verbose=True)
-            active_alpha = epoch_alpha
-            print(f"[data] Epoch {epoch+1}: class_balance_alpha={epoch_alpha:.4f}")
+            epoch_alpha = resolve_train_alpha(cfg, epoch_idx=epoch, num_epochs=num_epochs)
+            if active_alpha is None or abs(epoch_alpha - active_alpha) > 1e-12:
+                train_sampler.set_alpha(epoch_alpha, verbose=True)
+                active_alpha = epoch_alpha
+                print(f"[data] Epoch {epoch+1}: class_balance_alpha={epoch_alpha:.4f}")
 
-        epoch_loss_sum = 0.0
-        epoch_batches = 0
+            epoch_loss_sum = 0.0
+            epoch_batches = 0
+            pipe_profiler.start_epoch()
 
-        pbar = tqdm(ds_train, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+            pbar = tqdm(total=steps_per_epoch, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+            train_iter = iter(ds_train)
 
-        for batch, (x0, cond) in enumerate(pbar):
-            if batch >= steps_per_epoch:
-                break
-            step_index = tf.convert_to_tensor(global_step, dtype=tf.int32)
-            loss = train_step(x0, cond, step_index=step_index)
-            global_step += 1
-            checkpoint.global_step.assign(global_step)
-            loss_value = float(loss.numpy())
-            if not np.isfinite(loss_value):
-                print(f"\n[warn] step {global_step}: non-finite loss ({loss_value}), update skipped")
-            epoch_loss_sum += loss_value if np.isfinite(loss_value) else 0.0
-            epoch_batches += 1
+            for batch in range(steps_per_epoch):
+                t_fetch0 = time.perf_counter()
+                try:
+                    x0, cond = next(train_iter)
+                except StopIteration as exc:
+                    raise RuntimeError(
+                        "Training input pipeline exhausted unexpectedly before steps_per_epoch."
+                    ) from exc
+                data_wait_time_sec = time.perf_counter() - t_fetch0
+                batch_info = (
+                    train_sampler.consume_last_batch_info()
+                    if hasattr(train_sampler, "consume_last_batch_info")
+                    else None
+                )
 
-            if global_step % log_interval == 0:
-                pbar.set_postfix({"loss": f"{loss_value:.4f}"})
+                t_step0 = time.perf_counter()
+                step_index = tf.convert_to_tensor(global_step, dtype=tf.int32)
+                loss = train_step(x0, cond, step_index=step_index)
+                global_step += 1
+                checkpoint.global_step.assign(global_step)
+                loss_value = float(loss.numpy())
+                compute_time_sec = time.perf_counter() - t_step0
+                batch_size = int(np.shape(x0)[0])
 
-        pbar.close()
+                pipe_profiler.record(
+                    batch_size=batch_size,
+                    data_wait_time_sec=data_wait_time_sec,
+                    compute_time_sec=compute_time_sec,
+                    batch_info=batch_info,
+                )
 
-        epoch_loss = epoch_loss_sum / max(1, epoch_batches)
-        epoch_indices.append(epoch + 1)
-        epoch_losses.append(epoch_loss)
+                if not np.isfinite(loss_value):
+                    print(f"\n[warn] step {global_step}: non-finite loss ({loss_value}), update skipped")
+                epoch_loss_sum += loss_value if np.isfinite(loss_value) else 0.0
+                epoch_batches += 1
 
-        print(f"Epoch {epoch+1} mean loss: {epoch_loss:.6f}")
-        val_loss = None
-        val_loss_balanced = None
-        val_loss_ema = None
-        val_loss_balanced_ema = None
-        if (epoch + 1) % val_every_epochs == 0:
-            val_loss = evaluate_loss(
-                diffusion,
-                model,
-                ds_val_full,
-                val_steps=val_steps,
-                base_seed=val_base_seed,
-                split_seed_offset=0,
-            )
-            val_loss_balanced = evaluate_loss(
-                diffusion,
-                model,
-                ds_val_balanced,
-                val_steps=val_steps,
-                base_seed=val_base_seed,
-                split_seed_offset=10_000,
-            )
-            val_losses.append(val_loss)
-            val_losses_balanced.append(val_loss_balanced)
-            print(f"Epoch {epoch+1} val mean loss (full): {val_loss:.6f}")
-            print(f"Epoch {epoch+1} val mean loss (balanced_fixed): {val_loss_balanced:.6f}")
+                if global_step % log_interval == 0:
+                    postfix = {"loss": f"{loss_value:.4f}"}
+                    running = pipe_profiler.running()
+                    if running is not None:
+                        postfix.update(
+                            {
+                                "wait_ms": f"{running['wait_ms']:.1f}",
+                                "step_ms": f"{running['step_ms']:.1f}",
+                                "samples/s": f"{running['samples_per_sec']:.1f}",
+                            }
+                        )
+                    pbar.set_postfix(postfix)
+                pbar.update(1)
+
+            pbar.close()
+            rewound_batches = train_sampler.rewind_unconsumed() if hasattr(train_sampler, "rewind_unconsumed") else 0
+            if rewound_batches > 0:
+                print(
+                    f"[data] Rewound {rewound_batches} prefetched train batch(es) before epoch boundary."
+                )
+
+            epoch_loss = epoch_loss_sum / max(1, epoch_batches)
+            epoch_indices.append(epoch + 1)
+            epoch_losses.append(epoch_loss)
+
+            print(f"Epoch {epoch+1} mean loss: {epoch_loss:.6f}")
+            pipe_summary = pipe_profiler.finish_epoch(epoch=epoch + 1, loader_info=train_loader_info)
+            if pipe_summary is not None:
+                print(
+                    "[profile] "
+                    f"epoch {epoch+1}: avg_batch_prep={pipe_summary.avg_batch_prep_time_sec:.4f}s, "
+                    f"avg_wait={pipe_summary.avg_data_wait_time_sec:.4f}s, "
+                    f"avg_compute={pipe_summary.avg_compute_time_sec:.4f}s, "
+                    f"avg_step={pipe_summary.avg_step_time_sec:.4f}s, "
+                    f"wait={pipe_summary.wait_fraction_pct:.1f}%, "
+                    f"throughput={pipe_summary.throughput_samples_per_sec:.2f} samples/s"
+                )
+                if pipe_summary.avg_backend_load_time_sec is not None:
+                    print(
+                        "[profile] "
+                        f"loader breakdown: backend_load={pipe_summary.avg_backend_load_time_sec:.4f}s, "
+                        f"preprocess={pipe_summary.avg_preprocess_time_sec:.4f}s"
+                    )
+            val_loss = None
+            val_loss_balanced = None
+            val_loss_ema = None
+            val_loss_balanced_ema = None
+            if (epoch + 1) % val_every_epochs == 0:
+                val_loss = evaluate_loss(
+                    diffusion,
+                    model,
+                    ds_val_full,
+                    val_steps=val_steps,
+                    base_seed=val_base_seed,
+                    split_seed_offset=0,
+                )
+                val_loss_balanced = evaluate_loss(
+                    diffusion,
+                    model,
+                    ds_val_balanced,
+                    val_steps=val_steps,
+                    base_seed=val_base_seed,
+                    split_seed_offset=10_000,
+                )
+                val_losses.append(val_loss)
+                val_losses_balanced.append(val_loss_balanced)
+                print(f"Epoch {epoch+1} val mean loss (full): {val_loss:.6f}")
+                print(f"Epoch {epoch+1} val mean loss (balanced_fixed): {val_loss_balanced:.6f}")
+                if use_ema and ema is not None:
+                    with _ema_weights_applied(ema):
+                        val_loss_ema = evaluate_loss(
+                            diffusion,
+                            model,
+                            ds_val_full,
+                            val_steps=val_steps,
+                            base_seed=val_base_seed,
+                            split_seed_offset=0,
+                        )
+                        val_loss_balanced_ema = evaluate_loss(
+                            diffusion,
+                            model,
+                            ds_val_balanced,
+                            val_steps=val_steps,
+                            base_seed=val_base_seed,
+                            split_seed_offset=10_000,
+                        )
+                    val_losses_ema.append(val_loss_ema)
+                    val_losses_balanced_ema.append(val_loss_balanced_ema)
+                    print(f"Epoch {epoch+1} EMA val mean loss (full): {val_loss_ema:.6f}")
+                    print(f"Epoch {epoch+1} EMA val mean loss (balanced_fixed): {val_loss_balanced_ema:.6f}")
+
+            # ----- ALWAYS save "last" -----
+            last_path = out_dir / f"weights_last.epoch_{epoch+1}.weights.h5"
+            model.save_weights(last_path)
+            _delete_other_last_weights(out_dir, keep=last_path)
             if use_ema and ema is not None:
+                ema_last_path = out_dir / f"weights_ema_last.epoch_{epoch+1}.weights.h5"
                 with _ema_weights_applied(ema):
-                    val_loss_ema = evaluate_loss(
-                        diffusion,
-                        model,
-                        ds_val_full,
-                        val_steps=val_steps,
-                        base_seed=val_base_seed,
-                        split_seed_offset=0,
-                    )
-                    val_loss_balanced_ema = evaluate_loss(
-                        diffusion,
-                        model,
-                        ds_val_balanced,
-                        val_steps=val_steps,
-                        base_seed=val_base_seed,
-                        split_seed_offset=10_000,
-                    )
-                val_losses_ema.append(val_loss_ema)
-                val_losses_balanced_ema.append(val_loss_balanced_ema)
-                print(f"Epoch {epoch+1} EMA val mean loss (full): {val_loss_ema:.6f}")
-                print(f"Epoch {epoch+1} EMA val mean loss (balanced_fixed): {val_loss_balanced_ema:.6f}")
+                    model.save_weights(ema_last_path)
+                _delete_other_ema_last_weights(out_dir, keep=ema_last_path)
+                print(f"  Saved EMA last weights to {ema_last_path}")
+            print(f"  Saved last weights to {last_path}")
 
-        # ----- ALWAYS save "last" -----
-        last_path = out_dir / f"weights_last.epoch_{epoch+1}.weights.h5"
-        model.save_weights(last_path)
-        _delete_other_last_weights(out_dir, keep=last_path)
-        if use_ema and ema is not None:
-            ema_last_path = out_dir / f"weights_ema_last.epoch_{epoch+1}.weights.h5"
-            with _ema_weights_applied(ema):
-                model.save_weights(ema_last_path)
-            _delete_other_ema_last_weights(out_dir, keep=ema_last_path)
-            print(f"  Saved EMA last weights to {ema_last_path}")
-        print(f"  Saved last weights to {last_path}")
-
-        # ----- check for improvement (best) on FULL validation only -----
-        raw_improved = val_loss is not None and (best_epoch_loss - val_loss > min_delta)
-        ema_improved = (
-            val_loss_ema is not None
-            and use_ema
-            and ema is not None
-            and (best_epoch_loss_ema - val_loss_ema > min_delta)
-        )
-
-        if val_loss is not None:
-            if raw_improved:
-                best_epoch_loss = val_loss
-                best_epoch_idx = epoch + 1
-
-                best_path = out_dir / "weights_best_val.weights.h5"
-                model.save_weights(best_path)
-                print(f"  New best model (epoch {best_epoch_idx}), saved to {best_path} (metric={best_epoch_loss:.6f})")
-
-        if val_loss_ema is not None and use_ema and ema is not None:
-            if ema_improved:
-                best_epoch_loss_ema = val_loss_ema
-                best_epoch_idx_ema = epoch + 1
-                best_ema_path = out_dir / "weights_ema_best_val.weights.h5"
-                with _ema_weights_applied(ema):
-                    model.save_weights(best_ema_path)
-                print(
-                    f"  New best EMA model (epoch {best_epoch_idx_ema}), "
-                    f"saved to {best_ema_path} (metric={best_epoch_loss_ema:.6f})"
-                )
-
-        if val_loss is not None:
-            if early_stopping_monitor == "ema":
-                monitor_improved = ema_improved
-                monitor_metric = val_loss_ema
-            else:
-                monitor_improved = raw_improved
-                monitor_metric = val_loss
-
-            if monitor_metric is None:
-                raise RuntimeError(
-                    f"Early-stopping monitor '{early_stopping_monitor}' has no validation metric for epoch {epoch+1}."
-                )
-
-            if monitor_improved:
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
-                print(
-                    f"  No significant improvement on early-stopping monitor "
-                    f"({early_stopping_monitor}) ({epochs_without_improvement}/{patience_epochs})"
-                )
-        else:
-            print("  Skipping early-stopping update (validation not run this epoch).")
-
-        # Also track a best model on the balanced_fixed validation metric (does NOT drive early stopping).
-        if val_loss_balanced is not None and (best_epoch_balanced - val_loss_balanced > min_delta):
-            best_epoch_balanced = val_loss_balanced
-            best_bal_path = out_dir / "weights_best_balanced_val.weights.h5"
-            model.save_weights(best_bal_path)
-            print(f"  New best BALANCED model, saved to {best_bal_path} (metric={best_epoch_balanced:.6f})")
-        if (
-            val_loss_balanced_ema is not None
-            and use_ema
-            and ema is not None
-            and (best_epoch_balanced_ema - val_loss_balanced_ema > min_delta)
-        ):
-            best_epoch_balanced_ema = val_loss_balanced_ema
-            best_bal_ema_path = out_dir / "weights_ema_best_balanced_val.weights.h5"
-            with _ema_weights_applied(ema):
-                model.save_weights(best_bal_ema_path)
-            print(
-                f"  New best BALANCED EMA model, saved to {best_bal_ema_path} "
-                f"(metric={best_epoch_balanced_ema:.6f})"
+            # ----- check for improvement (best) on FULL validation only -----
+            raw_improved = val_loss is not None and (best_epoch_loss - val_loss > min_delta)
+            ema_improved = (
+                val_loss_ema is not None
+                and use_ema
+                and ema is not None
+                and (best_epoch_loss_ema - val_loss_ema > min_delta)
             )
 
-        checkpoint.epoch.assign(epoch + 1)
-        ckpt_path = checkpoint_manager.save(checkpoint_number=epoch + 1)
-        print(f"  Saved training checkpoint to {ckpt_path}")
+            if val_loss is not None:
+                if raw_improved:
+                    best_epoch_loss = val_loss
+                    best_epoch_idx = epoch + 1
 
-        # ----- persist run state (for resuming) -----
-        _save_state(
-            out_dir,
-            {
-                "last_epoch": epoch + 1,  # completed epochs
-                "global_step": global_step,
-                "best_epoch": best_epoch_idx,
-                "best_epoch_loss": best_epoch_loss,
-                "best_epoch_balanced": best_epoch_balanced,
-                "best_epoch_ema": best_epoch_idx_ema,
-                "best_epoch_loss_ema": best_epoch_loss_ema,
-                "best_epoch_balanced_ema": best_epoch_balanced_ema,
-                "epochs_without_improvement": epochs_without_improvement,
-                "epoch_indices": epoch_indices,
-                "epoch_losses": epoch_losses,
-                "val_losses": val_losses,
-                "val_losses_balanced": val_losses_balanced,
-                "val_losses_ema": val_losses_ema,
-                "val_losses_balanced_ema": val_losses_balanced_ema,
-                "python_random_state": _encode_py_state(random.getstate()),
-                "numpy_random_state": _encode_py_state(np.random.get_state()),
-                "train_sampler_state": _encode_py_state(train_sampler.get_state()),
-            },
-        )
+                    best_path = out_dir / "weights_best_val.weights.h5"
+                    model.save_weights(best_path)
+                    print(f"  New best model (epoch {best_epoch_idx}), saved to {best_path} (metric={best_epoch_loss:.6f})")
 
-        # ----- early stopping -----
-        if es_enabled and epochs_without_improvement >= patience_epochs:
-            stop_best_epoch = best_epoch_idx_ema if early_stopping_monitor == "ema" else best_epoch_idx
-            stop_best_loss = best_epoch_loss_ema if early_stopping_monitor == "ema" else best_epoch_loss
-            print(
-                f"\n Early stopping at epoch {epoch+1} "
-                f"(monitor={early_stopping_monitor}, best epoch: {stop_best_epoch}, "
-                f"best loss {stop_best_loss:.6f})"
+            if val_loss_ema is not None and use_ema and ema is not None:
+                if ema_improved:
+                    best_epoch_loss_ema = val_loss_ema
+                    best_epoch_idx_ema = epoch + 1
+                    best_ema_path = out_dir / "weights_ema_best_val.weights.h5"
+                    with _ema_weights_applied(ema):
+                        model.save_weights(best_ema_path)
+                    print(
+                        f"  New best EMA model (epoch {best_epoch_idx_ema}), "
+                        f"saved to {best_ema_path} (metric={best_epoch_loss_ema:.6f})"
+                    )
+
+            if val_loss is not None:
+                if early_stopping_monitor == "ema":
+                    monitor_improved = ema_improved
+                    monitor_metric = val_loss_ema
+                else:
+                    monitor_improved = raw_improved
+                    monitor_metric = val_loss
+
+                if monitor_metric is None:
+                    raise RuntimeError(
+                        f"Early-stopping monitor '{early_stopping_monitor}' has no validation metric for epoch {epoch+1}."
+                    )
+
+                if monitor_improved:
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                    print(
+                        f"  No significant improvement on early-stopping monitor "
+                        f"({early_stopping_monitor}) ({epochs_without_improvement}/{patience_epochs})"
+                    )
+            else:
+                print("  Skipping early-stopping update (validation not run this epoch).")
+
+            # Also track a best model on the balanced_fixed validation metric (does NOT drive early stopping).
+            if val_loss_balanced is not None and (best_epoch_balanced - val_loss_balanced > min_delta):
+                best_epoch_balanced = val_loss_balanced
+                best_bal_path = out_dir / "weights_best_balanced_val.weights.h5"
+                model.save_weights(best_bal_path)
+                print(f"  New best BALANCED model, saved to {best_bal_path} (metric={best_epoch_balanced:.6f})")
+            if (
+                val_loss_balanced_ema is not None
+                and use_ema
+                and ema is not None
+                and (best_epoch_balanced_ema - val_loss_balanced_ema > min_delta)
+            ):
+                best_epoch_balanced_ema = val_loss_balanced_ema
+                best_bal_ema_path = out_dir / "weights_ema_best_balanced_val.weights.h5"
+                with _ema_weights_applied(ema):
+                    model.save_weights(best_bal_ema_path)
+                print(
+                    f"  New best BALANCED EMA model, saved to {best_bal_ema_path} "
+                    f"(metric={best_epoch_balanced_ema:.6f})"
+                )
+
+            checkpoint.epoch.assign(epoch + 1)
+            ckpt_path = checkpoint_manager.save(checkpoint_number=epoch + 1)
+            print(f"  Saved training checkpoint to {ckpt_path}")
+
+            # ----- persist run state (for resuming) -----
+            _save_state(
+                out_dir,
+                {
+                    "last_epoch": epoch + 1,  # completed epochs
+                    "global_step": global_step,
+                    "best_epoch": best_epoch_idx,
+                    "best_epoch_loss": best_epoch_loss,
+                    "best_epoch_balanced": best_epoch_balanced,
+                    "best_epoch_ema": best_epoch_idx_ema,
+                    "best_epoch_loss_ema": best_epoch_loss_ema,
+                    "best_epoch_balanced_ema": best_epoch_balanced_ema,
+                    "epochs_without_improvement": epochs_without_improvement,
+                    "epoch_indices": epoch_indices,
+                    "epoch_losses": epoch_losses,
+                    "val_losses": val_losses,
+                    "val_losses_balanced": val_losses_balanced,
+                    "val_losses_ema": val_losses_ema,
+                    "val_losses_balanced_ema": val_losses_balanced_ema,
+                    "python_random_state": _encode_py_state(random.getstate()),
+                    "numpy_random_state": _encode_py_state(np.random.get_state()),
+                    "train_sampler_state": _encode_py_state(train_sampler.get_state()),
+                },
             )
-            break
+
+            # ----- early stopping -----
+            if es_enabled and epochs_without_improvement >= patience_epochs:
+                stop_best_epoch = best_epoch_idx_ema if early_stopping_monitor == "ema" else best_epoch_idx
+                stop_best_loss = best_epoch_loss_ema if early_stopping_monitor == "ema" else best_epoch_loss
+                print(
+                    f"\n Early stopping at epoch {epoch+1} "
+                    f"(monitor={early_stopping_monitor}, best epoch: {stop_best_epoch}, "
+                    f"best loss {stop_best_loss:.6f})"
+                )
+                break
+    finally:
+        if hasattr(train_sampler, "close"):
+            train_sampler.close()
     
 
     
