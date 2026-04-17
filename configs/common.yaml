@@ -18,7 +18,7 @@ data:
   bt_max_k: 310.0 # q99.9; global max is 348.0
   split_dir: data/splits
   eval_num_parallel_calls: null  # null -> 1 for netcdf, AUTOTUNE for packed_memmap
-  eval_seed: 42
+  eval_seed: 42             # legacy; train/val dataset seeding now follows training.seed
   eval_mode: full
   val_balanced_per_class: 5
 
@@ -53,7 +53,7 @@ diffusion:
   dynamic_threshold_p: 0.995
 
 training:
-  seed: 42              # global seed for Python/NumPy/TF; set to null to disable
+  seed: 42              # authoritative seed for data order, RNG streams, and resumable training
   num_epochs: 100
   steps_per_epoch: 2000
   lr: 1e-4

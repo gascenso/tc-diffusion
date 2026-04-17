@@ -35,50 +35,85 @@ def _build_aug_policy(num_classes: int) -> Tuple[tf.Tensor, tf.Tensor]:
         tf.constant(max_shift, dtype=tf.int32),
     )
 
+
+def _seed_with_offset(seed: tf.Tensor, offset: int) -> tf.Tensor:
+    seed = tf.convert_to_tensor(seed, dtype=tf.int32)
+    return tf.stack([seed[0], seed[1] + tf.cast(offset, tf.int32)])
+
 # ------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------
-def rot90_only(x):
+def rot90_only(x, seed: tf.Tensor | None = None):
     # x: [H, W, C] or [H, W]
-    k = tf.random.uniform([], minval=0, maxval=4, dtype=tf.int32)
+    if seed is None:
+        k = tf.random.uniform([], minval=0, maxval=4, dtype=tf.int32)
+    else:
+        k = tf.random.stateless_uniform(
+            [],
+            seed=tf.convert_to_tensor(seed, dtype=tf.int32),
+            minval=0,
+            maxval=4,
+            dtype=tf.int32,
+        )
     return tf.image.rot90(x, k)
 
-def random_shift_reflect(x, max_shift):
+def random_shift_reflect(x, max_shift, seed: tf.Tensor | None = None):
     # max_shift: int scalar tensor
-    if max_shift <= 0:
-        return x
+    max_shift = tf.cast(max_shift, tf.int32)
 
-    h = tf.shape(x)[0]
-    w = tf.shape(x)[1]
+    def _do_shift():
+        h = tf.shape(x)[0]
+        w = tf.shape(x)[1]
 
-    dy = tf.random.uniform([], -max_shift, max_shift + 1, dtype=tf.int32)
-    dx = tf.random.uniform([], -max_shift, max_shift + 1, dtype=tf.int32)
+        if seed is None:
+            dy = tf.random.uniform([], -max_shift, max_shift + 1, dtype=tf.int32)
+            dx = tf.random.uniform([], -max_shift, max_shift + 1, dtype=tf.int32)
+        else:
+            seed_i = tf.convert_to_tensor(seed, dtype=tf.int32)
+            dy = tf.random.stateless_uniform(
+                [],
+                seed=_seed_with_offset(seed_i, 0),
+                minval=-max_shift,
+                maxval=max_shift + 1,
+                dtype=tf.int32,
+            )
+            dx = tf.random.stateless_uniform(
+                [],
+                seed=_seed_with_offset(seed_i, 1),
+                minval=-max_shift,
+                maxval=max_shift + 1,
+                dtype=tf.int32,
+            )
 
-    # reflect pad enough to allow cropping after shift
-    pad_y = max_shift
-    pad_x = max_shift
-    x_pad = tf.pad(
-        x,
-        paddings=[[pad_y, pad_y], [pad_x, pad_x], [0, 0]] if x.shape.rank == 3 else [[pad_y, pad_y], [pad_x, pad_x]],
-        mode="REFLECT",
-    )
+        # reflect pad enough to allow cropping after shift
+        pad_y = max_shift
+        pad_x = max_shift
+        x_pad = tf.pad(
+            x,
+            paddings=[[pad_y, pad_y], [pad_x, pad_x], [0, 0]]
+            if x.shape.rank == 3
+            else [[pad_y, pad_y], [pad_x, pad_x]],
+            mode="REFLECT",
+        )
 
-    # crop with offset
-    y0 = pad_y + dy
-    x0 = pad_x + dx
-    if x.shape.rank == 3:
-        return tf.image.crop_to_bounding_box(x_pad, y0, x0, h, w)
-    else:
-        # expand to use crop_to_bounding_box then squeeze
+        # crop with offset
+        y0 = pad_y + dy
+        x0 = pad_x + dx
+        if x.shape.rank == 3:
+            return tf.image.crop_to_bounding_box(x_pad, y0, x0, h, w)
+
         x_pad3 = x_pad[..., None]
         out = tf.image.crop_to_bounding_box(x_pad3, y0, x0, h, w)
         return tf.squeeze(out, axis=-1)
+
+    return tf.cond(max_shift <= 0, lambda: x, _do_shift)
 
 def augment_x_given_y(
     x,
     y,
     p_aug: tf.Tensor,
     max_shift_per_class: tf.Tensor,
+    seed: tf.Tensor | None = None,
 ):
     """
     x: [H,W,1] (or [H,W]) normalized already (e.g., to [-1,1])
@@ -90,11 +125,62 @@ def augment_x_given_y(
     max_shift = tf.gather(max_shift_per_class, y)
 
     def do_aug():
-        x1 = rot90_only(x)
-        x2 = random_shift_reflect(x1, max_shift=max_shift)
+        rot_seed = None if seed is None else _seed_with_offset(seed, 1)
+        shift_seed = None if seed is None else _seed_with_offset(seed, 2)
+        x1 = rot90_only(x, seed=rot_seed)
+        x2 = random_shift_reflect(x1, max_shift=max_shift, seed=shift_seed)
         return x2
 
-    return tf.cond(tf.random.uniform([]) < p, do_aug, lambda: x)
+    if seed is None:
+        apply_aug = tf.random.uniform([]) < p
+    else:
+        apply_aug = tf.random.stateless_uniform(
+            [],
+            seed=tf.convert_to_tensor(seed, dtype=tf.int32),
+            minval=0.0,
+            maxval=1.0,
+            dtype=tf.float32,
+        ) < p
+    return tf.cond(apply_aug, do_aug, lambda: x)
+
+
+def augment_batch_x_given_y(
+    x,
+    y,
+    p_aug: tf.Tensor,
+    max_shift_per_class: tf.Tensor,
+    base_seed: tf.Tensor,
+):
+    """Stateless batch augmentation keyed by an explicit per-step seed."""
+    base_seed = tf.convert_to_tensor(base_seed, dtype=tf.int32)
+    batch_size = tf.shape(x)[0]
+    sample_idx = tf.range(batch_size, dtype=tf.int32)
+    sample_seeds = tf.stack(
+        [
+            tf.fill([batch_size], base_seed[0]),
+            base_seed[1] + sample_idx,
+        ],
+        axis=1,
+    )
+
+    def _augment_one(args):
+        x_i, y_i, seed_i = args
+        return augment_x_given_y(
+            x_i,
+            y_i,
+            p_aug=p_aug,
+            max_shift_per_class=max_shift_per_class,
+            seed=seed_i,
+        )
+
+    channel_dim = x.shape[-1] if x.shape.rank == 4 else None
+    out_spec = tf.TensorSpec(shape=(None, None, channel_dim), dtype=x.dtype)
+    return tf.map_fn(
+        _augment_one,
+        (x, y, sample_seeds),
+        fn_output_signature=out_spec,
+        parallel_iterations=1,
+    )
 
 def preprocess_bt(bt: np.ndarray, bt_range: Tuple[float, float]) -> np.ndarray:
     bt = bt.astype(np.float32)
@@ -620,6 +706,29 @@ class BalancedTCGenerator:
         class_probs = compute_class_sampling_probs(self.class_to_files, self.alpha)
         self.set_class_probs(class_probs, verbose=verbose)
 
+    def get_state(self) -> Dict[str, Any]:
+        return {
+            "rng_state": self.rng.getstate(),
+            "alpha": self.alpha,
+            "class_probs": dict(self.class_probs),
+        }
+
+    def set_state(self, state: Dict[str, Any]):
+        if not isinstance(state, dict):
+            raise ValueError("BalancedTCGenerator.set_state expects a dict state payload.")
+
+        class_probs = state.get("class_probs")
+        if class_probs is not None:
+            self.set_class_probs(
+                {int(c): float(p) for c, p in class_probs.items()},
+                verbose=False,
+            )
+        alpha = state.get("alpha")
+        self.alpha = None if alpha is None else float(alpha)
+        rng_state = state.get("rng_state")
+        if rng_state is not None:
+            self.rng.setstate(rng_state)
+
     def __iter__(self) -> Iterator[Tuple[np.ndarray, np.int32] | Tuple[np.ndarray, Dict[str, np.generic]]]:
         while True:
             # 1) sample class
@@ -676,7 +785,8 @@ def create_dataset(
     backend = build_data_backend(data_cfg)
 
     batch_size = int(data_cfg["batch_size"])
-    seed = int(cfg.get("seed", 42))
+    train_seed_cfg = cfg.get("training", {}).get("seed", 42)
+    seed = 42 if train_seed_cfg is None else int(train_seed_cfg)
 
     # ---- load index ----
     if use_wind_speed:
@@ -711,7 +821,7 @@ def create_dataset(
     # --------------------------------------------------------
 
     eval_mode = str(data_cfg.get("eval_mode", "full"))  # 'full' | 'balanced_fixed'
-    eval_seed = int(data_cfg.get("eval_seed", seed))
+    eval_seed = seed
 
     bt_range = (float(data_cfg["bt_min_k"]), float(data_cfg["bt_max_k"]))
 
@@ -819,25 +929,10 @@ def create_dataset(
         output_signature=output_signature,
     )
 
-    # shuffle only within small buffer (structure comes from sampler)
-    ds = ds.shuffle(buffer_size=4 * batch_size, seed=seed)
-    p_aug, max_shift = _build_aug_policy(int(cfg["conditioning"]["num_ss_classes"]))
-    if use_wind_speed:
-        ds = ds.map(
-            lambda x, cond: (
-                augment_x_given_y(x, cond["ss_cat"], p_aug, max_shift),
-                cond,
-            ),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
-    else:
-        ds = ds.map(
-            lambda x, y: (augment_x_given_y(x, y, p_aug, max_shift), y),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
-
     ds = ds.batch(batch_size, drop_remainder=True)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
+    opts = tf.data.Options()
+    opts.deterministic = True
+    ds = ds.with_options(opts)
 
     if return_train_generator:
         return ds, gen

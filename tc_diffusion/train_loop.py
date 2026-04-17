@@ -3,6 +3,8 @@ import json
 import glob
 import math
 import random
+import base64
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +13,7 @@ import tensorflow as tf #type: ignore
 from tensorflow import keras #type: ignore
 from tqdm.auto import tqdm # type: ignore
 
-from .data import create_dataset
+from .data import _build_aug_policy, augment_batch_x_given_y, create_dataset
 from .model_unet import build_unet
 from .diffusion import Diffusion
 from .evaluation.evaluator import TCEvaluator
@@ -60,7 +62,7 @@ class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
         }
 
 
-class EMA:
+class EMA(tf.Module):
     """Exponential Moving Average (EMA) over model weights.
 
     Updates after each optimizer step:
@@ -68,10 +70,11 @@ class EMA:
     """
 
     def __init__(self, model: tf.keras.Model, decay: float):
+        super().__init__(name="ema")
         if not (0.0 < float(decay) < 1.0):
             raise ValueError(f"EMA decay must be in (0, 1), got {decay}")
         self.model = model
-        self.decay = tf.constant(float(decay), dtype=tf.float32)
+        self.decay = float(decay)
 
         # Shadow variables mirror model.weights (trainable + non-trainable)
         self.shadow_vars = [
@@ -80,7 +83,7 @@ class EMA:
         ]
 
     def update(self):
-        d = self.decay
+        d = tf.constant(self.decay, dtype=tf.float32)
         one_minus_d = 1.0 - d
         for s, w in zip(self.shadow_vars, self.model.weights):
             s.assign(d * s + one_minus_d * w)
@@ -104,8 +107,8 @@ def _state_path(out_dir: Path) -> Path:
     return out_dir / "run_state.json"
 
 
-def _optimizer_state_path(out_dir: Path) -> Path:
-    return out_dir / "optimizer_state.npy"
+def _checkpoint_dir(out_dir: Path) -> Path:
+    return out_dir / "train_checkpoints"
 
 
 def _find_latest_last_weights(out_dir: Path) -> Path | None:
@@ -153,6 +156,15 @@ def _save_state(out_dir: Path, state: dict):
     with tmp.open("w") as f:
         json.dump(state, f, indent=2)
     tmp.replace(sp)
+
+
+def _encode_py_state(obj) -> str:
+    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    return base64.b64encode(payload).decode("ascii")
+
+
+def _decode_py_state(encoded: str):
+    return pickle.loads(base64.b64decode(encoded.encode("ascii")))
 
 def evaluate_loss(
     diffusion,
@@ -246,17 +258,15 @@ def train(cfg, resume: bool = False):
         except Exception:
             pass
 
-    # Global seeds — set before any data pipeline or model construction so that
-    # weight initialisation, data shuffling, and augmentation are reproducible.
-    # Set training.seed: null in config to skip (non-reproducible but slightly
-    # faster on some backends).
+    # training.seed is the authoritative seed for data order, train-time
+    # stochasticity, and resumable RNG streams. If it is omitted or null we fall
+    # back to 42 so resume-equivalent training still has a stable base seed.
     seed_cfg = cfg["training"].get("seed", 42)
-    if seed_cfg is not None:
-        seed_val = int(seed_cfg)
-        random.seed(seed_val)
-        np.random.seed(seed_val)
-        tf.random.set_seed(seed_val)
-        print(f"[train] Global seed set to {seed_val}")
+    train_seed = 42 if seed_cfg is None else int(seed_cfg)
+    random.seed(train_seed)
+    np.random.seed(train_seed)
+    tf.random.set_seed(train_seed)
+    print(f"[train] Global seed set to {train_seed}")
 
     # Mixed precision — must be set before any model or layer is built.
     # With "mixed_float16", Keras layers compute in float16 but store weights in
@@ -306,12 +316,7 @@ def train(cfg, resume: bool = False):
     # If val_steps <= 0, we will do a full deterministic pass with fixed
     # timestep/noise draws as well as a fixed sample order.
     val_steps = int(cfg["training"].get("val_steps", 0))
-    train_seed_cfg = cfg.get("training", {}).get("seed", None)
-    if train_seed_cfg is not None:
-        val_base_seed = int(train_seed_cfg)
-    else:
-        eval_seed_cfg = cfg.get("data", {}).get("eval_seed", None)
-        val_base_seed = 42 if eval_seed_cfg is None else int(eval_seed_cfg)
+    val_base_seed = train_seed
     log_interval = int(cfg["training"]["log_interval_steps"])
 
     lr_schedule = WarmupCosineDecay(
@@ -327,9 +332,29 @@ def train(cfg, resume: bool = False):
         # back before apply_gradients.  The scale is halved on any NaN/Inf step
         # and doubled every 2000 finite steps.
         optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+    if hasattr(optimizer, "build"):
+        optimizer.build(model.trainable_variables)
 
     out_dir = Path(cfg["experiment"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_items = {
+        "model": model,
+        "optimizer": optimizer,
+        "epoch": tf.Variable(0, dtype=tf.int64, trainable=False, name="epoch"),
+        "global_step": tf.Variable(0, dtype=tf.int64, trainable=False, name="global_step"),
+    }
+    if use_ema and ema is not None:
+        checkpoint_items["ema"] = ema
+    cfg_dropout_layer = model.get_layer("cfg_cond_dropout")
+    cfg_dropout_rng = getattr(cfg_dropout_layer, "rng", None)
+    if cfg_dropout_rng is not None:
+        checkpoint_items["cfg_dropout_rng"] = cfg_dropout_rng
+    checkpoint = tf.train.Checkpoint(**checkpoint_items)
+    checkpoint_manager = tf.train.CheckpointManager(
+        checkpoint,
+        directory=str(_checkpoint_dir(out_dir)),
+        max_to_keep=1,
+    )
 
     # ----- evaluation -----
     evaluator = TCEvaluator(cfg)
@@ -346,63 +371,58 @@ def train(cfg, resume: bool = False):
     best_epoch_balanced = float("inf")
     best_epoch_idx = -1
     epochs_without_improvement = 0
-    global_step = 0
 
     epoch_indices = []
     epoch_losses = []
     val_losses = []
     val_losses_balanced = []
+    state = _load_state(out_dir)
 
     if resume:
-        state = _load_state(out_dir)
-        last_w = _find_latest_last_weights(out_dir)
-        last_ema_w = _find_latest_ema_last_weights(out_dir) if use_ema else None
-
-        if state is None or last_w is None:
-            print(f"[resume] No state/last weights found in {out_dir}. Starting fresh.")
+        latest_ckpt = checkpoint_manager.latest_checkpoint
+        if latest_ckpt is None:
+            print(f"[resume] No checkpoint found in {out_dir}. Starting fresh.")
         else:
-            print(f"[resume] Loading last weights: {last_w}")
-            model.load_weights(str(last_w))
-            if use_ema and ema is not None:
-                if last_ema_w is not None:
-                    print(f"[resume] Loading last EMA weights: {last_ema_w}")
-                    # Temporarily load EMA weights into model, copy into EMA shadow, then restore model weights.
-                    model.load_weights(str(last_ema_w))
-                    ema.copy_from_model()
-                    model.load_weights(str(last_w))
-                else:
-                    print("[resume] No EMA weights found; initializing EMA from current model weights.")
-                    ema.copy_from_model()
-            # Continue from next epoch
-            start_epoch = int(state.get("last_epoch", 0))
-            best_epoch_loss = float(state.get("best_epoch_loss", best_epoch_loss))
-            best_epoch_balanced = float(state.get("best_epoch_balanced", best_epoch_balanced))
-            best_epoch_idx = int(state.get("best_epoch", best_epoch_idx))
-            epochs_without_improvement = int(state.get("epochs_without_improvement", 0))
-            global_step = int(state.get("global_step", 0))
+            print(f"[resume] Restoring checkpoint: {latest_ckpt}")
+            restore_status = checkpoint.restore(latest_ckpt)
+            restore_status.assert_existing_objects_matched()
+            start_epoch = int(checkpoint.epoch.numpy())
 
-            # If you want continuous loss curves across resumes:
-            epoch_indices = list(state.get("epoch_indices", []))
-            epoch_losses = list(state.get("epoch_losses", []))
-            val_losses = list(state.get("val_losses", []))
-            val_losses_balanced = list(state.get("val_losses_balanced", []))
+            if state is not None:
+                state_epoch = int(state.get("last_epoch", start_epoch))
+                if state_epoch != start_epoch:
+                    print(
+                        f"[resume] Warning: checkpoint epoch ({start_epoch}) and "
+                        f"run_state last_epoch ({state_epoch}) differ; using checkpoint state."
+                    )
+                best_epoch_loss = float(state.get("best_epoch_loss", best_epoch_loss))
+                best_epoch_balanced = float(state.get("best_epoch_balanced", best_epoch_balanced))
+                best_epoch_idx = int(state.get("best_epoch", best_epoch_idx))
+                epochs_without_improvement = int(state.get("epochs_without_improvement", 0))
+                epoch_indices = list(state.get("epoch_indices", []))
+                epoch_losses = list(state.get("epoch_losses", []))
+                val_losses = list(state.get("val_losses", []))
+                val_losses_balanced = list(state.get("val_losses_balanced", []))
+
+                py_state = state.get("python_random_state")
+                if py_state is not None:
+                    random.setstate(_decode_py_state(py_state))
+                np_state = state.get("numpy_random_state")
+                if np_state is not None:
+                    np.random.set_state(_decode_py_state(np_state))
+                sampler_state = state.get("train_sampler_state")
+                if sampler_state is not None:
+                    train_sampler.set_state(_decode_py_state(sampler_state))
+            else:
+                print(
+                    "[resume] Checkpoint restored, but run_state.json is missing; "
+                    "history and Python/NumPy/train-sampler RNG state start fresh."
+                )
 
             print(
                 f"[resume] start_epoch={start_epoch}, best_epoch={best_epoch_idx}, "
-                f"best_loss={best_epoch_loss:.6f}, global_step={global_step}"
+                f"best_loss={best_epoch_loss:.6f}, global_step={int(checkpoint.global_step.numpy())}"
             )
-
-            opt_state_path = _optimizer_state_path(out_dir)
-            if opt_state_path.exists():
-                # Adam slots are created lazily on first apply_gradients.
-                # Trigger slot creation with zero gradients, then overwrite with saved state.
-                dummy_grads = [tf.zeros_like(v) for v in model.trainable_variables]
-                optimizer.apply_gradients(zip(dummy_grads, model.trainable_variables))
-                saved_opt_weights = list(np.load(str(opt_state_path), allow_pickle=True))
-                optimizer.set_weights(saved_opt_weights)
-                print(f"[resume] Restored optimizer state from {opt_state_path}")
-            else:
-                print("[resume] No optimizer state found; optimizer starts fresh.")
 
     active_alpha = None
 
@@ -413,17 +433,47 @@ def train(cfg, resume: bool = False):
     # always present or always absent in the compiled graph, with zero runtime overhead.
     jit_compile = bool(cfg["training"].get("jit_compile", False))
     grad_clip_norm = float(cfg["training"].get("grad_clip_norm", 1.0))
+    use_wind_speed = bool(cfg.get("conditioning", {}).get("use_wind_speed", False))
+    p_aug, max_shift = _build_aug_policy(int(cfg["conditioning"]["num_ss_classes"]))
 
     @tf.function(reduce_retracing=True, jit_compile=jit_compile)
-    def train_step(x0, cond):
+    def train_step(x0, cond, step_index):
+        step_index = tf.cast(step_index, tf.int32)
+        aug_seed = tf.stack(
+            [
+                tf.cast(train_seed + 20_000, tf.int32),
+                step_index,
+            ]
+        )
+        loss_seed = tf.stack(
+            [
+                tf.cast(train_seed + 40_000, tf.int32),
+                step_index,
+            ]
+        )
+        cond_labels = cond["ss_cat"] if use_wind_speed else cond
+        x0 = augment_batch_x_given_y(
+            x0,
+            cond_labels,
+            p_aug=p_aug,
+            max_shift_per_class=max_shift,
+            base_seed=aug_seed,
+        )
         with tf.GradientTape() as tape:
-            loss = diffusion.loss(model, x0, cond)
+            loss = diffusion.loss(model, x0, cond, seed=loss_seed)
             # Loss scaling must happen inside the tape so that the scale factor
             # is included in the gradient computation.
-            scaled_loss = optimizer.get_scaled_loss(loss) if use_mixed_precision else loss
+            if use_mixed_precision:
+                if hasattr(optimizer, "get_scaled_loss"):
+                    scaled_loss = optimizer.get_scaled_loss(loss)
+                else:
+                    scaled_loss = optimizer.scale_loss(loss)
+            else:
+                scaled_loss = loss
         grads = tape.gradient(scaled_loss, model.trainable_variables)
         if use_mixed_precision:
-            grads = optimizer.get_unscaled_gradients(grads)
+            if hasattr(optimizer, "get_unscaled_gradients"):
+                grads = optimizer.get_unscaled_gradients(grads)
         # Clip after unscaling so the norm is in the natural gradient space.
         grads, _ = tf.clip_by_global_norm(grads, grad_clip_norm)
         # Guard against non-finite loss (NaN/Inf): zero out all gradients so
@@ -437,6 +487,8 @@ def train(cfg, resume: bool = False):
         if use_ema and ema is not None:
             ema.update()
         return loss
+
+    global_step = int(checkpoint.global_step.numpy())
 
     for epoch in range(start_epoch, num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
@@ -455,8 +507,9 @@ def train(cfg, resume: bool = False):
         for batch, (x0, cond) in enumerate(pbar):
             if batch >= steps_per_epoch:
                 break
-            loss = train_step(x0, cond)
+            loss = train_step(x0, cond, step_index=global_step)
             global_step += 1
+            checkpoint.global_step.assign(global_step)
             loss_value = float(loss.numpy())
             if not np.isfinite(loss_value):
                 print(f"\n[warn] step {global_step}: non-finite loss ({loss_value}), update skipped")
@@ -511,9 +564,6 @@ def train(cfg, resume: bool = False):
             print(f"  Saved EMA last weights to {ema_last_path}")
         print(f"  Saved last weights to {last_path}")
 
-        # ----- save optimizer state for resume -----
-        np.save(str(_optimizer_state_path(out_dir)), optimizer.get_weights(), allow_pickle=True)
-
         # ----- check for improvement (best) on FULL validation only -----
         if val_loss is not None:
             metric = val_loss
@@ -554,6 +604,9 @@ def train(cfg, resume: bool = False):
                 ema.restore_model_weights_snapshot(snap)
                 print(f"  New best BALANCED EMA model, saved to {best_bal_ema_path}")
 
+        checkpoint.epoch.assign(epoch + 1)
+        ckpt_path = checkpoint_manager.save(checkpoint_number=epoch + 1)
+        print(f"  Saved training checkpoint to {ckpt_path}")
 
         # ----- persist run state (for resuming) -----
         _save_state(
@@ -569,6 +622,9 @@ def train(cfg, resume: bool = False):
                 "epoch_losses": epoch_losses,
                 "val_losses": val_losses,
                 "val_losses_balanced": val_losses_balanced,
+                "python_random_state": _encode_py_state(random.getstate()),
+                "numpy_random_state": _encode_py_state(np.random.get_state()),
+                "train_sampler_state": _encode_py_state(train_sampler.get_state()),
             },
         )
 

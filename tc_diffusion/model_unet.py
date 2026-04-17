@@ -91,14 +91,26 @@ class GroupNorm(layers.Layer):
 class ClassifierFreeCondDropout(layers.Layer):
     """Joint CFG dropout for categorical and continuous conditioning."""
 
-    def __init__(self, drop_prob: float, null_label: int, null_wind_kt: float, **kwargs):
+    def __init__(
+        self,
+        drop_prob: float,
+        null_label: int,
+        null_wind_kt: float,
+        seed: int | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.drop_prob = float(drop_prob)
         self.null_label = int(null_label)
         self.null_wind_kt = float(null_wind_kt)
+        self.seed = None if seed is None else int(seed)
+        self.rng = None if self.seed is None else tf.random.Generator.from_seed(self.seed)
 
     def _drop_conditioning(self, labels, wind_kt):
-        rnd = tf.random.uniform(tf.shape(labels), 0.0, 1.0, dtype=tf.float32)
+        if self.rng is None:
+            rnd = tf.random.uniform(tf.shape(labels), 0.0, 1.0, dtype=tf.float32)
+        else:
+            rnd = self.rng.uniform(tf.shape(labels), minval=0.0, maxval=1.0, dtype=tf.float32)
         drop = rnd < self.drop_prob
         labels_out = tf.where(
             drop,
@@ -144,6 +156,7 @@ class ClassifierFreeCondDropout(layers.Layer):
                 "drop_prob": self.drop_prob,
                 "null_label": self.null_label,
                 "null_wind_kt": self.null_wind_kt,
+                "seed": self.seed,
             }
         )
         return config
@@ -246,6 +259,8 @@ def build_unet(cfg):
     wind_min_kt = float(cond_cfg.get("wind_min_kt", 35.0))
     wind_max_kt = float(cond_cfg.get("wind_max_kt", 170.0))
     wind_null_kt = float(cond_cfg.get("wind_null_kt", 0.0))
+    train_seed_cfg = cfg.get("training", {}).get("seed", 42)
+    train_seed = 42 if train_seed_cfg is None else int(train_seed_cfg)
 
     ss_cat_in = keras.Input(shape=(), dtype=tf.int32, name="ss_cat")
     wind_kt_in = keras.Input(shape=(), dtype=tf.float32, name="wind_kt")
@@ -282,6 +297,7 @@ def build_unet(cfg):
         drop_prob=cfg_drop_prob,
         null_label=null_label,
         null_wind_kt=wind_null_kt,
+        seed=train_seed + 30_000,
         name="cfg_cond_dropout",
     )([ss_cat_clipped, wind_kt_clipped])
 
