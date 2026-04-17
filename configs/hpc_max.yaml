@@ -2,7 +2,7 @@ _base_: common.yaml
 
 data:
   backend: "packed_memmap"
-  packed_manifest: "data/packed_tc_memmap/manifest.json"
+  packed_manifest: "../data/packed_tc_memmap/manifest.json"
   batch_size: 8           # prioritize model capacity over batch size
 
 model:

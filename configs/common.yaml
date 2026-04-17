@@ -1,8 +1,8 @@
 data:
-  data_root: "data/gridsat_patches"
-  dataset_index: "data/dataset_index_wind.json"
+  data_root: "../data/gridsat_patches"
+  dataset_index: "../data/dataset_index_wind.json"
   backend: "packed_memmap"           # local/HPC can override if needed
-  packed_manifest: "data/packed_tc_memmap/manifest.json"
+  packed_manifest: "../data/packed_tc_memmap/manifest.json"
   netcdf_engine: "netcdf4"
   class_balance_alpha: 0.4
   class_balance_curriculum:
@@ -16,7 +16,7 @@ data:
   image_size: 256
   bt_min_k: 180.0 # q0.1; global min is 117.0
   bt_max_k: 310.0 # q99.9; global max is 348.0
-  split_dir: data/splits
+  split_dir: ../data/splits
   eval_num_parallel_calls: null  # null -> 1 for netcdf, AUTOTUNE for packed_memmap
   eval_seed: 42             # legacy; train/val dataset seeding now follows training.seed
   eval_mode: full
