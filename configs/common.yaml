@@ -12,7 +12,7 @@ data:
     start_epoch: 0
     ramp_epochs: 40
     mode: "cosine"
-  batch_size: 8
+  batch_size: 16
   train_pipeline_profile: local_5090  # legacy | local_5090 | cassandra_hpc
   train_prefetch_batches: 1  # local_5090 only; 0 disables lookahead
   hpc_loader:                # cassandra_hpc only
@@ -61,7 +61,7 @@ diffusion:
 
 training:
   seed: 42              # authoritative seed for data order, RNG streams, and resumable training
-  num_epochs: 100
+  num_epochs: 200
   steps_per_epoch: 2000
   lr: 1e-4
   lr_min: 1.0e-6        # cosine decay floor
@@ -93,10 +93,17 @@ evaluation:
   n_per_class_light: 25
   n_per_class_heavy: 50
   n_plot_per_group: 25   # plot up to 25 real + 25 generated samples per class
+  epoch_preview:
+    enabled: true
+    every_epochs: 20
+    n_per_class: 10
+    ncols: 5
+    use_ema: true
+    seed: 123
   gen_batch_size: null
   guidance_scale: 2.5
   sampler: "dpmpp_2m"    # "ddpm" | "ddim" | "dpmpp_2m"
-  sampling_steps: 25     # used by DDIM / DPM++ 2M; DDPM ignores it
+  sampling_steps: 100     # used by DDIM / DPM++ 2M; DDPM ignores it
   ddim_steps: null       # legacy alias for sampling_steps
   ddim_eta: 0.0          # 0.0 -> deterministic DDIM
   seed: 123
