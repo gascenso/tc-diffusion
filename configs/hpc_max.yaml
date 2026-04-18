@@ -4,7 +4,7 @@ data:
   backend: "packed_memmap"
   packed_manifest: "../data/packed_tc_memmap/manifest.json"
   train_pipeline_profile: cassandra_hpc
-  batch_size: 8           # prioritize model capacity over batch size
+  batch_size: 32           # prioritize model capacity over batch size
   hpc_loader:
     prefetch_batches: 2
     sort_within_shard: true
@@ -18,11 +18,11 @@ model:
   # Full attention at 64x64 creates 4096x4096 score maps per head and is
   # too memory-hungry with the current implementation. Keep attention only
   # at 32x32 unless we later add memory-efficient/windowed attention.
-  attention_resolutions: [32]
+  attention_resolutions: [16, 32]
   attention_heads: 8
 
 training:
-  num_epochs: 120
+  num_epochs: 200
   steps_per_epoch: 2500
   early_stopping:
     enabled: true
