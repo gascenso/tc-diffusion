@@ -19,10 +19,11 @@ import tensorflow as tf #type: ignore
 from tensorflow import keras #type: ignore
 from tqdm.auto import tqdm # type: ignore
 
-from .data import _build_aug_policy, augment_batch_x_given_y, create_dataset
+from .data import _build_aug_policy, augment_batch_x_given_y, create_dataset, ss_class_midpoint_kt
 from .model_unet import build_unet
 from .diffusion import Diffusion
 from .evaluation.evaluator import TCEvaluator
+from .plotting import save_image_grid
 
 
 class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
@@ -421,6 +422,136 @@ def evaluate_loss(
     return loss_sum / max(1, n_samples)
 
 
+def _default_epoch_preview_cfg(cfg: dict) -> dict:
+    ev = dict(cfg.get("evaluation", {}))
+    preview = dict(ev.get("epoch_preview", {}))
+    preview.setdefault("enabled", False)
+    preview.setdefault("every_epochs", 20)
+    preview.setdefault("n_per_class", 10)
+    preview.setdefault("ncols", 5)
+    preview.setdefault("use_ema", True)
+    preview.setdefault("seed", ev.get("seed", 123))
+    preview.setdefault("sampler", ev.get("sampler", "dpmpp_2m"))
+    preview.setdefault("sampling_steps", ev.get("sampling_steps", ev.get("ddim_steps", None)))
+    preview.setdefault("ddim_eta", ev.get("ddim_eta", 0.0))
+    preview.setdefault("guidance_scale", ev.get("guidance_scale", 0.0))
+    preview.setdefault("gen_batch_size", ev.get("gen_batch_size", None))
+    return preview
+
+
+def _resolve_epoch_preview_wind_target_kt(cfg: dict, ss_cat: int) -> float:
+    cond_cfg = cfg.get("conditioning", {})
+    targets = cond_cfg.get("eval_wind_targets_kt")
+    if isinstance(targets, dict):
+        key = str(int(ss_cat))
+        if key in targets:
+            try:
+                return float(targets[key])
+            except Exception:
+                pass
+    return ss_class_midpoint_kt(int(ss_cat))
+
+
+def _save_epoch_preview_samples(
+    *,
+    cfg: dict,
+    out_dir: Path,
+    epoch: int,
+    model,
+    diffusion,
+    preview_cfg: dict,
+    using_ema_weights: bool,
+) -> Path:
+    n_per_class = int(preview_cfg["n_per_class"])
+    if n_per_class <= 0:
+        raise ValueError(f"evaluation.epoch_preview.n_per_class must be > 0, got {n_per_class}")
+
+    ncols = max(1, min(int(preview_cfg["ncols"]), n_per_class))
+    seed = int(preview_cfg["seed"])
+    image_size = int(cfg["data"]["image_size"])
+    bt_min_k = float(cfg["data"]["bt_min_k"])
+    bt_max_k = float(cfg["data"]["bt_max_k"])
+    num_classes = int(cfg["conditioning"]["num_ss_classes"])
+    use_wind_speed = bool(cfg.get("conditioning", {}).get("use_wind_speed", False))
+
+    sampling_steps = preview_cfg.get("sampling_steps")
+    if sampling_steps is not None:
+        sampling_steps = int(sampling_steps)
+
+    gen_batch_size_cfg = preview_cfg.get("gen_batch_size")
+    if gen_batch_size_cfg is None:
+        gen_batch_size = int(cfg["data"].get("batch_size", n_per_class))
+    else:
+        gen_batch_size = int(gen_batch_size_cfg)
+    if gen_batch_size <= 0:
+        raise ValueError(
+            f"evaluation.epoch_preview.gen_batch_size must be > 0 when set, got {gen_batch_size}"
+        )
+    gen_batch_size = min(gen_batch_size, n_per_class)
+
+    preview_root = out_dir / "qualitative_samples" / f"epoch_{epoch+1:04d}"
+    preview_root.mkdir(parents=True, exist_ok=True)
+
+    wind_targets_kt = {}
+    for c in range(num_classes):
+        tf.random.set_seed(seed + c)
+        raw_chunks = []
+        remaining = n_per_class
+        wind_target = None
+        if use_wind_speed:
+            wind_target = float(_resolve_epoch_preview_wind_target_kt(cfg, c))
+            wind_targets_kt[str(c)] = wind_target
+
+        while remaining > 0:
+            bsz = min(gen_batch_size, remaining)
+            sample_outputs = diffusion.sample(
+                model=model,
+                batch_size=bsz,
+                image_size=image_size,
+                cond_value=c,
+                wind_value_kt=wind_target,
+                show_progress=False,
+                guidance_scale=float(preview_cfg["guidance_scale"]),
+                sampler=str(preview_cfg["sampler"]),
+                num_sampling_steps=sampling_steps,
+                ddim_eta=float(preview_cfg["ddim_eta"]),
+                return_both=True,
+            )
+            raw_chunks.append(sample_outputs["raw_final"].numpy())
+            remaining -= bsz
+
+        x_samples = np.concatenate(raw_chunks, axis=0)
+        save_image_grid(
+            x_samples,
+            path=str(preview_root / f"class_{c}.png"),
+            bt_min_k=bt_min_k,
+            bt_max_k=bt_max_k,
+            ncols=ncols,
+        )
+
+    meta_path = preview_root / "meta.json"
+    with meta_path.open("w") as f:
+        json.dump(
+            {
+                "epoch": int(epoch + 1),
+                "using_ema_weights": bool(using_ema_weights),
+                "n_per_class": int(n_per_class),
+                "ncols": int(ncols),
+                "seed": int(seed),
+                "sampler": str(preview_cfg["sampler"]),
+                "sampling_steps": sampling_steps,
+                "ddim_eta": float(preview_cfg["ddim_eta"]),
+                "guidance_scale": float(preview_cfg["guidance_scale"]),
+                "gen_batch_size": int(gen_batch_size),
+                "class_wind_targets_kt": wind_targets_kt,
+            },
+            f,
+            indent=2,
+        )
+
+    return preview_root
+
+
 def resolve_train_alpha(cfg, epoch_idx: int, num_epochs: int) -> float:
     data_cfg = cfg.get("data", {})
     default_alpha = float(data_cfg.get("class_balance_alpha", 1.0))
@@ -569,6 +700,19 @@ def train(cfg, resume: bool = False):
             "[profile] Input-pipeline timing enabled "
             f"(window_steps={pipe_profiler.window_steps}, jsonl={pipe_profiler.jsonl_path.name})"
         )
+    epoch_preview_cfg = _default_epoch_preview_cfg(cfg)
+    if bool(epoch_preview_cfg["enabled"]):
+        preview_every_epochs = int(epoch_preview_cfg["every_epochs"])
+        if preview_every_epochs <= 0:
+            raise ValueError(
+                "evaluation.epoch_preview.every_epochs must be >= 1 when enabled, "
+                f"got {preview_every_epochs}"
+            )
+        print(
+            "[eval] Epoch previews enabled "
+            f"(every_epochs={preview_every_epochs}, n_per_class={int(epoch_preview_cfg['n_per_class'])}, "
+            f"use_ema={bool(epoch_preview_cfg['use_ema'])})"
+        )
     checkpoint_items = {
         "model": model,
         "optimizer": optimizer,
@@ -608,7 +752,13 @@ def train(cfg, resume: bool = False):
         raise ValueError(
             "training.early_stopping.monitor='ema' requires training.ema_decay > 0."
         )
-    print(f"[train] Early stopping monitor: {early_stopping_monitor}")
+    if es_enabled:
+        print(
+            "[train] Early stopping enabled "
+            f"(monitor={early_stopping_monitor}, patience={patience_epochs}, min_delta={min_delta:g})"
+        )
+    else:
+        print("[train] Early stopping disabled")
 
     # ----- resume state -----
     start_epoch = 0
@@ -822,11 +972,8 @@ def train(cfg, resume: bool = False):
                 pbar.update(1)
 
             pbar.close()
-            rewound_batches = train_sampler.rewind_unconsumed() if hasattr(train_sampler, "rewind_unconsumed") else 0
-            if rewound_batches > 0:
-                print(
-                    f"[data] Rewound {rewound_batches} prefetched train batch(es) before epoch boundary."
-                )
+            if hasattr(train_sampler, "rewind_unconsumed"):
+                train_sampler.rewind_unconsumed()
 
             epoch_loss = epoch_loss_sum / max(1, epoch_batches)
             epoch_indices.append(epoch + 1)
@@ -874,8 +1021,6 @@ def train(cfg, resume: bool = False):
                 )
                 val_losses.append(val_loss)
                 val_losses_balanced.append(val_loss_balanced)
-                print(f"Epoch {epoch+1} val mean loss (full): {val_loss:.6f}")
-                print(f"Epoch {epoch+1} val mean loss (balanced_fixed): {val_loss_balanced:.6f}")
                 if use_ema and ema is not None:
                     with _ema_weights_applied(ema):
                         val_loss_ema = evaluate_loss(
@@ -896,8 +1041,18 @@ def train(cfg, resume: bool = False):
                         )
                     val_losses_ema.append(val_loss_ema)
                     val_losses_balanced_ema.append(val_loss_balanced_ema)
-                    print(f"Epoch {epoch+1} EMA val mean loss (full): {val_loss_ema:.6f}")
-                    print(f"Epoch {epoch+1} EMA val mean loss (balanced_fixed): {val_loss_balanced_ema:.6f}")
+                val_summary_bits = [
+                    f"raw_full={val_loss:.6f}",
+                    f"raw_balanced={val_loss_balanced:.6f}",
+                ]
+                if val_loss_ema is not None:
+                    val_summary_bits.extend(
+                        [
+                            f"ema_full={val_loss_ema:.6f}",
+                            f"ema_balanced={val_loss_balanced_ema:.6f}",
+                        ]
+                    )
+                print(f"  Validation: {', '.join(val_summary_bits)}")
 
             # ----- check for improvement (best) on FULL validation only -----
             raw_improved = val_loss is not None and (best_epoch_loss - val_loss > min_delta)
@@ -918,7 +1073,6 @@ def train(cfg, resume: bool = False):
                 and (best_epoch_balanced_ema - val_loss_balanced_ema > min_delta)
             )
 
-            epoch_save_t0 = time.perf_counter()
             raw_snapshot_source: Path | None = None
             ema_snapshot_source: Path | None = None
 
@@ -940,8 +1094,6 @@ def train(cfg, resume: bool = False):
                     label="last weights",
                 )
                 _delete_other_last_weights(out_dir, keep=last_path)
-            else:
-                print("  Skipped raw last-weight export (training.save_last_weights=false)")
 
             if use_ema and ema is not None:
                 if save_ema_last_weights:
@@ -953,8 +1105,6 @@ def train(cfg, resume: bool = False):
                         label="EMA last weights",
                     )
                     _delete_other_ema_last_weights(out_dir, keep=ema_last_path)
-                else:
-                    print("  Skipped EMA last-weight export (training.save_ema_last_weights=false)")
 
             if val_loss is not None:
                 if raw_improved:
@@ -993,9 +1143,11 @@ def train(cfg, resume: bool = False):
                 if early_stopping_monitor == "ema":
                     monitor_improved = ema_improved
                     monitor_metric = val_loss_ema
+                    monitor_best = best_epoch_loss_ema
                 else:
                     monitor_improved = raw_improved
                     monitor_metric = val_loss
+                    monitor_best = best_epoch_loss
 
                 if monitor_metric is None:
                     raise RuntimeError(
@@ -1004,11 +1156,16 @@ def train(cfg, resume: bool = False):
 
                 if monitor_improved:
                     epochs_without_improvement = 0
+                    print(
+                        f"  Early stopping ({early_stopping_monitor}): improved to "
+                        f"{monitor_metric:.6f}; patience reset"
+                    )
                 else:
                     epochs_without_improvement += 1
                     print(
-                        f"  No significant improvement on early-stopping monitor "
-                        f"({early_stopping_monitor}) ({epochs_without_improvement}/{patience_epochs})"
+                        f"  Early stopping ({early_stopping_monitor}): no improvement "
+                        f"(current={monitor_metric:.6f}, best={monitor_best:.6f}) "
+                        f"({epochs_without_improvement}/{patience_epochs})"
                     )
             else:
                 print("  Skipping early-stopping update (validation not run this epoch).")
@@ -1071,8 +1228,37 @@ def train(cfg, resume: bool = False):
                     "train_sampler_state": _encode_py_state(train_sampler.get_state()),
                 },
             )
-            epoch_save_dt = time.perf_counter() - epoch_save_t0
-            print(f"  Epoch-end checkpoint/export stage took {epoch_save_dt:.1f}s")
+
+            if bool(epoch_preview_cfg["enabled"]) and ((epoch + 1) % int(epoch_preview_cfg["every_epochs"]) == 0):
+                preview_use_ema = bool(epoch_preview_cfg["use_ema"]) and use_ema and ema is not None
+                preview_t0 = time.perf_counter()
+                if preview_use_ema:
+                    with _ema_weights_applied(ema):
+                        preview_root = _save_epoch_preview_samples(
+                            cfg=cfg,
+                            out_dir=out_dir,
+                            epoch=epoch,
+                            model=model,
+                            diffusion=diffusion,
+                            preview_cfg=epoch_preview_cfg,
+                            using_ema_weights=True,
+                        )
+                else:
+                    preview_root = _save_epoch_preview_samples(
+                        cfg=cfg,
+                        out_dir=out_dir,
+                        epoch=epoch,
+                        model=model,
+                        diffusion=diffusion,
+                        preview_cfg=epoch_preview_cfg,
+                        using_ema_weights=False,
+                    )
+                preview_dt = time.perf_counter() - preview_t0
+                preview_label = "EMA" if preview_use_ema else "raw"
+                print(
+                    f"  Saved epoch preview samples to {preview_root} "
+                    f"using {preview_label} weights ({preview_dt:.1f}s)"
+                )
 
             # ----- early stopping -----
             if es_enabled and epochs_without_improvement >= patience_epochs:
