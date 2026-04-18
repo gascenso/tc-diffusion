@@ -81,7 +81,7 @@ training:
   save_last_weights: false
   save_ema_last_weights: false
   input_pipeline_profile:
-    enabled: false
+    enabled: true
     window_steps: 50
   early_stopping:
     enabled: true
