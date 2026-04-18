@@ -40,7 +40,7 @@ def parse_args():
     p.add_argument(
         "--resume",
         action="store_true",
-        help="Resume training from the latest weights_last.* in runs/<name>/ if available.",
+        help="Resume training from the latest TensorFlow checkpoint in runs/<name>/train_checkpoints/ if available.",
     )
     return p.parse_args()
 

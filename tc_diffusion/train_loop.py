@@ -1,10 +1,12 @@
 # tc_diffusion/train_loop.py
-import json
-import glob
-import math
-import random
 import base64
+import glob
+import json
+import math
+import os
 import pickle
+import random
+import shutil
 import time
 from contextlib import contextmanager
 from collections import deque
@@ -179,6 +181,47 @@ def _save_state(out_dir: Path, state: dict):
 def _encode_py_state(obj) -> str:
     payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     return base64.b64encode(payload).decode("ascii")
+
+
+def _copy_file_atomic(src: Path, dst: Path) -> str:
+    """Publish dst from src without re-serializing model weights."""
+    src = Path(src)
+    dst = Path(dst)
+    tmp = dst.with_name(f".{dst.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
+        return "copied"
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _publish_weight_snapshot(
+    source_path: Path | None,
+    dest_path: Path,
+    *,
+    save_fn,
+    label: str,
+) -> Path:
+    """Save once, then reuse the written artifact for sibling snapshots."""
+    t0 = time.perf_counter()
+    if source_path is None:
+        save_fn(dest_path)
+        dt = time.perf_counter() - t0
+        print(f"  Saved {label} to {dest_path} ({dt:.1f}s)")
+        return dest_path
+
+    method = _copy_file_atomic(source_path, dest_path)
+    dt = time.perf_counter() - t0
+    print(
+        f"  {method.capitalize()} {label} to {dest_path} "
+        f"from {source_path.name} ({dt:.2f}s)"
+    )
+    return source_path
 
 
 def _decode_py_state(encoded: str):
@@ -490,6 +533,12 @@ def train(cfg, resume: bool = False):
     val_steps = int(cfg["training"].get("val_steps", 0))
     val_base_seed = train_seed
     log_interval = int(cfg["training"]["log_interval_steps"])
+    save_last_weights = bool(cfg["training"].get("save_last_weights", True))
+    save_ema_last_cfg = cfg["training"].get("save_ema_last_weights")
+    if save_ema_last_cfg is None:
+        save_ema_last_weights = save_last_weights
+    else:
+        save_ema_last_weights = bool(save_ema_last_cfg)
 
     lr_schedule = WarmupCosineDecay(
         lr_peak=lr,
@@ -850,18 +899,6 @@ def train(cfg, resume: bool = False):
                     print(f"Epoch {epoch+1} EMA val mean loss (full): {val_loss_ema:.6f}")
                     print(f"Epoch {epoch+1} EMA val mean loss (balanced_fixed): {val_loss_balanced_ema:.6f}")
 
-            # ----- ALWAYS save "last" -----
-            last_path = out_dir / f"weights_last.epoch_{epoch+1}.weights.h5"
-            model.save_weights(last_path)
-            _delete_other_last_weights(out_dir, keep=last_path)
-            if use_ema and ema is not None:
-                ema_last_path = out_dir / f"weights_ema_last.epoch_{epoch+1}.weights.h5"
-                with _ema_weights_applied(ema):
-                    model.save_weights(ema_last_path)
-                _delete_other_ema_last_weights(out_dir, keep=ema_last_path)
-                print(f"  Saved EMA last weights to {ema_last_path}")
-            print(f"  Saved last weights to {last_path}")
-
             # ----- check for improvement (best) on FULL validation only -----
             raw_improved = val_loss is not None and (best_epoch_loss - val_loss > min_delta)
             ema_improved = (
@@ -870,6 +907,54 @@ def train(cfg, resume: bool = False):
                 and ema is not None
                 and (best_epoch_loss_ema - val_loss_ema > min_delta)
             )
+            balanced_improved = (
+                val_loss_balanced is not None
+                and (best_epoch_balanced - val_loss_balanced > min_delta)
+            )
+            balanced_ema_improved = (
+                val_loss_balanced_ema is not None
+                and use_ema
+                and ema is not None
+                and (best_epoch_balanced_ema - val_loss_balanced_ema > min_delta)
+            )
+
+            epoch_save_t0 = time.perf_counter()
+            raw_snapshot_source: Path | None = None
+            ema_snapshot_source: Path | None = None
+
+            def _save_raw_weights(path: Path):
+                model.save_weights(path)
+
+            def _save_ema_weights(path: Path):
+                if ema is None:
+                    raise RuntimeError("EMA weights requested, but EMA is not enabled.")
+                with _ema_weights_applied(ema):
+                    model.save_weights(path)
+
+            if save_last_weights:
+                last_path = out_dir / f"weights_last.epoch_{epoch+1}.weights.h5"
+                raw_snapshot_source = _publish_weight_snapshot(
+                    raw_snapshot_source,
+                    last_path,
+                    save_fn=_save_raw_weights,
+                    label="last weights",
+                )
+                _delete_other_last_weights(out_dir, keep=last_path)
+            else:
+                print("  Skipped raw last-weight export (training.save_last_weights=false)")
+
+            if use_ema and ema is not None:
+                if save_ema_last_weights:
+                    ema_last_path = out_dir / f"weights_ema_last.epoch_{epoch+1}.weights.h5"
+                    ema_snapshot_source = _publish_weight_snapshot(
+                        ema_snapshot_source,
+                        ema_last_path,
+                        save_fn=_save_ema_weights,
+                        label="EMA last weights",
+                    )
+                    _delete_other_ema_last_weights(out_dir, keep=ema_last_path)
+                else:
+                    print("  Skipped EMA last-weight export (training.save_ema_last_weights=false)")
 
             if val_loss is not None:
                 if raw_improved:
@@ -877,16 +962,28 @@ def train(cfg, resume: bool = False):
                     best_epoch_idx = epoch + 1
 
                     best_path = out_dir / "weights_best_val.weights.h5"
-                    model.save_weights(best_path)
-                    print(f"  New best model (epoch {best_epoch_idx}), saved to {best_path} (metric={best_epoch_loss:.6f})")
+                    raw_snapshot_source = _publish_weight_snapshot(
+                        raw_snapshot_source,
+                        best_path,
+                        save_fn=_save_raw_weights,
+                        label="best validation weights",
+                    )
+                    print(
+                        f"  New best model (epoch {best_epoch_idx}), "
+                        f"saved to {best_path} (metric={best_epoch_loss:.6f})"
+                    )
 
             if val_loss_ema is not None and use_ema and ema is not None:
                 if ema_improved:
                     best_epoch_loss_ema = val_loss_ema
                     best_epoch_idx_ema = epoch + 1
                     best_ema_path = out_dir / "weights_ema_best_val.weights.h5"
-                    with _ema_weights_applied(ema):
-                        model.save_weights(best_ema_path)
+                    ema_snapshot_source = _publish_weight_snapshot(
+                        ema_snapshot_source,
+                        best_ema_path,
+                        save_fn=_save_ema_weights,
+                        label="EMA best validation weights",
+                    )
                     print(
                         f"  New best EMA model (epoch {best_epoch_idx_ema}), "
                         f"saved to {best_ema_path} (metric={best_epoch_loss_ema:.6f})"
@@ -917,29 +1014,38 @@ def train(cfg, resume: bool = False):
                 print("  Skipping early-stopping update (validation not run this epoch).")
 
             # Also track a best model on the balanced_fixed validation metric (does NOT drive early stopping).
-            if val_loss_balanced is not None and (best_epoch_balanced - val_loss_balanced > min_delta):
+            if balanced_improved:
                 best_epoch_balanced = val_loss_balanced
                 best_bal_path = out_dir / "weights_best_balanced_val.weights.h5"
-                model.save_weights(best_bal_path)
-                print(f"  New best BALANCED model, saved to {best_bal_path} (metric={best_epoch_balanced:.6f})")
-            if (
-                val_loss_balanced_ema is not None
-                and use_ema
-                and ema is not None
-                and (best_epoch_balanced_ema - val_loss_balanced_ema > min_delta)
-            ):
+                raw_snapshot_source = _publish_weight_snapshot(
+                    raw_snapshot_source,
+                    best_bal_path,
+                    save_fn=_save_raw_weights,
+                    label="best balanced-validation weights",
+                )
+                print(
+                    f"  New best BALANCED model, saved to {best_bal_path} "
+                    f"(metric={best_epoch_balanced:.6f})"
+                )
+            if balanced_ema_improved:
                 best_epoch_balanced_ema = val_loss_balanced_ema
                 best_bal_ema_path = out_dir / "weights_ema_best_balanced_val.weights.h5"
-                with _ema_weights_applied(ema):
-                    model.save_weights(best_bal_ema_path)
+                ema_snapshot_source = _publish_weight_snapshot(
+                    ema_snapshot_source,
+                    best_bal_ema_path,
+                    save_fn=_save_ema_weights,
+                    label="EMA best balanced-validation weights",
+                )
                 print(
                     f"  New best BALANCED EMA model, saved to {best_bal_ema_path} "
                     f"(metric={best_epoch_balanced_ema:.6f})"
                 )
 
             checkpoint.epoch.assign(epoch + 1)
+            ckpt_t0 = time.perf_counter()
             ckpt_path = checkpoint_manager.save(checkpoint_number=epoch + 1)
-            print(f"  Saved training checkpoint to {ckpt_path}")
+            ckpt_dt = time.perf_counter() - ckpt_t0
+            print(f"  Saved training checkpoint to {ckpt_path} ({ckpt_dt:.1f}s)")
 
             # ----- persist run state (for resuming) -----
             _save_state(
@@ -965,6 +1071,8 @@ def train(cfg, resume: bool = False):
                     "train_sampler_state": _encode_py_state(train_sampler.get_state()),
                 },
             )
+            epoch_save_dt = time.perf_counter() - epoch_save_t0
+            print(f"  Epoch-end checkpoint/export stage took {epoch_save_dt:.1f}s")
 
             # ----- early stopping -----
             if es_enabled and epochs_without_improvement >= patience_epochs:

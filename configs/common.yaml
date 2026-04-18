@@ -75,6 +75,11 @@ training:
   jit_compile: false
   grad_clip_norm: 1.0   # global gradient norm clipping (0 or null to disable)
   val_every_epochs: 1
+  # Resume uses the TensorFlow checkpoint under runs/<name>/train_checkpoints/,
+  # so exporting extra H5 "last" snapshots every epoch is optional. Disabling
+  # them avoids a large epoch-end serialization cost on both local and HPC runs.
+  save_last_weights: false
+  save_ema_last_weights: false
   input_pipeline_profile:
     enabled: false
     window_steps: 50
