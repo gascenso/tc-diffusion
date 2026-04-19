@@ -30,7 +30,10 @@ def build_evaluator_model(cfg: Dict[str, Any]) -> keras.Model:
     embedding_dim = int(model_cfg.get("embedding_dim", 256))
     norm = str(model_cfg.get("norm", "group")).strip().lower()
     gn_groups = int(model_cfg.get("gn_groups", 8))
-    dropout_rate = float(model_cfg.get("dropout", 0.0))
+    spatial_dropout_rate = float(model_cfg.get("spatial_dropout_rate", 0.0))
+    embedding_dropout_rate = float(
+        model_cfg.get("embedding_dropout_rate", model_cfg.get("dropout", 0.0))
+    )
 
     if len(input_shape) != 3 or int(input_shape[-1]) != 1:
         raise ValueError(f"Evaluator expects input_shape [H, W, 1], got {input_shape}")
@@ -38,6 +41,8 @@ def build_evaluator_model(cfg: Dict[str, Any]) -> keras.Model:
         raise ValueError("evaluator.model.stage_channels must contain at least one stage.")
     if blocks_per_stage <= 0:
         raise ValueError("evaluator.model.blocks_per_stage must be > 0.")
+    _validate_dropout_rate(spatial_dropout_rate, "spatial_dropout_rate")
+    _validate_dropout_rate(embedding_dropout_rate, "embedding_dropout_rate")
 
     inputs = keras.Input(shape=input_shape, name="bt")
     x = layers.Conv2D(
@@ -49,6 +54,7 @@ def build_evaluator_model(cfg: Dict[str, Any]) -> keras.Model:
     )(inputs)
     x = _norm(x, norm=norm, groups=gn_groups, name="stem_norm")
     x = _silu(x, name="stem_silu")
+    x = _spatial_dropout(x, spatial_dropout_rate, name="stem_spatial_dropout")
 
     for stage_idx, channels in enumerate(stage_channels):
         for block_idx in range(blocks_per_stage):
@@ -61,12 +67,18 @@ def build_evaluator_model(cfg: Dict[str, Any]) -> keras.Model:
                 groups=gn_groups,
                 name=f"stage{stage_idx + 1}_block{block_idx + 1}",
             )
+        if stage_idx == 1:
+            x = _spatial_dropout(
+                x,
+                spatial_dropout_rate,
+                name=f"stage{stage_idx + 1}_spatial_dropout",
+            )
 
     x = layers.GlobalAveragePooling2D(name="global_avg_pool")(x)
     x = layers.Dense(embedding_dim, name="embedding_dense")(x)
     x = _silu(x, name="embedding_silu")
-    if dropout_rate > 0.0:
-        x = layers.Dropout(dropout_rate, name="embedding_dropout")(x)
+    if embedding_dropout_rate > 0.0:
+        x = layers.Dropout(embedding_dropout_rate, name="embedding_dropout")(x)
 
     class_logits = layers.Dense(
         num_classes,
@@ -141,3 +153,14 @@ def _norm(x, *, norm: str, groups: int, name: str):
 
 def _silu(x, *, name: str):
     return layers.Activation(tf.nn.silu, name=name)(x)
+
+
+def _spatial_dropout(x, rate: float, *, name: str):
+    if float(rate) <= 0.0:
+        return x
+    return layers.SpatialDropout2D(float(rate), name=name)(x)
+
+
+def _validate_dropout_rate(rate: float, name: str):
+    if not 0.0 <= float(rate) < 1.0:
+        raise ValueError(f"evaluator.model.{name} must be in [0, 1), got {rate}")

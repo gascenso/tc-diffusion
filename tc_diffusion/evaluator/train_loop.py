@@ -16,6 +16,7 @@ from .data import (
     build_evaluator_data,
     bundle_summary,
     make_batch_dataset,
+    resolve_class_weight_alpha,
 )
 from .losses import evaluator_loss_components
 from .metrics import compute_evaluator_report, make_loss_summary, to_builtin
@@ -110,6 +111,13 @@ def train_evaluator(cfg: Dict[str, Any], *, resume: bool = False) -> Dict[str, A
     if best.get("metric") is not None:
         scheduler.best = float(best["metric"])
     early = _default_early_stopping_cfg(ev_cfg)
+    _print_training_control_summary(
+        cfg=cfg,
+        train_cfg=train_cfg,
+        loss_cfg=loss_cfg,
+        early_cfg=early,
+        ckpt_cfg=ckpt_cfg,
+    )
     epochs_without_improvement = int(
         state.get("epochs_without_improvement", 0) if state is not None else 0
     )
@@ -130,6 +138,7 @@ def train_evaluator(cfg: Dict[str, Any], *, resume: bool = False) -> Dict[str, A
                 lambda_cls=float(loss_cfg["lambda_cls"]),
                 lambda_wind=float(loss_cfg["lambda_wind"]),
                 huber_delta=float(loss_cfg["huber_delta"]),
+                label_smoothing=float(loss_cfg["label_smoothing"]),
             )
             loss = comps["total_loss"]
             if use_mixed_precision:
@@ -220,7 +229,7 @@ def train_evaluator(cfg: Dict[str, Any], *, resume: bool = False) -> Dict[str, A
             f"loss={val_report['loss']['total']:.5f}, "
             f"bal_acc={_fmt(val_report['classification']['balanced_accuracy'])}, "
             f"macro_f1={_fmt(val_report['classification']['macro_f1'])}, "
-            f"mae={_fmt(val_report['regression']['mae_kt'])} kt, "
+            f"{_format_tail_summary(val_report)}, "
             f"tail_score={_fmt(val_report['selection']['tail_score'])}"
         )
 
@@ -247,13 +256,16 @@ def train_evaluator(cfg: Dict[str, Any], *, resume: bool = False) -> Dict[str, A
             epochs_without_improvement = 0
             print(
                 f"  New best evaluator checkpoint: epoch={epoch_idx}, "
-                f"{ckpt_cfg['monitor']}={monitor_value:.6f}"
+                f"{ckpt_cfg['monitor']}={monitor_value:.6f} "
+                f"({_format_best_reason(val_report)})"
             )
         else:
             epochs_without_improvement += 1
             print(
                 f"  No best-checkpoint improvement "
-                f"({epochs_without_improvement}/{early['patience_epochs']})"
+                f"(current {ckpt_cfg['monitor']}={monitor_value:.6f}, "
+                f"best={_fmt(best.get('metric'))}; "
+                f"{epochs_without_improvement}/{early['patience_epochs']})"
             )
 
         scheduler.step(monitor_value)
@@ -279,6 +291,7 @@ def train_evaluator(cfg: Dict[str, Any], *, resume: bool = False) -> Dict[str, A
         ):
             print(
                 f"[evaluator] Early stopping at epoch {epoch_idx}; "
+                f"patience={early['patience_epochs']}, "
                 f"best epoch {best['epoch']} ({best['monitor']}={best['metric']})"
             )
             break
@@ -359,6 +372,7 @@ def evaluate_evaluator(
             lambda_cls=float(loss_cfg["lambda_cls"]),
             lambda_wind=float(loss_cfg["lambda_wind"]),
             huber_delta=float(loss_cfg["huber_delta"]),
+            label_smoothing=float(loss_cfg["label_smoothing"]),
         )
         logits = outputs["class_logits"].numpy()
         pred_z = tf.squeeze(outputs["wind_z"], axis=-1).numpy()
@@ -566,6 +580,71 @@ def _finalize_report(
     )
 
 
+def _print_training_control_summary(
+    *,
+    cfg: Dict[str, Any],
+    train_cfg: Dict[str, Any],
+    loss_cfg: Dict[str, Any],
+    early_cfg: Dict[str, Any],
+    ckpt_cfg: Dict[str, Any],
+):
+    ev_cfg = cfg.get("evaluator", {})
+    model_cfg = ev_cfg.get("model", {})
+    spatial_dropout = float(model_cfg.get("spatial_dropout_rate", 0.0))
+    embedding_dropout = float(
+        model_cfg.get("embedding_dropout_rate", model_cfg.get("dropout", 0.0))
+    )
+    print(
+        "[evaluator:control] "
+        f"AdamW weight_decay={float(train_cfg['weight_decay']):.3g}, "
+        f"label_smoothing={float(loss_cfg['label_smoothing']):.3g}, "
+        f"class_weight_alpha={resolve_class_weight_alpha(ev_cfg):.3g}"
+    )
+    print(
+        "[evaluator:control] "
+        f"spatial_dropout_rate={spatial_dropout:.3g}, "
+        f"embedding_dropout_rate={embedding_dropout:.3g}, "
+        f"best_monitor={ckpt_cfg['monitor']} ({ckpt_cfg['mode']}), "
+        f"early_stopping_enabled={bool(early_cfg['enabled'])}, "
+        f"early_stopping_patience={int(early_cfg['patience_epochs'])}"
+    )
+
+
+def _format_tail_summary(report: Dict[str, Any]) -> str:
+    cls = report.get("classification", {})
+    tail = report.get("tail", {})
+    per_class = cls.get("per_class", {})
+    cat45 = tail.get("cat45", {}) if isinstance(tail.get("cat45"), dict) else {}
+    return (
+        f"cat4_rec={_fmt(_nested(per_class, '4', 'recall'))}, "
+        f"cat5_rec={_fmt(_nested(per_class, '5', 'recall'))}, "
+        f"cat45_rec={_fmt(cat45.get('combined_recall'))}, "
+        f"cat45_mae={_fmt(cat45.get('mae_kt'))} kt, "
+        f"cat45_bias={_fmt(cat45.get('bias_kt'))} kt"
+    )
+
+
+def _format_best_reason(report: Dict[str, Any]) -> str:
+    selection = report.get("selection", {})
+    terms = selection.get("tail_score_terms", {})
+    source = selection.get("tail_score_source", "unknown")
+    return (
+        f"source={source}, "
+        f"mae/std={_fmt(terms.get('mae_over_train_std'))}, "
+        f"1-recall={_fmt(terms.get('one_minus_recall'))}, "
+        f"{_format_tail_summary(report)}"
+    )
+
+
+def _nested(obj: Dict[str, Any], *keys: str):
+    value: Any = obj
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
 def _make_adamw(*, learning_rate: float, weight_decay: float):
     if hasattr(keras.optimizers, "AdamW"):
         return keras.optimizers.AdamW(
@@ -587,7 +666,7 @@ def _default_train_cfg(ev_cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("num_epochs", 50)
     cfg.setdefault("batch_size", None)
     cfg.setdefault("lr", 3.0e-4)
-    cfg.setdefault("weight_decay", 1.0e-4)
+    cfg.setdefault("weight_decay", 5.0e-4)
     cfg.setdefault("log_interval_steps", 20)
     cfg.setdefault("mixed_precision", False)
     cfg.setdefault("jit_compile", False)
@@ -603,6 +682,10 @@ def _default_loss_cfg(ev_cfg: Dict[str, Any]) -> Dict[str, float]:
     cfg.setdefault("lambda_cls", 1.0)
     cfg.setdefault("lambda_wind", 1.0)
     cfg.setdefault("huber_delta", 1.0)
+    if "label_smoothing" in ev_cfg:
+        cfg["label_smoothing"] = ev_cfg["label_smoothing"]
+    else:
+        cfg.setdefault("label_smoothing", 0.04)
     return cfg
 
 
@@ -638,8 +721,11 @@ def _default_scheduler_cfg(ev_cfg: Dict[str, Any], ckpt_cfg: Dict[str, Any]) -> 
 
 def _default_early_stopping_cfg(ev_cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(ev_cfg.get("early_stopping", {}))
-    cfg.setdefault("enabled", False)
-    cfg.setdefault("patience_epochs", 20)
+    cfg.setdefault("enabled", True)
+    if "early_stopping_patience" in ev_cfg:
+        cfg["patience_epochs"] = ev_cfg["early_stopping_patience"]
+    else:
+        cfg.setdefault("patience_epochs", 6)
     return cfg
 
 
@@ -655,7 +741,7 @@ def _save_startup_artifacts(
     _write_json(
         out_dir / "class_weights.json",
         {
-            "alpha": float(cfg.get("evaluator", {}).get("class_weights", {}).get("alpha", 0.5)),
+            "alpha": resolve_class_weight_alpha(cfg.get("evaluator", {})),
             "weights": summary["class_weights"],
             "train_class_counts": summary["train_class_counts"],
         },

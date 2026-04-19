@@ -148,7 +148,6 @@ def build_evaluator_data(
     data_cfg = cfg["data"]
     ev_cfg = cfg.get("evaluator", {})
     ev_train_cfg = ev_cfg.get("training", {})
-    ev_weight_cfg = ev_cfg.get("class_weights", {})
 
     num_classes = int(
         ev_cfg.get(
@@ -160,7 +159,7 @@ def build_evaluator_data(
     if batch_size_cfg is None:
         batch_size_cfg = data_cfg.get("batch_size", 8)
     batch_size = int(batch_size_cfg)
-    alpha = float(ev_weight_cfg.get("alpha", 0.5))
+    alpha = resolve_class_weight_alpha(ev_cfg)
 
     index_path = Path(data_cfg["dataset_index"])
     split_dir = Path(data_cfg["split_dir"])
@@ -279,6 +278,15 @@ def compute_soft_class_weights(
     weights[present] = np.power(counts[present], -float(alpha))
     weights[present] /= np.mean(weights[present])
     return weights.astype(np.float32)
+
+
+def resolve_class_weight_alpha(ev_cfg: Dict[str, Any]) -> float:
+    if "class_weight_alpha" in ev_cfg:
+        return float(ev_cfg["class_weight_alpha"])
+    weight_cfg = ev_cfg.get("class_weights", {})
+    if isinstance(weight_cfg, dict) and "alpha" in weight_cfg:
+        return float(weight_cfg["alpha"])
+    return 0.7
 
 
 def bundle_summary(bundle: EvaluatorDataBundle) -> Dict[str, Any]:

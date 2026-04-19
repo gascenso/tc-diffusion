@@ -2,6 +2,9 @@ _base_: local.yaml
 
 evaluator:
   num_classes: 6
+  class_weight_alpha: 0.7
+  label_smoothing: 0.04
+  early_stopping_patience: 6
 
   model:
     image_size: 256
@@ -11,25 +14,27 @@ evaluator:
     embedding_dim: 256
     norm: "group"
     gn_groups: 8
-    dropout: 0.0
+    spatial_dropout_rate: 0.05
+    embedding_dropout_rate: 0.25
 
   class_weights:
-    alpha: 0.5
+    alpha: 0.7
 
   loss:
     lambda_cls: 1.0
     lambda_wind: 1.0
     huber_delta: 1.0
+    label_smoothing: 0.04
 
   training:
     seed: 42
-    num_epochs: 50
+    num_epochs: 27
     batch_size: 16
     lr: 3.0e-4
-    weight_decay: 1.0e-4
+    weight_decay: 5.0e-4
     log_interval_steps: 20
-    mixed_precision: false
-    jit_compile: false
+    mixed_precision: true
+    jit_compile: true
     grad_clip_norm: 1.0
     drop_remainder: false
     save_last_weights: true
@@ -54,8 +59,8 @@ evaluator:
     max_to_keep: 1
 
   early_stopping:
-    enabled: false
-    patience_epochs: 20
+    enabled: true
+    patience_epochs: 6
 
   metrics:
     tail_classes: [4, 5]
