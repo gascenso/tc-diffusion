@@ -21,7 +21,7 @@ from tqdm.auto import tqdm # type: ignore
 
 from .data import _build_aug_policy, augment_batch_x_given_y, create_dataset, ss_class_midpoint_kt
 from .model_unet import build_unet
-from .diffusion import Diffusion
+from .diffusion import Diffusion, resolve_sampling_timestep_schedule
 from .evaluation.evaluator import TCEvaluator
 from .plotting import save_image_grid
 
@@ -433,6 +433,7 @@ def _default_epoch_preview_cfg(cfg: dict) -> dict:
     preview.setdefault("seed", ev.get("seed", 123))
     preview.setdefault("sampler", ev.get("sampler", "dpmpp_2m"))
     preview.setdefault("sampling_steps", ev.get("sampling_steps", ev.get("ddim_steps", None)))
+    preview.setdefault("timestep_schedule", resolve_sampling_timestep_schedule(cfg))
     preview.setdefault("ddim_eta", ev.get("ddim_eta", 0.0))
     preview.setdefault("guidance_scale", ev.get("guidance_scale", 0.0))
     preview.setdefault("gen_batch_size", ev.get("gen_batch_size", None))
@@ -477,6 +478,7 @@ def _save_epoch_preview_samples(
     sampling_steps = preview_cfg.get("sampling_steps")
     if sampling_steps is not None:
         sampling_steps = int(sampling_steps)
+    timestep_schedule = str(preview_cfg["timestep_schedule"])
 
     gen_batch_size_cfg = preview_cfg.get("gen_batch_size")
     if gen_batch_size_cfg is None:
@@ -514,6 +516,7 @@ def _save_epoch_preview_samples(
                 guidance_scale=float(preview_cfg["guidance_scale"]),
                 sampler=str(preview_cfg["sampler"]),
                 num_sampling_steps=sampling_steps,
+                timestep_schedule=timestep_schedule,
                 ddim_eta=float(preview_cfg["ddim_eta"]),
                 return_both=True,
             )
@@ -540,6 +543,7 @@ def _save_epoch_preview_samples(
                 "seed": int(seed),
                 "sampler": str(preview_cfg["sampler"]),
                 "sampling_steps": sampling_steps,
+                "timestep_schedule": timestep_schedule,
                 "ddim_eta": float(preview_cfg["ddim_eta"]),
                 "guidance_scale": float(preview_cfg["guidance_scale"]),
                 "gen_batch_size": int(gen_batch_size),
@@ -1291,7 +1295,7 @@ def train(cfg, resume: bool = False):
         )
 
     model.load_weights(str(eval_weights))
-    evaluator.run(model=model, diffusion=diffusion, out_dir=out_dir, tag=tag, heavy=heavy)
+    evaluator.run(model=model, diffusion=diffusion, out_dir=out_dir, tag=tag, heavy=heavy, show_progress=True)
     print(f"  [eval] wrote eval/{tag} (heavy={heavy}) using {eval_weights.name}")
 
     return {

@@ -3,6 +3,60 @@ import numpy as np
 from tqdm.auto import tqdm
 
 
+_VALID_BETA_SCHEDULES = ("linear", "cosine")
+_VALID_TIMESTEP_SCHEDULES = ("linear", "leading", "trailing")
+_ZERO_TERMINAL_SNR_SUFFIX = "_rescaled_zero_terminal_snr"
+
+
+def _resolve_beta_schedule_spec(
+    name: str,
+    *,
+    rescale_zero_terminal_snr: bool = False,
+) -> tuple[str, bool]:
+    schedule_name = str(name).strip().lower()
+    alias_enables_rescale = False
+    if schedule_name.endswith(_ZERO_TERMINAL_SNR_SUFFIX):
+        schedule_name = schedule_name[: -len(_ZERO_TERMINAL_SNR_SUFFIX)]
+        alias_enables_rescale = True
+    if schedule_name not in _VALID_BETA_SCHEDULES:
+        supported = list(_VALID_BETA_SCHEDULES) + [
+            f"{base}{_ZERO_TERMINAL_SNR_SUFFIX}" for base in _VALID_BETA_SCHEDULES
+        ]
+        raise ValueError(
+            "Unknown beta schedule "
+            f"{name!r}. Expected one of: {', '.join(supported)}."
+        )
+    return schedule_name, bool(rescale_zero_terminal_snr or alias_enables_rescale)
+
+
+def normalize_timestep_schedule_name(name: str) -> str:
+    schedule_name = str(name).strip().lower()
+    if schedule_name == "linspace":
+        schedule_name = "linear"
+    if schedule_name not in _VALID_TIMESTEP_SCHEDULES:
+        raise ValueError(
+            "Unknown timestep schedule "
+            f"{name!r}. Expected one of: {', '.join(_VALID_TIMESTEP_SCHEDULES)}."
+        )
+    return schedule_name
+
+
+def resolve_sampling_timestep_schedule(cfg: dict) -> str:
+    sampling_cfg = cfg.get("sampling", {})
+    if isinstance(sampling_cfg, dict):
+        raw = sampling_cfg.get("timestep_schedule", None)
+        if raw is not None:
+            return normalize_timestep_schedule_name(raw)
+
+    eval_cfg = cfg.get("evaluation", {})
+    if isinstance(eval_cfg, dict):
+        raw = eval_cfg.get("timestep_schedule", None)
+        if raw is not None:
+            return normalize_timestep_schedule_name(raw)
+
+    return "linear"
+
+
 def _ss_class_midpoint_kt_scalar(ss_cat: int) -> float:
     cls = int(ss_cat)
     if cls == 0:
@@ -31,7 +85,13 @@ class Diffusion:
     """
     def __init__(self, cfg):
         self.num_steps = int(cfg["diffusion"]["num_steps"])
-        self.beta_schedule_name = cfg["diffusion"]["beta_schedule"]
+        self.beta_schedule_name, self.rescale_zero_terminal_snr = _resolve_beta_schedule_spec(
+            cfg["diffusion"]["beta_schedule"],
+            rescale_zero_terminal_snr=bool(
+                cfg["diffusion"].get("rescale_zero_terminal_snr", False)
+            ),
+        )
+        self.default_timestep_schedule_name = resolve_sampling_timestep_schedule(cfg)
         cond_cfg = cfg.get("conditioning", {})
         self.num_ss_classes = int(cond_cfg.get("num_ss_classes", 6))
         self.null_label = self.num_ss_classes  # must match model_unet.py
@@ -49,7 +109,11 @@ class Diffusion:
                 f"diffusion.min_snr_gamma must be > 0 when set, got {self.min_snr_gamma}"
             )
 
-        betas = self._make_beta_schedule(self.beta_schedule_name, self.num_steps)
+        betas = self._make_beta_schedule(
+            self.beta_schedule_name,
+            self.num_steps,
+            rescale_zero_terminal_snr=self.rescale_zero_terminal_snr,
+        )
         alphas = 1.0 - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
 
@@ -174,7 +238,77 @@ class Diffusion:
         x0_thr = tf.clip_by_value(x0, -s, s) / (s + eps)
         return x0_thr, s
 
-    def _make_beta_schedule(self, name: str, num_steps: int):
+    def _betas_for_alpha_bar(self, num_steps: int, alpha_bar_fn):
+        t = np.linspace(0.0, 1.0, num_steps + 1, dtype=np.float64)
+        alpha_bar = np.asarray(alpha_bar_fn(t), dtype=np.float64)
+        if alpha_bar.shape != (num_steps + 1,):
+            raise ValueError(
+                f"alpha_bar_fn must return shape ({num_steps + 1},), got {alpha_bar.shape}."
+            )
+        alpha_bar0 = float(alpha_bar[0])
+        if not np.isfinite(alpha_bar0) or alpha_bar0 <= 0.0:
+            raise ValueError(f"alpha_bar[0] must be finite and > 0, got {alpha_bar0}.")
+        alpha_bar = np.maximum(alpha_bar / alpha_bar0, 0.0)
+        betas = 1.0 - (alpha_bar[1:] / np.maximum(alpha_bar[:-1], 1e-12))
+        return betas.astype(np.float64, copy=False)
+
+    def _rescale_betas_zero_terminal_snr(self, betas):
+        betas = np.asarray(betas, dtype=np.float64)
+        alphas = 1.0 - betas
+        alpha_bar = np.cumprod(alphas, axis=0)
+        alpha_bar_sqrt = np.sqrt(alpha_bar)
+
+        start = float(alpha_bar_sqrt[0])
+        end = float(alpha_bar_sqrt[-1])
+        if not np.isfinite(start) or not np.isfinite(end):
+            raise ValueError("Cannot rescale betas with non-finite alpha_bar values.")
+        if start <= end:
+            raise ValueError(
+                "Zero-terminal-SNR rescaling requires alpha_bar_sqrt[0] > alpha_bar_sqrt[-1]."
+            )
+
+        alpha_bar_sqrt = alpha_bar_sqrt - end
+        alpha_bar_sqrt = alpha_bar_sqrt * (start / (start - end))
+
+        alpha_bar_rescaled = np.square(alpha_bar_sqrt)
+        alphas_rescaled = np.empty_like(alpha_bar_rescaled)
+        alphas_rescaled[0] = alpha_bar_rescaled[0]
+        alphas_rescaled[1:] = alpha_bar_rescaled[1:] / np.maximum(
+            alpha_bar_rescaled[:-1], 1e-12
+        )
+        return 1.0 - alphas_rescaled
+
+    def _validate_betas(self, betas, *, num_steps: int, schedule_name: str):
+        betas = np.asarray(betas, dtype=np.float64)
+        if betas.shape != (num_steps,):
+            raise ValueError(
+                f"{schedule_name} beta schedule must have shape ({num_steps},), got {betas.shape}."
+            )
+        if not np.all(np.isfinite(betas)):
+            raise ValueError(f"{schedule_name} beta schedule contains non-finite values.")
+        if np.any(betas <= 0.0) or np.any(betas >= 1.0):
+            raise ValueError(
+                f"{schedule_name} beta schedule must lie strictly inside (0, 1)."
+            )
+
+        alpha_bar = np.cumprod(1.0 - betas, axis=0)
+        if not np.all(np.isfinite(alpha_bar)):
+            raise ValueError(f"{schedule_name} alpha_bar contains non-finite values.")
+        if np.any(alpha_bar <= 0.0) or np.any(alpha_bar > 1.0):
+            raise ValueError(
+                f"{schedule_name} alpha_bar must stay inside (0, 1], got "
+                f"[{alpha_bar.min():.3e}, {alpha_bar.max():.3e}]."
+            )
+        if np.any(np.diff(alpha_bar) >= 0.0):
+            raise ValueError(f"{schedule_name} alpha_bar must be strictly decreasing.")
+
+    def _make_beta_schedule(
+        self,
+        name: str,
+        num_steps: int,
+        *,
+        rescale_zero_terminal_snr: bool = False,
+    ):
         """
         Create a beta schedule.
 
@@ -182,32 +316,41 @@ class Diffusion:
         - "linear": linear beta schedule (original DDPM)
         - "cosine": cosine alpha_bar schedule (Nichol & Dhariwal 2021)
         """
-        if name == "linear":
+        if num_steps <= 0:
+            raise ValueError(f"diffusion.num_steps must be >= 1, got {num_steps}.")
+
+        schedule_name, rescale_zero_terminal_snr = _resolve_beta_schedule_spec(
+            name,
+            rescale_zero_terminal_snr=rescale_zero_terminal_snr,
+        )
+
+        if schedule_name == "linear":
             beta_start = 1e-4
             beta_end = 2e-2
-            return np.linspace(beta_start, beta_end, num_steps, dtype=np.float64)
-
-        elif name == "cosine":
-            # --- cosine alpha_bar schedule (Nichol & Dhariwal, 2021) ---
+            betas = np.linspace(beta_start, beta_end, num_steps, dtype=np.float64)
+        elif schedule_name == "cosine":
             s = 0.008
-            steps = num_steps
-
-            # t in [0, T]
-            t = np.linspace(0, steps, steps + 1, dtype=np.float64) / steps
-
-            alpha_bar = np.cos(((t + s) / (1.0 + s)) * np.pi / 2.0) ** 2
-            alpha_bar = alpha_bar / alpha_bar[0]  # normalize so alpha_bar[0] = 1
-
-            # betas from alpha_bar
-            betas = 1.0 - (alpha_bar[1:] / alpha_bar[:-1])
-
-            # numerical safety
-            betas = np.clip(betas, 1e-8, 0.999)
-
-            return betas.astype(np.float64)
-
+            betas = self._betas_for_alpha_bar(
+                num_steps,
+                lambda t: np.cos(((t + s) / (1.0 + s)) * np.pi / 2.0) ** 2,
+            )
         else:
-            raise ValueError(f"Unknown beta schedule: {name}")
+            raise ValueError(f"Unknown beta schedule: {schedule_name}")
+
+        if rescale_zero_terminal_snr:
+            betas = self._rescale_betas_zero_terminal_snr(betas)
+
+        betas = np.clip(betas, 1e-8, 0.999).astype(np.float64, copy=False)
+        self._validate_betas(
+            betas,
+            num_steps=num_steps,
+            schedule_name=(
+                f"{schedule_name}{_ZERO_TERMINAL_SNR_SUFFIX}"
+                if rescale_zero_terminal_snr
+                else schedule_name
+            ),
+        )
+        return betas
 
     # --- for training ---
     def q_sample(self, x0, t, noise):
@@ -489,7 +632,43 @@ class Diffusion:
         )
         return x_prev, x0_pred
 
-    def _build_sampling_timesteps(self, num_sampling_steps, *, sampler_name: str):
+    def _validate_sampling_timesteps(
+        self,
+        timesteps,
+        *,
+        sampler_name: str,
+        schedule_name: str,
+        expected_steps: int,
+    ):
+        timesteps = np.asarray(timesteps, dtype=np.int32)
+        if timesteps.shape != (expected_steps,):
+            raise ValueError(
+                f"{sampler_name.upper()} {schedule_name} timestep schedule must have "
+                f"shape ({expected_steps},), got {timesteps.shape}."
+            )
+        if np.any(timesteps < 0) or np.any(timesteps >= self.num_steps):
+            raise ValueError(
+                f"{sampler_name.upper()} {schedule_name} timestep schedule produced "
+                f"indices outside [0, {self.num_steps - 1}]."
+            )
+        if timesteps.size > 1 and np.any(np.diff(timesteps) >= 0):
+            raise ValueError(
+                f"{sampler_name.upper()} {schedule_name} timestep schedule must be "
+                "strictly decreasing."
+            )
+        if timesteps.size > 1 and len(np.unique(timesteps)) != timesteps.size:
+            raise ValueError(
+                f"{sampler_name.upper()} {schedule_name} timestep schedule contains duplicates."
+            )
+        return list(timesteps.tolist())
+
+    def _build_sampling_timesteps(
+        self,
+        num_sampling_steps,
+        *,
+        sampler_name: str,
+        timestep_schedule: str | None = None,
+    ):
         if num_sampling_steps is None:
             steps = self.num_steps
         else:
@@ -498,9 +677,36 @@ class Diffusion:
             raise ValueError(
                 f"{sampler_name.upper()} num_sampling_steps must be in [1, {self.num_steps}], got {steps}."
             )
-        schedule = np.round(np.linspace(0, self.num_steps - 1, steps)).astype(np.int32)
-        schedule = np.unique(schedule)
-        return list(schedule[::-1])
+
+        schedule_name = normalize_timestep_schedule_name(
+            self.default_timestep_schedule_name if timestep_schedule is None else timestep_schedule
+        )
+        if steps == self.num_steps:
+            return list(range(self.num_steps - 1, -1, -1))
+        if steps == 1:
+            return [self.num_steps - 1]
+
+        if schedule_name == "linear":
+            schedule = np.round(
+                np.linspace(0, self.num_steps - 1, steps, dtype=np.float64)
+            ).astype(np.int32)[::-1]
+        elif schedule_name == "leading":
+            step_ratio = self.num_steps // steps
+            schedule = (
+                np.arange(0, steps, dtype=np.int32) * np.int32(step_ratio)
+            )[::-1]
+        else:
+            step_ratio = float(self.num_steps) / float(steps)
+            schedule = np.round(
+                np.arange(steps, 0, -1, dtype=np.float64) * step_ratio
+            ).astype(np.int32) - 1
+
+        return self._validate_sampling_timesteps(
+            schedule,
+            sampler_name=sampler_name,
+            schedule_name=schedule_name,
+            expected_steps=steps,
+        )
 
     def sample(
         self,
@@ -513,6 +719,7 @@ class Diffusion:
         guidance_scale=0.0,
         sampler: str = "dpmpp_2m",
         num_sampling_steps: int | None = None,
+        timestep_schedule: str | None = None,
         ddim_eta: float = 0.0,
         return_both: bool = False,
     ):
@@ -523,6 +730,8 @@ class Diffusion:
         wind_value_kt: optional wind conditioning value. If None, uses class midpoint.
         sampler: reverse-process sampler to use. Supported: "ddpm", "ddim", "dpmpp_2m".
         num_sampling_steps: optional number of inference steps for DDIM / DPM-Solver++(2M).
+        timestep_schedule: optional reduced-step timestep spacing. Supported:
+                           "linear", "leading", "trailing".
         ddim_eta: DDIM stochasticity. 0.0 is deterministic DDIM.
         return_both: if True, return both the post-threshold raw final sample and
                      a hard-clipped sibling for diagnostic use.
@@ -571,6 +780,7 @@ class Diffusion:
             timesteps = self._build_sampling_timesteps(
                 num_sampling_steps,
                 sampler_name=sampler_name,
+                timestep_schedule=timestep_schedule,
             )
 
         t_iter = timesteps

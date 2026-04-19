@@ -25,6 +25,7 @@ from .metrics import (
 )
 from .plots import plot_hist_overlay, plot_psd, plot_radial_profiles
 from ..data import build_data_backend, load_dataset_index, load_split_file_set
+from ..diffusion import resolve_sampling_timestep_schedule
 from ..plotting import save_real_generated_comparison_grid
 
 
@@ -95,6 +96,7 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ev.setdefault("guidance_scale", 0.0)
     ev.setdefault("sampler", "dpmpp_2m")
     ev.setdefault("sampling_steps", 25)
+    ev.setdefault("timestep_schedule", resolve_sampling_timestep_schedule(cfg))
     ev.setdefault("ddim_steps", None)
     ev.setdefault("ddim_eta", 0.0)
     ev.setdefault("seed", 123)
@@ -785,6 +787,7 @@ class TCEvaluator:
                     guidance_scale=float(ev["guidance_scale"]),
                     sampler=str(ev["sampler"]),
                     num_sampling_steps=sampling_steps,
+                    timestep_schedule=str(ev["timestep_schedule"]),
                     ddim_eta=float(ev.get("ddim_eta", 0.0)),
                     show_progress=show_progress,
                     return_both=True,
@@ -927,6 +930,7 @@ class TCEvaluator:
                 "sampler": str(ev["sampler"]),
                 "guidance_scale": float(ev["guidance_scale"]),
                 "sampling_steps": ev.get("sampling_steps", ev.get("ddim_steps", None)),
+                "timestep_schedule": str(ev["timestep_schedule"]),
                 "ddim_eta": float(ev.get("ddim_eta", 0.0)),
             },
             "bootstrap": {

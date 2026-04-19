@@ -14,7 +14,7 @@ import tensorflow as tf
 
 from tc_diffusion.config import load_config
 from tc_diffusion.model_unet import build_unet
-from tc_diffusion.diffusion import Diffusion
+from tc_diffusion.diffusion import Diffusion, resolve_sampling_timestep_schedule
 from tc_diffusion.plotting import save_image_grid
 
 
@@ -151,6 +151,7 @@ if __name__ == "__main__":
         if args.sampling_steps is not None
         else eval_cfg.get("sampling_steps", eval_cfg.get("ddim_steps", None))
     )
+    timestep_schedule = resolve_sampling_timestep_schedule(cfg)
     ddim_eta = (
         float(args.ddim_eta)
         if args.ddim_eta is not None
@@ -167,6 +168,7 @@ if __name__ == "__main__":
         guidance_scale=args.guidance_scale,
         sampler=sampler,
         num_sampling_steps=sampling_steps,
+        timestep_schedule=timestep_schedule,
         ddim_eta=ddim_eta,
         return_both=True,
     )

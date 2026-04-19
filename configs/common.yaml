@@ -54,6 +54,7 @@ model:
 diffusion:
   num_steps: 1000
   beta_schedule: "linear"
+  rescale_zero_terminal_snr: false
   loss_type: "v_mse"
   min_snr_gamma: 2.5
   dynamic_threshold: true
@@ -104,6 +105,7 @@ evaluation:
   guidance_scale: 2.5
   sampler: "dpmpp_2m"    # "ddpm" | "ddim" | "dpmpp_2m"
   sampling_steps: 100     # used by DDIM / DPM++ 2M; DDPM ignores it
+  timestep_schedule: "linear"  # "linear" | "leading" | "trailing"
   ddim_steps: null       # legacy alias for sampling_steps
   ddim_eta: 0.0          # 0.0 -> deterministic DDIM
   seed: 123
