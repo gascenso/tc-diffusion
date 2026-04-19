@@ -1,0 +1,61 @@
+_base_: local.yaml
+
+evaluator:
+  num_classes: 6
+
+  model:
+    image_size: 256
+    input_shape: [256, 256, 1]
+    stage_channels: [32, 64, 128, 256]
+    blocks_per_stage: 2
+    embedding_dim: 256
+    norm: "group"
+    gn_groups: 8
+    dropout: 0.0
+
+  class_weights:
+    alpha: 0.5
+
+  loss:
+    lambda_cls: 1.0
+    lambda_wind: 1.0
+    huber_delta: 1.0
+
+  training:
+    seed: 42
+    num_epochs: 50
+    batch_size: 16
+    lr: 3.0e-4
+    weight_decay: 1.0e-4
+    log_interval_steps: 20
+    mixed_precision: false
+    jit_compile: false
+    grad_clip_norm: 1.0
+    drop_remainder: false
+    save_last_weights: true
+    max_train_batches: null
+
+  validation:
+    max_batches: null
+    show_progress: false
+
+  reduce_lr_on_plateau:
+    enabled: true
+    factor: 0.5
+    patience_epochs: 5
+    min_delta: 1.0e-4
+    min_lr: 1.0e-6
+    cooldown_epochs: 0
+
+  checkpoint:
+    monitor: "selection.tail_score"
+    mode: "min"
+    min_delta: 1.0e-6
+    max_to_keep: 1
+
+  early_stopping:
+    enabled: false
+    patience_epochs: 20
+
+  metrics:
+    tail_classes: [4, 5]
