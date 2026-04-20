@@ -45,6 +45,7 @@ class WindStandardizer:
 class EvaluatorSplit:
     name: str
     rel_paths: Tuple[str, ...]
+    raw_labels: np.ndarray
     labels: np.ndarray
     wind_kt: np.ndarray
     wind_z: np.ndarray
@@ -64,7 +65,10 @@ class EvaluatorDataBundle:
     backend: Any
     bt_range: Tuple[float, float]
     batch_size: int
+    label_scheme: str
+    raw_num_classes: int
     num_classes: int
+    raw_class_names: Dict[int, str]
     class_names: Dict[int, str]
     class_weights: np.ndarray
     train_class_counts: np.ndarray
@@ -87,6 +91,15 @@ class EvaluatorDataBundle:
 class EvaluatorSamplerConfig:
     mode: str = "natural"
     strength: float = 0.0
+
+
+@dataclass(frozen=True)
+class EvaluatorLabelScheme:
+    name: str
+    raw_num_classes: int
+    num_classes: int
+    raw_to_eval: Tuple[int, ...]
+    class_names: Dict[int, str]
 
 
 class NaturalEvaluatorBatchDataset:
@@ -142,6 +155,10 @@ class NaturalEvaluatorBatchDataset:
             bt = _ensure_channel_axis(bt).astype(np.float32, copy=False)
             targets = {
                 "class": self.split.labels[batch_idx].astype(np.int32, copy=False),
+                "raw_class": self.split.raw_labels[batch_idx].astype(
+                    np.int32,
+                    copy=False,
+                ),
                 "wind_z": self.split.wind_z[batch_idx].astype(np.float32, copy=False),
                 "wind_kt": self.split.wind_kt[batch_idx].astype(np.float32, copy=False),
                 "sample_weight": self.split.sample_weight[batch_idx].astype(
@@ -230,6 +247,10 @@ class MildRebalancedEvaluatorBatchDataset(NaturalEvaluatorBatchDataset):
             bt = _ensure_channel_axis(bt).astype(np.float32, copy=False)
             targets = {
                 "class": self.split.labels[batch_idx].astype(np.int32, copy=False),
+                "raw_class": self.split.raw_labels[batch_idx].astype(
+                    np.int32,
+                    copy=False,
+                ),
                 "wind_z": self.split.wind_z[batch_idx].astype(np.float32, copy=False),
                 "wind_kt": self.split.wind_kt[batch_idx].astype(np.float32, copy=False),
                 "sample_weight": self.split.sample_weight[batch_idx].astype(
@@ -249,12 +270,7 @@ def build_evaluator_data(
     ev_cfg = cfg.get("evaluator", {})
     ev_train_cfg = ev_cfg.get("training", {})
 
-    num_classes = int(
-        ev_cfg.get(
-            "num_classes",
-            cfg.get("conditioning", {}).get("num_ss_classes", 6),
-        )
-    )
+    raw_num_classes = resolve_raw_num_classes(cfg)
     batch_size_cfg = ev_train_cfg.get("batch_size")
     if batch_size_cfg is None:
         batch_size_cfg = data_cfg.get("batch_size", 8)
@@ -270,16 +286,30 @@ def build_evaluator_data(
         index_path,
         return_sample_meta=True,
     )
-    class_names = _load_class_names(index_path=index_path, num_classes=num_classes)
+    raw_class_names = _load_class_names(
+        index_path=index_path,
+        num_classes=raw_num_classes,
+    )
+    label_scheme = build_evaluator_label_scheme(
+        cfg,
+        raw_class_names=raw_class_names,
+    )
+    num_classes = label_scheme.num_classes
 
     raw_splits: Dict[str, Dict[str, Any]] = {}
     for split_name in _dedupe_preserve_order(("train", *splits)):
-        rel_paths, labels, wind_kt, n_fallback = _load_split_targets(
+        rel_paths, raw_labels, wind_kt, n_fallback = _load_split_targets(
             split_name=split_name,
             split_dir=split_dir,
             class_to_files=class_to_files,
             sample_meta=sample_meta,
         )
+        _validate_labels(
+            raw_labels,
+            num_classes=raw_num_classes,
+            split_name=f"{split_name} raw",
+        )
+        labels = map_raw_labels_to_evaluator(raw_labels, label_scheme)
         _validate_labels(labels, num_classes=num_classes, split_name=split_name)
         if rel_paths and n_fallback == len(rel_paths):
             raise RuntimeError(
@@ -289,6 +319,7 @@ def build_evaluator_data(
             )
         raw_splits[split_name] = {
             "rel_paths": rel_paths,
+            "raw_labels": raw_labels,
             "labels": labels,
             "wind_kt": wind_kt,
             "fallbacks": int(n_fallback),
@@ -306,11 +337,13 @@ def build_evaluator_data(
 
     split_objs: Dict[str, EvaluatorSplit] = {}
     for split_name, raw in raw_splits.items():
+        raw_labels = raw["raw_labels"]
         labels = raw["labels"]
         wind_kt = raw["wind_kt"]
         split_objs[split_name] = EvaluatorSplit(
             name=split_name,
             rel_paths=tuple(raw["rel_paths"]),
+            raw_labels=raw_labels,
             labels=labels,
             wind_kt=wind_kt,
             wind_z=wind.transform(wind_kt),
@@ -322,8 +355,11 @@ def build_evaluator_data(
         backend=backend,
         bt_range=bt_range,
         batch_size=batch_size,
+        label_scheme=label_scheme.name,
+        raw_num_classes=raw_num_classes,
         num_classes=num_classes,
-        class_names=class_names,
+        raw_class_names=raw_class_names,
+        class_names=label_scheme.class_names,
         class_weights=class_weights,
         train_class_counts=class_counts,
         wind=wind,
@@ -404,6 +440,105 @@ def resolve_class_weight_alpha(ev_cfg: Dict[str, Any]) -> float:
     if isinstance(weight_cfg, dict) and "alpha" in weight_cfg:
         return float(weight_cfg["alpha"])
     return 0.7
+
+
+def resolve_label_scheme_name(ev_cfg: Dict[str, Any]) -> str:
+    raw = ev_cfg.get("label_scheme", ev_cfg.get("class_scheme", "native"))
+    name = str(raw).strip().lower()
+    aliases = {
+        "native": "native",
+        "ss": "native",
+        "saffir_simpson": "native",
+        "cat4plus": "cat4plus",
+        "cat4+": "cat4plus",
+        "merge_cat45": "cat4plus",
+        "merged_cat45": "cat4plus",
+    }
+    if name not in aliases:
+        raise ValueError(
+            f"Unsupported evaluator.label_scheme={raw!r}; expected 'native' or 'cat4plus'."
+        )
+    return aliases[name]
+
+
+def resolve_raw_num_classes(cfg: Dict[str, Any]) -> int:
+    ev_cfg = cfg.get("evaluator", {})
+    if "raw_num_classes" in ev_cfg:
+        return int(ev_cfg["raw_num_classes"])
+    return int(cfg.get("conditioning", {}).get("num_ss_classes", 6))
+
+
+def resolve_evaluator_num_classes(cfg: Dict[str, Any]) -> int:
+    ev_cfg = cfg.get("evaluator", {})
+    if resolve_label_scheme_name(ev_cfg) == "cat4plus":
+        return 5
+    model_cfg = ev_cfg.get("model", {})
+    if isinstance(model_cfg, dict) and "num_classes" in model_cfg:
+        return int(model_cfg["num_classes"])
+    if "num_classes" in ev_cfg:
+        return int(ev_cfg["num_classes"])
+    return resolve_raw_num_classes(cfg)
+
+
+def build_evaluator_label_scheme(
+    cfg: Dict[str, Any],
+    *,
+    raw_class_names: Dict[int, str],
+) -> EvaluatorLabelScheme:
+    raw_num_classes = resolve_raw_num_classes(cfg)
+    name = resolve_label_scheme_name(cfg.get("evaluator", {}))
+    if name == "native":
+        num_classes = resolve_evaluator_num_classes(cfg)
+        raw_to_eval = tuple(range(raw_num_classes))
+        class_names = {
+            c: raw_class_names.get(c, f"class_{c}") for c in range(num_classes)
+        }
+        return EvaluatorLabelScheme(
+            name=name,
+            raw_num_classes=raw_num_classes,
+            num_classes=num_classes,
+            raw_to_eval=raw_to_eval,
+            class_names=class_names,
+        )
+
+    if name == "cat4plus":
+        if raw_num_classes < 6:
+            raise ValueError(
+                "evaluator.label_scheme='cat4plus' expects raw Saffir-Simpson "
+                f"classes 0..5, but raw_num_classes={raw_num_classes}."
+            )
+        raw_to_eval = tuple(4 if c >= 4 else c for c in range(raw_num_classes))
+        class_names = {
+            0: raw_class_names.get(0, "Tropical Storm"),
+            1: raw_class_names.get(1, "Category 1"),
+            2: raw_class_names.get(2, "Category 2"),
+            3: raw_class_names.get(3, "Category 3"),
+            4: "Category 4+ (Cat 4-5, >=113 kt)",
+        }
+        return EvaluatorLabelScheme(
+            name=name,
+            raw_num_classes=raw_num_classes,
+            num_classes=5,
+            raw_to_eval=raw_to_eval,
+            class_names=class_names,
+        )
+
+    raise AssertionError(f"Unhandled evaluator label scheme: {name}")
+
+
+def map_raw_labels_to_evaluator(
+    raw_labels: np.ndarray,
+    scheme: EvaluatorLabelScheme,
+) -> np.ndarray:
+    raw = np.asarray(raw_labels, dtype=np.int64)
+    mapping = np.asarray(scheme.raw_to_eval, dtype=np.int32)
+    bad = raw[(raw < 0) | (raw >= mapping.shape[0])]
+    if bad.size:
+        uniq = sorted({int(x) for x in bad.tolist()})
+        raise ValueError(
+            f"Raw labels outside evaluator label mapping for scheme {scheme.name!r}: {uniq}"
+        )
+    return mapping[raw].astype(np.int32)
 
 
 def resolve_sampler_config(ev_cfg: Dict[str, Any]) -> EvaluatorSamplerConfig:
@@ -520,7 +655,10 @@ def bundle_summary(bundle: EvaluatorDataBundle) -> Dict[str, Any]:
         "backend": getattr(bundle.backend, "name", type(bundle.backend).__name__),
         "bt_range": [float(bundle.bt_range[0]), float(bundle.bt_range[1])],
         "batch_size": int(bundle.batch_size),
+        "label_scheme": str(bundle.label_scheme),
+        "raw_num_classes": int(bundle.raw_num_classes),
         "num_classes": int(bundle.num_classes),
+        "raw_class_names": {str(k): v for k, v in sorted(bundle.raw_class_names.items())},
         "class_names": {str(k): v for k, v in sorted(bundle.class_names.items())},
         "train_class_counts": {
             str(i): int(v) for i, v in enumerate(bundle.train_class_counts.tolist())
@@ -536,6 +674,15 @@ def bundle_summary(bundle: EvaluatorDataBundle) -> Dict[str, Any]:
                     str(i): int(v)
                     for i, v in enumerate(
                         split.class_counts(bundle.num_classes).tolist()
+                    )
+                },
+                "raw_class_counts": {
+                    str(i): int(v)
+                    for i, v in enumerate(
+                        np.bincount(
+                            split.raw_labels,
+                            minlength=bundle.raw_num_classes,
+                        ).astype(np.int64).tolist()
                     )
                 },
                 "wind_metadata_fallbacks": int(split.wind_metadata_fallbacks),

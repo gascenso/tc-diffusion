@@ -1,7 +1,9 @@
 _base_: local.yaml
 
 evaluator:
-  num_classes: 6
+  raw_num_classes: 6
+  num_classes: 5
+  label_scheme: "cat4plus"
   class_weight_alpha: 0.7
   label_smoothing: 0.04
   early_stopping_patience: 6
@@ -67,4 +69,4 @@ evaluator:
     patience_epochs: 6
 
   metrics:
-    tail_classes: [4, 5]
+    tail_classes: [4]

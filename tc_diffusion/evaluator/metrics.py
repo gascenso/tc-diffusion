@@ -182,6 +182,21 @@ def tail_report(
             str(strongest_class)
         )
 
+    if 4 < int(num_classes) and 5 >= int(num_classes):
+        cat4plus = (4,)
+        mask = np.isin(labels, cat4plus)
+        pred_tail = np.isin(preds, cat4plus)
+        err = wind_pred_kt.astype(np.float64) - wind_true_kt.astype(np.float64)
+        abs_err = np.abs(err)
+        n = int(np.sum(mask))
+        out["cat4plus"] = {
+            "classes": [4],
+            "n": n,
+            "mae_kt": float(np.mean(abs_err[mask])) if n > 0 else None,
+            "bias_kt": float(np.mean(err[mask])) if n > 0 else None,
+            "combined_recall": float(np.sum(mask & pred_tail) / n) if n > 0 else None,
+        }
+
     if 4 < int(num_classes) and 5 < int(num_classes):
         cat45 = (4, 5)
         mask = np.isin(labels, cat45)
@@ -208,15 +223,21 @@ def selection_report(
     wind_std_kt: float,
 ) -> Dict[str, Any]:
     std = max(float(wind_std_kt), 1.0e-6)
-    cat45 = tail.get("cat45")
-    if isinstance(cat45, dict) and cat45.get("n", 0) > 0:
-        mae = cat45.get("mae_kt")
-        recall = cat45.get("combined_recall")
-        source = "cat45"
+    cat4plus = tail.get("cat4plus")
+    if isinstance(cat4plus, dict) and cat4plus.get("n", 0) > 0:
+        mae = cat4plus.get("mae_kt")
+        recall = cat4plus.get("combined_recall")
+        source = "cat4plus"
     else:
-        mae = regression.get("mae_kt")
-        recall = classification.get("balanced_accuracy")
-        source = "overall_fallback"
+        cat45 = tail.get("cat45")
+        if isinstance(cat45, dict) and cat45.get("n", 0) > 0:
+            mae = cat45.get("mae_kt")
+            recall = cat45.get("combined_recall")
+            source = "cat45"
+        else:
+            mae = regression.get("mae_kt")
+            recall = classification.get("balanced_accuracy")
+            source = "overall_fallback"
 
     mae_term = 1.0 if mae is None else float(mae) / std
     recall_term = 1.0 if recall is None else 1.0 - float(recall)

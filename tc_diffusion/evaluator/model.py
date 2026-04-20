@@ -6,6 +6,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
+from .data import resolve_evaluator_num_classes
 from ..model_unet import GroupNorm
 
 
@@ -16,15 +17,7 @@ def build_evaluator_model(cfg: Dict[str, Any]) -> keras.Model:
 
     image_size = int(model_cfg.get("image_size", data_cfg.get("image_size", 256)))
     input_shape = tuple(model_cfg.get("input_shape", [image_size, image_size, 1]))
-    num_classes = int(
-        model_cfg.get(
-            "num_classes",
-            ev_cfg.get(
-                "num_classes",
-                cfg.get("conditioning", {}).get("num_ss_classes", 6),
-            ),
-        )
-    )
+    num_classes = resolve_evaluator_num_classes(cfg)
     stage_channels = tuple(int(c) for c in model_cfg.get("stage_channels", [32, 64, 128, 256]))
     blocks_per_stage = int(model_cfg.get("blocks_per_stage", 2))
     embedding_dim = int(model_cfg.get("embedding_dim", 256))

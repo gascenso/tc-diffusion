@@ -673,6 +673,15 @@ def _format_tail_summary(report: Dict[str, Any]) -> str:
     cls = report.get("classification", {})
     tail = report.get("tail", {})
     per_class = cls.get("per_class", {})
+    cat4plus = tail.get("cat4plus", {}) if isinstance(tail.get("cat4plus"), dict) else {}
+    if cat4plus:
+        return (
+            f"cat4plus_rec={_fmt(_nested(per_class, '4', 'recall'))}, "
+            f"cat4plus_combined_rec={_fmt(cat4plus.get('combined_recall'))}, "
+            f"cat4plus_mae={_fmt(cat4plus.get('mae_kt'))} kt, "
+            f"cat4plus_bias={_fmt(cat4plus.get('bias_kt'))} kt"
+        )
+
     cat45 = tail.get("cat45", {}) if isinstance(tail.get("cat45"), dict) else {}
     return (
         f"cat4_rec={_fmt(_nested(per_class, '4', 'recall'))}, "
@@ -812,6 +821,8 @@ def _print_data_summary(bundle: EvaluatorDataBundle):
     print(
         "[evaluator:data] "
         f"backend={getattr(bundle.backend, 'name', type(bundle.backend).__name__)}, "
+        f"label_scheme={bundle.label_scheme}, "
+        f"classes={bundle.num_classes} (raw={bundle.raw_num_classes}), "
         f"train={bundle.train.size}, val={bundle.val.size}, "
         f"wind_mean={bundle.wind.mean_kt:.3f} kt, wind_std={bundle.wind.std_kt:.3f} kt"
     )
