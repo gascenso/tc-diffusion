@@ -83,6 +83,12 @@ class EvaluatorDataBundle:
         return self.splits[str(name)]
 
 
+@dataclass(frozen=True)
+class EvaluatorSamplerConfig:
+    mode: str = "natural"
+    strength: float = 0.0
+
+
 class NaturalEvaluatorBatchDataset:
     """Finite natural-order/shuffled batches for supervised evaluator training."""
 
@@ -93,6 +99,7 @@ class NaturalEvaluatorBatchDataset:
         backend: Any,
         bt_range: Tuple[float, float],
         batch_size: int,
+        num_classes: int,
         shuffle: bool,
         seed: int,
         drop_remainder: bool = False,
@@ -103,10 +110,15 @@ class NaturalEvaluatorBatchDataset:
         self.backend = backend
         self.bt_range = (float(bt_range[0]), float(bt_range[1]))
         self.batch_size = int(batch_size)
+        self.num_classes = int(num_classes)
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.drop_remainder = bool(drop_remainder)
         self._epoch_index = 0
+        self.sampler_config = EvaluatorSamplerConfig(mode="natural", strength=0.0)
+        self.class_probabilities = empirical_class_probabilities(
+            split.class_counts(self.num_classes)
+        )
 
     def __len__(self) -> int:
         if self.drop_remainder:
@@ -124,6 +136,94 @@ class NaturalEvaluatorBatchDataset:
             batch_idx = idx[start : start + self.batch_size]
             if self.drop_remainder and batch_idx.shape[0] < self.batch_size:
                 break
+            rel_paths = [self.split.rel_paths[int(i)] for i in batch_idx]
+            bt = self.backend.load_bt_batch(rel_paths)
+            bt = preprocess_bt(bt, self.bt_range)
+            bt = _ensure_channel_axis(bt).astype(np.float32, copy=False)
+            targets = {
+                "class": self.split.labels[batch_idx].astype(np.int32, copy=False),
+                "wind_z": self.split.wind_z[batch_idx].astype(np.float32, copy=False),
+                "wind_kt": self.split.wind_kt[batch_idx].astype(np.float32, copy=False),
+                "sample_weight": self.split.sample_weight[batch_idx].astype(
+                    np.float32,
+                    copy=False,
+                ),
+            }
+            yield bt, targets
+
+    def num_samples_for_batches(self, max_batches: int | None = None) -> int:
+        n_batches = len(self)
+        if max_batches is not None:
+            n_batches = min(n_batches, max(0, int(max_batches)))
+        if n_batches <= 0:
+            return 0
+        if self.drop_remainder:
+            return int(n_batches * self.batch_size)
+        if n_batches >= len(self):
+            return int(self.split.size)
+        return int(n_batches * self.batch_size)
+
+    def describe_sampler(self) -> Dict[str, Any]:
+        return sampler_description(
+            mode=self.sampler_config.mode,
+            strength=self.sampler_config.strength,
+            probabilities=self.class_probabilities,
+            class_counts=self.split.class_counts(self.num_classes),
+        )
+
+
+class MildRebalancedEvaluatorBatchDataset(NaturalEvaluatorBatchDataset):
+    """Finite replacement sampler with class probabilities mildly shifted to tails.
+
+    The class law is p_c proportional to empirical_p_c ** (1 - strength).
+    strength=0 reproduces natural sampling; strength=1 is flat over present
+    classes.  This is intentionally simple and mild by default.
+    """
+
+    def __init__(
+        self,
+        *,
+        sampler_config: EvaluatorSamplerConfig,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.sampler_config = sampler_config
+        self.class_probabilities = compute_sampler_class_probabilities(
+            counts=self.split.class_counts(self.num_classes),
+            mode=sampler_config.mode,
+            strength=sampler_config.strength,
+        )
+        self.classes = np.flatnonzero(self.class_probabilities > 0.0).astype(np.int64)
+        if self.classes.size == 0:
+            raise ValueError("Mild rebalanced sampler found no present classes.")
+        self.class_probs_present = self.class_probabilities[self.classes]
+        self.class_probs_present = self.class_probs_present / np.sum(
+            self.class_probs_present
+        )
+        self.indices_by_class = {
+            int(c): np.flatnonzero(self.split.labels == int(c)).astype(np.int64)
+            for c in self.classes.tolist()
+        }
+
+    def __iter__(self) -> Iterator[Tuple[np.ndarray, Dict[str, np.ndarray]]]:
+        rng = np.random.default_rng(self.seed + self._epoch_index)
+        self._epoch_index += 1
+
+        for start in range(0, self.split.size, self.batch_size):
+            size = min(self.batch_size, self.split.size - start)
+            if self.drop_remainder and size < self.batch_size:
+                break
+            sampled_classes = rng.choice(
+                self.classes,
+                size=size,
+                replace=True,
+                p=self.class_probs_present,
+            )
+            batch_idx = np.empty((size,), dtype=np.int64)
+            for pos, cls in enumerate(sampled_classes.tolist()):
+                candidates = self.indices_by_class[int(cls)]
+                batch_idx[pos] = int(rng.choice(candidates))
+
             rel_paths = [self.split.rel_paths[int(i)] for i in batch_idx]
             bt = self.backend.load_bt_batch(rel_paths)
             bt = preprocess_bt(bt, self.bt_range)
@@ -238,15 +338,32 @@ def make_batch_dataset(
     shuffle: bool,
     seed: int,
     drop_remainder: bool = False,
+    sampler_config: EvaluatorSamplerConfig | None = None,
 ) -> NaturalEvaluatorBatchDataset:
+    sampler_config = sampler_config or EvaluatorSamplerConfig()
+    mode = str(sampler_config.mode).strip().lower()
+    kwargs = {
+        "split": bundle.split(split_name),
+        "backend": bundle.backend,
+        "bt_range": bundle.bt_range,
+        "batch_size": bundle.batch_size,
+        "num_classes": bundle.num_classes,
+        "shuffle": shuffle,
+        "seed": seed,
+        "drop_remainder": drop_remainder,
+    }
+    if split_name == "train" and mode == "mild_rebalanced":
+        return MildRebalancedEvaluatorBatchDataset(
+            sampler_config=sampler_config,
+            **kwargs,
+        )
+    if mode != "natural" and split_name == "train":
+        raise ValueError(
+            f"Unsupported evaluator sampler mode '{sampler_config.mode}'. "
+            "Expected 'natural' or 'mild_rebalanced'."
+        )
     return NaturalEvaluatorBatchDataset(
-        split=bundle.split(split_name),
-        backend=bundle.backend,
-        bt_range=bundle.bt_range,
-        batch_size=bundle.batch_size,
-        shuffle=shuffle,
-        seed=seed,
-        drop_remainder=drop_remainder,
+        **kwargs,
     )
 
 
@@ -287,6 +404,115 @@ def resolve_class_weight_alpha(ev_cfg: Dict[str, Any]) -> float:
     if isinstance(weight_cfg, dict) and "alpha" in weight_cfg:
         return float(weight_cfg["alpha"])
     return 0.7
+
+
+def resolve_sampler_config(ev_cfg: Dict[str, Any]) -> EvaluatorSamplerConfig:
+    sampler_cfg = ev_cfg.get("sampler", {})
+    if sampler_cfg is None:
+        sampler_cfg = {}
+    if not isinstance(sampler_cfg, dict):
+        raise ValueError("evaluator.sampler must be a mapping when set.")
+
+    mode = str(sampler_cfg.get("mode", ev_cfg.get("sampler_mode", "natural"))).strip().lower()
+    default_strength = 0.35 if mode == "mild_rebalanced" else 0.0
+    strength = float(
+        sampler_cfg.get("strength", ev_cfg.get("sampler_strength", default_strength))
+    )
+    if mode not in {"natural", "mild_rebalanced"}:
+        raise ValueError(
+            f"Unsupported evaluator.sampler.mode={mode!r}; expected 'natural' or 'mild_rebalanced'."
+        )
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError(f"evaluator.sampler.strength must be in [0, 1], got {strength}")
+    if mode == "natural":
+        strength = 0.0
+    return EvaluatorSamplerConfig(mode=mode, strength=strength)
+
+
+def empirical_class_probabilities(counts: np.ndarray) -> np.ndarray:
+    counts = np.asarray(counts, dtype=np.float64)
+    total = float(np.sum(counts))
+    if total <= 0.0:
+        raise ValueError("Cannot compute empirical class probabilities from empty counts.")
+    return (counts / total).astype(np.float64)
+
+
+def compute_sampler_class_probabilities(
+    *,
+    counts: np.ndarray,
+    mode: str,
+    strength: float,
+) -> np.ndarray:
+    counts = np.asarray(counts, dtype=np.float64)
+    present = counts > 0.0
+    if not np.any(present):
+        raise ValueError("Cannot compute sampler probabilities from empty counts.")
+
+    empirical = empirical_class_probabilities(counts)
+    mode = str(mode).strip().lower()
+    if mode == "natural":
+        return empirical
+    if mode != "mild_rebalanced":
+        raise ValueError(
+            f"Unsupported sampler mode '{mode}'. Expected 'natural' or 'mild_rebalanced'."
+        )
+
+    strength = float(strength)
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError(f"Sampler strength must be in [0, 1], got {strength}")
+    exponent = 1.0 - strength
+    probs = np.zeros_like(empirical, dtype=np.float64)
+    probs[present] = np.power(empirical[present], exponent)
+    probs[present] /= np.sum(probs[present])
+    return probs
+
+
+def sampler_description(
+    *,
+    mode: str,
+    strength: float,
+    probabilities: np.ndarray,
+    class_counts: np.ndarray,
+) -> Dict[str, Any]:
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    class_counts = np.asarray(class_counts, dtype=np.int64)
+    empirical = empirical_class_probabilities(class_counts)
+    return {
+        "mode": str(mode),
+        "strength": float(strength),
+        "class_probabilities": {
+            str(i): float(v) for i, v in enumerate(probabilities.tolist())
+        },
+        "natural_class_probabilities": {
+            str(i): float(v) for i, v in enumerate(empirical.tolist())
+        },
+        "class_probability_ratio_vs_natural": {
+            str(i): (
+                None
+                if float(empirical[i]) <= 0.0
+                else float(probabilities[i] / empirical[i])
+            )
+            for i in range(int(probabilities.shape[0]))
+        },
+    }
+
+
+def build_sampler_summary(
+    cfg: Dict[str, Any],
+    bundle: EvaluatorDataBundle,
+) -> Dict[str, Any]:
+    sampler_config = resolve_sampler_config(cfg.get("evaluator", {}))
+    probabilities = compute_sampler_class_probabilities(
+        counts=bundle.train_class_counts,
+        mode=sampler_config.mode,
+        strength=sampler_config.strength,
+    )
+    return sampler_description(
+        mode=sampler_config.mode,
+        strength=sampler_config.strength,
+        probabilities=probabilities,
+        class_counts=bundle.train_class_counts,
+    )
 
 
 def bundle_summary(bundle: EvaluatorDataBundle) -> Dict[str, Any]:

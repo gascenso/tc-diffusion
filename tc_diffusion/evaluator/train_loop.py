@@ -13,10 +13,12 @@ from tqdm.auto import tqdm
 
 from .data import (
     EvaluatorDataBundle,
+    build_sampler_summary,
     build_evaluator_data,
     bundle_summary,
     make_batch_dataset,
     resolve_class_weight_alpha,
+    resolve_sampler_config,
 )
 from .losses import evaluator_loss_components
 from .metrics import compute_evaluator_report, make_loss_summary, to_builtin
@@ -42,6 +44,7 @@ def train_evaluator(cfg: Dict[str, Any], *, resume: bool = False) -> Dict[str, A
     bundle = build_evaluator_data(cfg, splits=("train", "val"))
     _save_startup_artifacts(out_dir=out_dir, bundle=bundle, cfg=cfg)
     _print_data_summary(bundle)
+    sampler_cfg = resolve_sampler_config(ev_cfg)
 
     model = build_evaluator_model(cfg)
     optimizer = _make_adamw(
@@ -100,6 +103,7 @@ def train_evaluator(cfg: Dict[str, Any], *, resume: bool = False) -> Dict[str, A
         shuffle=True,
         seed=seed,
         drop_remainder=bool(train_cfg.get("drop_remainder", False)),
+        sampler_config=sampler_cfg,
     )
     train_ds._epoch_index = start_epoch
     val_ds = make_batch_dataset(bundle, "val", shuffle=False, seed=seed)
@@ -172,6 +176,12 @@ def train_evaluator(cfg: Dict[str, Any], *, resume: bool = False) -> Dict[str, A
     for epoch in range(start_epoch, num_epochs):
         epoch_idx = epoch + 1
         print(f"\n[evaluator] Epoch {epoch_idx}/{num_epochs}")
+        _print_epoch_sampler_summary(
+            train_ds,
+            bundle=bundle,
+            epoch=epoch_idx,
+            max_batches=max_train_batches,
+        )
         train_report = _run_train_epoch(
             train_step=train_step,
             dataset=train_ds,
@@ -207,6 +217,11 @@ def train_evaluator(cfg: Dict[str, Any], *, resume: bool = False) -> Dict[str, A
             "epoch": epoch_idx,
             "global_step": int(global_step.numpy()),
             "lr": lr_value,
+            "train_sampler": _epoch_sampler_record(
+                train_ds,
+                bundle=bundle,
+                max_batches=max_train_batches,
+            ),
             "monitor": ckpt_cfg["monitor"],
             "monitor_value": monitor_value,
             "best_improved": bool(improved),
@@ -598,7 +613,9 @@ def _print_training_control_summary(
         "[evaluator:control] "
         f"AdamW weight_decay={float(train_cfg['weight_decay']):.3g}, "
         f"label_smoothing={float(loss_cfg['label_smoothing']):.3g}, "
-        f"class_weight_alpha={resolve_class_weight_alpha(ev_cfg):.3g}"
+        f"class_weight_alpha={resolve_class_weight_alpha(ev_cfg):.3g}, "
+        f"sampler={resolve_sampler_config(ev_cfg).mode}, "
+        f"sampler_strength={resolve_sampler_config(ev_cfg).strength:.3g}"
     )
     print(
         "[evaluator:control] "
@@ -608,6 +625,48 @@ def _print_training_control_summary(
         f"early_stopping_enabled={bool(early_cfg['enabled'])}, "
         f"early_stopping_patience={int(early_cfg['patience_epochs'])}"
     )
+
+
+def _print_epoch_sampler_summary(
+    dataset,
+    *,
+    bundle: EvaluatorDataBundle,
+    epoch: int,
+    max_batches: int | None,
+):
+    record = _epoch_sampler_record(dataset, bundle=bundle, max_batches=max_batches)
+    expected = record["expected_samples_per_class"]
+    probs = record["class_probabilities"]
+    ratios = record["class_probability_ratio_vs_natural"]
+    print(
+        "[evaluator:sampler] "
+        f"epoch={epoch}, mode={record['mode']}, strength={record['strength']:.3g}, "
+        f"planned_samples={record['planned_samples']}"
+    )
+    for c in range(bundle.num_classes):
+        print(
+            "  "
+            f"class {c}: p={float(probs[str(c)]):.5f}, "
+            f"ratio_vs_natural={_fmt(ratios[str(c)])}, "
+            f"expected_n={float(expected[str(c)]):.1f}"
+        )
+
+
+def _epoch_sampler_record(
+    dataset,
+    *,
+    bundle: EvaluatorDataBundle,
+    max_batches: int | None,
+) -> Dict[str, Any]:
+    desc = dataset.describe_sampler()
+    planned_samples = int(dataset.num_samples_for_batches(max_batches))
+    probabilities = desc["class_probabilities"]
+    desc["planned_samples"] = planned_samples
+    desc["expected_samples_per_class"] = {
+        str(c): float(probabilities[str(c)]) * planned_samples
+        for c in range(bundle.num_classes)
+    }
+    return desc
 
 
 def _format_tail_summary(report: Dict[str, Any]) -> str:
@@ -738,6 +797,7 @@ def _save_startup_artifacts(
     summary = bundle_summary(bundle)
     _write_json(out_dir / "data_summary.json", summary)
     _write_json(out_dir / "wind_normalization.json", summary["wind_standardization"])
+    _write_json(out_dir / "sampler_config.json", build_sampler_summary(cfg, bundle))
     _write_json(
         out_dir / "class_weights.json",
         {
