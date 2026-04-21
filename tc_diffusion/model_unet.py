@@ -197,7 +197,14 @@ def make_res_block(x, emb, out_channels, name_prefix, gn_groups=32):
     h = layers.Activation("swish", name=f"{name_prefix}_act1")(h)
 
     # --- Conv 2 ---
-    h = layers.Conv2D(out_channels, 3, padding="same", name=f"{name_prefix}_conv2")(h)
+    h = layers.Conv2D(
+        out_channels,
+        3,
+        padding="same",
+        kernel_initializer="zeros",
+        bias_initializer="zeros",
+        name=f"{name_prefix}_conv2",
+    )(h)
     h = GroupNorm(groups=gn_groups, name=f"{name_prefix}_gn2")(h)
     h = layers.Lambda(lambda z: z[0] * (1.0 + z[1]) + z[2], name=f"{name_prefix}_film2")([h, gamma2, beta2])
     h = layers.Activation("swish", name=f"{name_prefix}_act2")(h)
@@ -349,7 +356,7 @@ def build_unet(cfg):
         tc_emb = layers.Add(name="tc_emb")([t_emb, c_emb])  # (B, t_emb_dim)
 
     # ---- Downsampling path ----
-    hs = []  # skip connections
+    hs = []  # one long skip per encoder ResBlock
 
     h = layers.Conv2D(base_channels, 3, padding="same", name="in_conv")(x_in)
 
@@ -364,13 +371,16 @@ def build_unet(cfg):
                 out_ch,
                 name_prefix=f"down_l{level}_b{b}",
             )
+            hs.append(h)
         if level_resolutions[level] in attention_resolutions:
             h = make_attention_block(
                 h,
                 name_prefix=f"down_l{level}_attn",
                 num_heads=attention_heads,
             )
-        hs.append(h)  # store skip at this resolution
+            # Keep the skip count tied to ResBlocks while preserving the
+            # attention-refined representation for the deepest block at this level.
+            hs[-1] = h
 
         # don’t downsample after last level
         if level != len(channel_mults) - 1:
@@ -388,19 +398,18 @@ def build_unet(cfg):
     h = make_res_block(h, tc_emb, in_ch, name_prefix="bottleneck_1")
 
     # ---- Upsampling path ----
-    # walk back through channel_mults in reverse, popping skips
+    # walk back through channel_mults in reverse, consuming one skip per decoder ResBlock
     for level, mult in reversed(list(enumerate(channel_mults))):
-        skip = hs[level]  # this has the same H,W as h *after* upsampling
         # upsample except at the highest-res level (level 0) – but we’ve stored skip before pool,
         # so we first upsample then concat
         if level != len(channel_mults) - 1:
             h = layers.UpSampling2D(size=2, interpolation="bilinear", name=f"up_l{level}_up")(h)
 
-        # After upsampling, h should match skip spatial dims
-        h = layers.Concatenate(name=f"up_l{level}_concat")([h, skip])
         out_ch = base_channels * mult
 
         for b in range(num_res_blocks):
+            skip = hs.pop()
+            h = layers.Concatenate(name=f"up_l{level}_b{b}_concat")([h, skip])
             h = make_res_block(
                 h,
                 tc_emb,
@@ -414,11 +423,24 @@ def build_unet(cfg):
                 num_heads=attention_heads,
             )
 
+    if hs:
+        raise RuntimeError(f"Internal U-Net skip mismatch: {len(hs)} unused skip tensors.")
+
     # ---- Output ----
     # dtype="float32" overrides the global mixed_float16 policy so the model
     # always returns float32.  This keeps the loss computation numerically stable
     # regardless of whether mixed precision is enabled.
-    eps_out = layers.Conv2D(1, 3, padding="same", name="eps_out", dtype="float32")(h)
+    h = GroupNorm(name="out_gn")(h)
+    h = layers.Activation("swish", name="out_act")(h)
+    eps_out = layers.Conv2D(
+        1,
+        3,
+        padding="same",
+        kernel_initializer="zeros",
+        bias_initializer="zeros",
+        name="eps_out",
+        dtype="float32",
+    )(h)
 
     model = keras.Model(
         inputs=[x_in, t_in, ss_cat_in, wind_kt_in],
