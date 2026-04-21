@@ -46,9 +46,9 @@ conditioning:
 
 model:
   base_channels: 32
-  channel_mults: [1, 2, 4, 8]
-  num_res_blocks: 2
-  attention_resolutions: []
+  channel_mults: [1, 1, 2, 4, 8]
+  num_res_blocks: 3
+  attention_resolutions: [16, 32]
   attention_heads: 4
 
 diffusion:
@@ -92,7 +92,7 @@ training:
 
 evaluation:
   n_per_class_light: 25
-  n_per_class_heavy: 50
+  n_per_class_heavy: 100
   n_plot_per_group: 25   # plot up to 25 real + 25 generated samples per class
   epoch_preview:
     enabled: true
@@ -102,7 +102,7 @@ evaluation:
     use_ema: true
     seed: 123
   gen_batch_size: null
-  guidance_scale: 2.5
+  guidance_scale: 0.5
   sampler: "dpmpp_2m"    # "ddpm" | "ddim" | "dpmpp_2m"
   sampling_steps: 100     # used by DDIM / DPM++ 2M; DDPM ignores it
   timestep_schedule: "linear"  # "linear" | "leading" | "trailing"

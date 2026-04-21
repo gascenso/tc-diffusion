@@ -31,4 +31,4 @@ training:
 
 evaluation:
   gen_batch_size: 4       # smaller eval micro-batch keeps heavy eval safer
-  guidance_scale: 1.0     # start lower; 2.5 looked too aggressive in prior sweeps
+  guidance_scale: 0.5     # guidance sweep favored 0.5 over stronger CFG
