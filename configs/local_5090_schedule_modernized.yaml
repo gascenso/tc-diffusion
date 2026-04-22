@@ -1,7 +1,0 @@
-_base_: local.yaml
-
-diffusion:
-  beta_schedule: "cosine"
-
-evaluation:
-  timestep_schedule: "trailing"
