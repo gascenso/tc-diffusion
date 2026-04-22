@@ -21,8 +21,8 @@ data:
     max_samples_per_read: null
     warmup_shards: false
   image_size: 256
-  bt_min_k: 180.0 # q0.1; global min is 117.0
-  bt_max_k: 310.0 # q99.9; global max is 348.0
+  bt_min_k: 170.0 # q0.05; global min is 117.0
+  bt_max_k: 325.0 # q99.95; global max is 348.0
   split_dir: ../data/splits
   eval_num_parallel_calls: null  # null -> 1 for netcdf, AUTOTUNE for packed_memmap
   eval_seed: 42             # legacy; train/val dataset seeding now follows training.seed
@@ -46,14 +46,14 @@ conditioning:
 
 model:
   base_channels: 32
-  channel_mults: [1, 1, 2, 4, 8]
+  channel_mults: [1, 1, 2, 4, 8, 8]
   num_res_blocks: 3
-  attention_resolutions: [16, 32]
+  attention_resolutions: [8, 16, 32]
   attention_heads: 4
 
 diffusion:
   num_steps: 1000
-  beta_schedule: "linear"
+  beta_schedule: "cosine"
   rescale_zero_terminal_snr: false
   loss_type: "v_mse"
   min_snr_gamma: 2.5
@@ -105,7 +105,7 @@ evaluation:
   guidance_scale: 0.5
   sampler: "dpmpp_2m"    # "ddpm" | "ddim" | "dpmpp_2m"
   sampling_steps: 100     # used by DDIM / DPM++ 2M; DDPM ignores it
-  timestep_schedule: "linear"  # "linear" | "leading" | "trailing"
+  timestep_schedule: "trailing"  # "linear" | "leading" | "trailing"
   ddim_steps: null       # legacy alias for sampling_steps
   ddim_eta: 0.0          # 0.0 -> deterministic DDIM
   seed: 123

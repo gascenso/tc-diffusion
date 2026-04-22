@@ -837,7 +837,9 @@ def train(cfg, resume: bool = False):
     active_alpha = None
 
     # ----- compile the train step -----
-    # All TF ops (tape, grads, apply, EMA) go inside the compiled function.
+    # Keep geometric augmentation outside XLA. The reflected random shift uses
+    # dynamic MirrorPad paddings, which TensorFlow/XLA requires to be compile-time
+    # constants. The expensive denoiser/loss/optimizer path remains compiled.
     # Python bookkeeping (step counter, loss accumulation, tqdm) stays outside.
     # use_ema is a Python bool resolved at trace time → the EMA branch is either
     # always present or always absent in the compiled graph, with zero runtime overhead.
@@ -852,8 +854,8 @@ def train(cfg, resume: bool = False):
     use_wind_speed = bool(cfg.get("conditioning", {}).get("use_wind_speed", False))
     p_aug, max_shift = _build_aug_policy(int(cfg["conditioning"]["num_ss_classes"]))
 
-    @tf.function(reduce_retracing=True, jit_compile=jit_compile)
-    def train_step(x0, cond, step_index):
+    @tf.function(reduce_retracing=True, jit_compile=False)
+    def augment_train_batch(x0, cond, step_index):
         step_index = tf.cast(step_index, tf.int32)
         aug_seed = tf.stack(
             [
@@ -861,19 +863,23 @@ def train(cfg, resume: bool = False):
                 step_index,
             ]
         )
-        loss_seed = tf.stack(
-            [
-                tf.cast(train_seed + 40_000, tf.int32),
-                step_index,
-            ]
-        )
         cond_labels = cond["ss_cat"] if use_wind_speed else cond
-        x0 = augment_batch_x_given_y(
+        return augment_batch_x_given_y(
             x0,
             cond_labels,
             p_aug=p_aug,
             max_shift_per_class=max_shift,
             base_seed=aug_seed,
+        )
+
+    @tf.function(reduce_retracing=True, jit_compile=jit_compile)
+    def train_step(x0, cond, step_index):
+        step_index = tf.cast(step_index, tf.int32)
+        loss_seed = tf.stack(
+            [
+                tf.cast(train_seed + 40_000, tf.int32),
+                step_index,
+            ]
         )
         with tf.GradientTape() as tape:
             loss = diffusion.loss(model, x0, cond, seed=loss_seed)
@@ -942,6 +948,7 @@ def train(cfg, resume: bool = False):
 
                 t_step0 = time.perf_counter()
                 step_index = tf.convert_to_tensor(global_step, dtype=tf.int32)
+                x0 = augment_train_batch(x0, cond, step_index=step_index)
                 loss = train_step(x0, cond, step_index=step_index)
                 global_step += 1
                 checkpoint.global_step.assign(global_step)
