@@ -9,7 +9,7 @@ evaluator:
   early_stopping_patience: 6
 
   sampler:
-    mode: "natural"
+    mode: "mild_rebalanced"
     strength: 0.35
 
   model:

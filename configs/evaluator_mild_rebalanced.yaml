@@ -1,6 +1,0 @@
-_base_: evaluator_regularized_v2.yaml
-
-evaluator:
-  sampler:
-    mode: "mild_rebalanced"
-    strength: 0.35
