@@ -8,9 +8,9 @@ data:
   class_balance_curriculum:
     enabled: true
     start_alpha: 1.0
-    end_alpha: 0.4
+    end_alpha: 0.45
     start_epoch: 0
-    ramp_epochs: 40
+    ramp_epochs: 70
     mode: "cosine"
   batch_size: 16
   train_pipeline_profile: local_5090  # legacy | local_5090 | cassandra_hpc
@@ -27,7 +27,7 @@ data:
   eval_num_parallel_calls: null  # null -> 1 for netcdf, AUTOTUNE for packed_memmap
   eval_seed: 42             # legacy; train/val dataset seeding now follows training.seed
   eval_mode: full
-  val_balanced_per_class: 5
+  val_balanced_per_class: 10
 
 conditioning:
   num_ss_classes: 6
