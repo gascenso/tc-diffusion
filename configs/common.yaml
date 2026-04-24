@@ -27,7 +27,7 @@ data:
   eval_num_parallel_calls: null  # null -> 1 for netcdf, AUTOTUNE for packed_memmap
   eval_seed: 42             # legacy; train/val dataset seeding now follows training.seed
   eval_mode: full
-  val_balanced_per_class: 10
+  val_balanced_per_class: 7
 
 conditioning:
   num_ss_classes: 6
@@ -60,9 +60,21 @@ diffusion:
   dynamic_threshold: true
   dynamic_threshold_p: 0.995
 
+physics_loss:
+  enabled: false
+  lambda_phys: 0.05
+  radial_weight: 1.0
+  cold_weight: 0.5
+  grad_weight: 0.25
+  snr_gate_max: 0.8
+  radial_bins: 64
+  cold_threshold_k: 235.0
+  cold_softness_k: 5.0
+  charbonnier_eps: 1.0e-3
+
 training:
   seed: 42              # authoritative seed for data order, RNG streams, and resumable training
-  num_epochs: 200
+  num_epochs: 150
   steps_per_epoch: 2000
   lr: 1e-4
   lr_min: 1.0e-6        # cosine decay floor
@@ -88,7 +100,7 @@ training:
     enabled: true
     monitor: "ema"         # "ema" (recommended when EMA is used) or "raw"
     patience_epochs: 25
-    min_delta: 1.0e-8
+    min_delta: 1.0e-7
 
 evaluation:
   n_per_class_light: 25

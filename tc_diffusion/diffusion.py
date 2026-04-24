@@ -134,6 +134,84 @@ class Diffusion:
         self.dynamic_threshold = bool(cfg["diffusion"].get("dynamic_threshold", True))
         self.dynamic_threshold_p = float(cfg["diffusion"].get("dynamic_threshold_p", 0.995))
 
+        phys_cfg = cfg.get("physics_loss", {})
+        self.physics_enabled = bool(phys_cfg.get("enabled", False))
+        self.physics_lambda = float(phys_cfg.get("lambda_phys", 0.0))
+        self.physics_radial_weight = float(phys_cfg.get("radial_weight", 1.0))
+        self.physics_cold_weight = float(phys_cfg.get("cold_weight", 1.0))
+        self.physics_grad_weight = float(phys_cfg.get("grad_weight", 1.0))
+        self.physics_snr_gate_max = float(phys_cfg.get("snr_gate_max", 0.8))
+        self.physics_radial_bins = int(phys_cfg.get("radial_bins", 64))
+        self.physics_cold_threshold_k = float(phys_cfg.get("cold_threshold_k", 235.0))
+        self.physics_cold_softness_k = float(phys_cfg.get("cold_softness_k", 5.0))
+        self.physics_charbonnier_eps = float(phys_cfg.get("charbonnier_eps", 1e-3))
+        self.bt_min_k = float(cfg["data"]["bt_min_k"])
+        self.bt_max_k = float(cfg["data"]["bt_max_k"])
+        self.bt_range_k = self.bt_max_k - self.bt_min_k
+
+        if self.physics_lambda < 0.0:
+            raise ValueError(
+                f"physics_loss.lambda_phys must be >= 0, got {self.physics_lambda}"
+            )
+        if self.physics_radial_weight < 0.0:
+            raise ValueError(
+                f"physics_loss.radial_weight must be >= 0, got {self.physics_radial_weight}"
+            )
+        if self.physics_cold_weight < 0.0:
+            raise ValueError(
+                f"physics_loss.cold_weight must be >= 0, got {self.physics_cold_weight}"
+            )
+        if self.physics_grad_weight < 0.0:
+            raise ValueError(
+                f"physics_loss.grad_weight must be >= 0, got {self.physics_grad_weight}"
+            )
+        if self.physics_snr_gate_max < 0.0:
+            raise ValueError(
+                f"physics_loss.snr_gate_max must be >= 0, got {self.physics_snr_gate_max}"
+            )
+        if self.physics_radial_bins <= 0:
+            raise ValueError(
+                f"physics_loss.radial_bins must be >= 1, got {self.physics_radial_bins}"
+            )
+        if self.physics_cold_softness_k <= 0.0:
+            raise ValueError(
+                "physics_loss.cold_softness_k must be > 0, "
+                f"got {self.physics_cold_softness_k}"
+            )
+        if self.physics_charbonnier_eps <= 0.0:
+            raise ValueError(
+                "physics_loss.charbonnier_eps must be > 0, "
+                f"got {self.physics_charbonnier_eps}"
+            )
+        if self.bt_range_k <= 0.0:
+            raise ValueError(
+                "data.bt_max_k must be > data.bt_min_k to support physics_loss, "
+                f"got bt_min_k={self.bt_min_k}, bt_max_k={self.bt_max_k}"
+            )
+
+        self.physics_active = (
+            self.physics_enabled
+            and self.physics_lambda > 0.0
+            and (
+                self.physics_radial_weight > 0.0
+                or self.physics_cold_weight > 0.0
+                or self.physics_grad_weight > 0.0
+            )
+        )
+        if self.physics_active:
+            image_size = int(cfg["data"]["image_size"])
+            if image_size <= 0:
+                raise ValueError(
+                    f"data.image_size must be >= 1 when physics_loss is enabled, got {image_size}"
+                )
+            radial_bin_index, radial_bin_counts = self._build_radial_bin_lookup(
+                image_size=image_size,
+                radial_bins=self.physics_radial_bins,
+            )
+            self.physics_image_size = image_size
+            self.physics_radial_bin_index = tf.constant(radial_bin_index, dtype=tf.int32)
+            self.physics_radial_bin_counts = tf.constant(radial_bin_counts, dtype=tf.float32)
+
     def _default_wind_from_ss_tensor(self, ss_cat):
         ss_cat = tf.cast(ss_cat, tf.int32)
         if self.num_ss_classes == 6:
@@ -180,12 +258,12 @@ class Diffusion:
             f"Got: {loss_type}"
         )
 
-    def _predict_x0_from_eps(self, x_t, t_int, eps_theta):
+    def _predict_x0_from_eps(self, x_t, alpha_bar_t, eps_theta):
         """
         Reconstruct x0 from epsilon prediction:
           x0 = (x_t - sqrt(1 - alpha_bar_t) * eps) / sqrt(alpha_bar_t)
         """
-        alpha_bar_t = tf.cast(self.alphas_cumprod[t_int], tf.float32)  # scalar
+        alpha_bar_t = tf.cast(alpha_bar_t, tf.float32)
         sqrt_ab = tf.sqrt(alpha_bar_t)
         sqrt_one_minus_ab = tf.sqrt(1.0 - alpha_bar_t)
         return (x_t - sqrt_one_minus_ab * eps_theta) / (sqrt_ab + 1e-8)
@@ -237,6 +315,86 @@ class Diffusion:
 
         x0_thr = tf.clip_by_value(x0, -s, s) / (s + eps)
         return x0_thr, s
+
+    def _build_radial_bin_lookup(self, image_size: int, radial_bins: int):
+        yy, xx = np.mgrid[0:image_size, 0:image_size]
+        cy = (image_size - 1) / 2.0
+        cx = (image_size - 1) / 2.0
+        radius = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+        radius_norm = radius / np.maximum(np.max(radius), 1e-12)
+        radial_bin_index = np.floor(radius_norm * radial_bins).astype(np.int32)
+        radial_bin_index = np.clip(radial_bin_index, 0, radial_bins - 1).reshape(-1)
+        radial_bin_counts = np.bincount(radial_bin_index, minlength=radial_bins).astype(np.float32)
+        radial_bin_counts = np.maximum(radial_bin_counts, 1.0)
+        return radial_bin_index, radial_bin_counts
+
+    def _charbonnier(self, diff):
+        diff = tf.cast(diff, tf.float32)
+        eps = tf.cast(self.physics_charbonnier_eps, tf.float32)
+        return tf.sqrt(tf.square(diff) + eps * eps) - eps
+
+    def _denorm_bt_k(self, x):
+        x = tf.cast(x, tf.float32)
+        bt01 = (x + 1.0) * 0.5
+        return bt01 * tf.cast(self.bt_range_k, tf.float32) + tf.cast(self.bt_min_k, tf.float32)
+
+    def _radial_mean_profile(self, x):
+        x = tf.cast(x, tf.float32)
+        field = tf.reduce_mean(x, axis=-1)  # [B, H, W]
+        flat = tf.reshape(field, [tf.shape(field)[0], -1])  # [B, HW]
+        flat_t = tf.transpose(flat, [1, 0])  # [HW, B]
+        radial_sum = tf.math.unsorted_segment_sum(
+            flat_t,
+            self.physics_radial_bin_index,
+            self.physics_radial_bins,
+        )  # [R, B]
+        radial_mean = radial_sum / tf.reshape(self.physics_radial_bin_counts, [-1, 1])
+        return tf.transpose(radial_mean, [1, 0])  # [B, R]
+
+    def _soft_cold_cloud_fraction(self, x_bt_k):
+        x_bt_k = tf.cast(x_bt_k, tf.float32)
+        field = tf.reduce_mean(x_bt_k, axis=-1)  # [B, H, W]
+        threshold = tf.cast(self.physics_cold_threshold_k, tf.float32)
+        softness = tf.cast(self.physics_cold_softness_k, tf.float32)
+        cold_score = tf.nn.sigmoid((threshold - field) / softness)
+        return tf.reduce_mean(cold_score, axis=[1, 2])  # [B]
+
+    def _sobel_gradient_magnitude(self, x):
+        x = tf.cast(x, tf.float32)
+        field = tf.reduce_mean(x, axis=-1, keepdims=True)
+        sobel = tf.image.sobel_edges(field)  # [B, H, W, 1, 2]
+        return tf.sqrt(tf.reduce_sum(tf.square(sobel), axis=-1) + 1e-8)  # [B, H, W, 1]
+
+    def _physics_gate(self, alpha_bar_t):
+        alpha_bar_t = tf.reshape(tf.cast(alpha_bar_t, tf.float32), [-1])
+        snr = alpha_bar_t / (1.0 - alpha_bar_t + 1e-8)
+        gate = snr / (snr + 1.0)
+        return tf.clip_by_value(gate, 0.0, tf.cast(self.physics_snr_gate_max, tf.float32))
+
+    def _physics_loss_per_sample(self, x0_true, x0_hat):
+        x0_true = tf.cast(x0_true, tf.float32)
+        x0_hat = tf.cast(x0_hat, tf.float32)
+        loss = tf.zeros([tf.shape(x0_hat)[0]], dtype=tf.float32)
+
+        if self.physics_radial_weight > 0.0:
+            radial_true = self._radial_mean_profile(x0_true)
+            radial_hat = self._radial_mean_profile(x0_hat)
+            radial_loss = tf.reduce_mean(self._charbonnier(radial_hat - radial_true), axis=1)
+            loss = loss + tf.cast(self.physics_radial_weight, tf.float32) * radial_loss
+
+        if self.physics_cold_weight > 0.0:
+            cold_true = self._soft_cold_cloud_fraction(self._denorm_bt_k(x0_true))
+            cold_hat = self._soft_cold_cloud_fraction(self._denorm_bt_k(x0_hat))
+            cold_loss = self._charbonnier(cold_hat - cold_true)
+            loss = loss + tf.cast(self.physics_cold_weight, tf.float32) * cold_loss
+
+        if self.physics_grad_weight > 0.0:
+            grad_true = self._sobel_gradient_magnitude(x0_true)
+            grad_hat = self._sobel_gradient_magnitude(x0_hat)
+            grad_loss = tf.reduce_mean(self._charbonnier(grad_hat - grad_true), axis=[1, 2, 3])
+            loss = loss + tf.cast(self.physics_grad_weight, tf.float32) * grad_loss
+
+        return loss
 
     def _betas_for_alpha_bar(self, num_steps: int, alpha_bar_fn):
         t = np.linspace(0.0, 1.0, num_steps + 1, dtype=np.float64)
@@ -422,7 +580,7 @@ class Diffusion:
 
         if self.prediction_type == "eps":
             eps_theta = pred_theta
-            x0_pred = self._predict_x0_from_eps(x_t, t_int, eps_theta)
+            x0_pred = self._predict_x0_from_eps(x_t, alpha_bar_t, eps_theta)
         else:
             x0_pred = self._predict_x0_from_v(x_t, alpha_bar_t, pred_theta)
             eps_theta = self._predict_eps_from_v(x_t, alpha_bar_t, pred_theta)
@@ -512,8 +670,25 @@ class Diffusion:
 
         mse_per_sample = tf.reduce_mean((pred - target) ** 2, axis=[1, 2, 3])  # (B,)
         weights = self._min_snr_weights(t)  # (B,)
-        loss = tf.reduce_mean(mse_per_sample * weights)
-        return loss
+        base_loss = tf.reduce_mean(mse_per_sample * weights)
+
+        if not self.physics_active:
+            return base_loss
+
+        x_t_f32 = tf.cast(x_t, tf.float32)
+        pred_f32 = tf.cast(pred, tf.float32)
+        x0_f32 = tf.cast(x0, tf.float32)
+        alpha_bar_t_f32 = tf.cast(alpha_bar_t, tf.float32)
+
+        if self.prediction_type == "eps":
+            x0_hat = self._predict_x0_from_eps(x_t_f32, alpha_bar_t_f32, pred_f32)
+        else:
+            x0_hat = self._predict_x0_from_v(x_t_f32, alpha_bar_t_f32, pred_f32)
+
+        phys_loss_per_sample = self._physics_loss_per_sample(x0_f32, x0_hat)
+        gate = self._physics_gate(alpha_bar_t_f32)
+        physics_loss = tf.reduce_mean(gate * phys_loss_per_sample)
+        return base_loss + tf.cast(self.physics_lambda, tf.float32) * physics_loss
 
     # --- for sampling ---
     def p_sample_step(self, model, x_t, t_int, cond, guidance_scale=0.0):

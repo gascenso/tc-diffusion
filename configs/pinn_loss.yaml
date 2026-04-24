@@ -1,0 +1,13 @@
+_base_: local.yaml
+
+physics_loss:
+  enabled: true
+  lambda_phys: 0.05
+  radial_weight: 1.0
+  cold_weight: 0.5
+  grad_weight: 0.25
+  snr_gate_max: 0.8
+  radial_bins: 64
+  cold_threshold_k: 235.0
+  cold_softness_k: 5.0
+  charbonnier_eps: 1.0e-3
