@@ -593,6 +593,90 @@ def _compute_class_scalar_summary(
     }
 
 
+def _default_paper_ready_class_labels(class_ids: list[int]) -> Dict[int, str]:
+    class_ids = sorted(int(c) for c in class_ids)
+    if class_ids == list(range(6)):
+        return {
+            0: "< Cat 1",
+            1: "Cat 1",
+            2: "Cat 2",
+            3: "Cat 3",
+            4: "Cat 4",
+            5: "Cat 5",
+        }
+    return {c: f"Class {c}" for c in class_ids}
+
+
+def _build_pixel_hist_panel(
+    *,
+    bins: np.ndarray,
+    real_hist_counts: np.ndarray,
+    gen_hist_counts: np.ndarray,
+    label: str,
+) -> Dict[str, Any]:
+    rh = _hist_density_from_counts(real_hist_counts)
+    gh = _hist_density_from_counts(gen_hist_counts)
+    return {
+        "label": str(label),
+        "bt_bins": np.asarray(bins, dtype=np.float64).tolist(),
+        "hist_real": rh.tolist(),
+        "hist_gen": gh.tolist(),
+        "pixel_hist_js": float(js_divergence(rh, gh)),
+        "pixel_hist_w1": float(wasserstein1_from_hist(rh, gh, bin_edges=bins)),
+    }
+
+
+def _build_paper_ready_pixel_plausibility(
+    class_caches: Dict[int, ClassMetricCache],
+) -> Dict[str, Any]:
+    if not class_caches:
+        return {}
+
+    class_ids = sorted(int(c) for c in class_caches.keys())
+    class_labels = _default_paper_ready_class_labels(class_ids)
+
+    bins_ref: np.ndarray | None = None
+    real_hist_blocks = []
+    gen_hist_blocks = []
+    per_class = {}
+
+    for c in class_ids:
+        cache = class_caches[c]
+        bins = np.asarray(cache.bins, dtype=np.float64)
+        if bins_ref is None:
+            bins_ref = bins
+        elif bins.shape != bins_ref.shape or not np.allclose(bins, bins_ref):
+            raise ValueError("Paper-ready pixel histograms require identical BT bins across classes.")
+
+        real_hist_blocks.append(np.asarray(cache.real_hist_counts, dtype=np.float64))
+        gen_hist_blocks.append(np.asarray(cache.gen_raw_hist_counts, dtype=np.float64))
+        per_class[str(c)] = _build_pixel_hist_panel(
+            bins=bins,
+            real_hist_counts=cache.real_hist_counts,
+            gen_hist_counts=cache.gen_raw_hist_counts,
+            label=class_labels[c],
+        )
+
+    assert bins_ref is not None
+
+    overall = _build_pixel_hist_panel(
+        bins=bins_ref,
+        real_hist_counts=np.concatenate(real_hist_blocks, axis=0),
+        gen_hist_counts=np.concatenate(gen_hist_blocks, axis=0),
+        label="Overall",
+    )
+
+    return {
+        "hist_normalization": "probability_mass",
+        "metric_variant": "raw",
+        "bin_units": "K",
+        "metric_units": {"pixel_hist_w1": "K"},
+        "class_labels": {str(c): class_labels[c] for c in class_ids},
+        "overall": overall,
+        "per_class": per_class,
+    }
+
+
 def _compute_aggregate_primary_raw(class_scalars: Dict[int, Dict[str, float]]) -> Dict[str, float]:
     if not class_scalars:
         return {}
@@ -942,6 +1026,9 @@ class TCEvaluator:
             "macro": macro,
             "macro_ci": macro_ci,
             "per_class": per_class_metrics,
+            "paper_ready": {
+                "pixel_plausibility": _build_paper_ready_pixel_plausibility(class_caches)
+            },
         }
         if wind_targets_kt:
             report["conditioning_targets"] = {

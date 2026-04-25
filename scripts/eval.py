@@ -7,6 +7,7 @@
 # (show progress bar)         python -m scripts.eval --name <RUN_NAME> --show_progress
 
 import argparse
+from copy import deepcopy
 from pathlib import Path
 
 import tensorflow as tf
@@ -52,6 +53,43 @@ def configure_runtime(cfg):
         print("[eval] Mixed precision enabled (mixed_float16)")
 
 
+def _legacy_model_cfg(cfg):
+    legacy_cfg = deepcopy(cfg)
+    legacy_cfg.setdefault("model", {})
+    legacy_cfg["model"]["decoder_skip_mode"] = "per_level"
+    legacy_cfg["model"]["output_head_pre_norm"] = False
+    return legacy_cfg
+
+
+def _load_model_with_arch_fallback(cfg, weights_path: Path):
+    model_cfg = cfg.get("model", {})
+    has_explicit_arch_keys = (
+        "decoder_skip_mode" in model_cfg or "output_head_pre_norm" in model_cfg
+    )
+
+    attempts = [("saved config", cfg)]
+    if not has_explicit_arch_keys:
+        attempts.append(("legacy checkpoint compatibility mode", _legacy_model_cfg(cfg)))
+
+    errors = []
+    last_exc = None
+    for label, cfg_variant in attempts:
+        tf.keras.backend.clear_session()
+        model = build_unet(cfg_variant)
+        try:
+            model.load_weights(str(weights_path))
+            if label != "saved config":
+                print(f"[eval] Loaded weights using {label}.")
+            return model
+        except ValueError as exc:
+            errors.append(f"{label}: {exc}")
+            last_exc = exc
+
+    msg = "Could not load checkpoint with any known architecture variant:\n"
+    msg += "\n".join(f"  - {err}" for err in errors)
+    raise ValueError(msg) from last_exc
+
+
 if __name__ == "__main__":
     args = parse_args()
 
@@ -95,8 +133,7 @@ if __name__ == "__main__":
     weights_path = resolve_weights_path()
 
     # Build + load
-    model = build_unet(cfg)
-    model.load_weights(str(weights_path))
+    model = _load_model_with_arch_fallback(cfg, weights_path)
     diffusion = Diffusion(cfg)
 
     evaluator = TCEvaluator(cfg)

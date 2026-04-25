@@ -48,6 +48,8 @@ model:
   base_channels: 32
   channel_mults: [1, 1, 2, 4, 8, 8]
   num_res_blocks: 3
+  decoder_skip_mode: "per_resblock"  # "per_resblock" (modern) | "per_level" (legacy)
+  output_head_pre_norm: true
   attention_resolutions: [8, 16, 32]
   attention_heads: 4
 
@@ -74,7 +76,7 @@ physics_loss:
 
 training:
   seed: 42              # authoritative seed for data order, RNG streams, and resumable training
-  num_epochs: 150
+  num_epochs: 140
   steps_per_epoch: 2000
   lr: 1e-4
   lr_min: 1.0e-6        # cosine decay floor

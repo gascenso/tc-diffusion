@@ -4,6 +4,18 @@ from tensorflow import keras
 from tensorflow.keras import layers #type: ignore
 
 
+def _resolve_decoder_skip_mode(cfg):
+    mode = str(cfg.get("model", {}).get("decoder_skip_mode", "per_resblock")).strip().lower()
+    allowed = {"per_resblock", "per_level"}
+    if mode not in allowed:
+        raise ValueError(f"model.decoder_skip_mode must be one of {sorted(allowed)}, got {mode!r}")
+    return mode
+
+
+def _resolve_output_head_pre_norm(cfg):
+    return bool(cfg.get("model", {}).get("output_head_pre_norm", True))
+
+
 class SinusoidalTimeEmbedding(layers.Layer):
     def __init__(self, dim, **kwargs):
         super().__init__(**kwargs)
@@ -248,6 +260,8 @@ def build_unet(cfg):
     base_channels = int(cfg["model"]["base_channels"])
     channel_mults = cfg["model"].get("channel_mults", [1, 2, 4])
     num_res_blocks = int(cfg["model"].get("num_res_blocks", 2))
+    decoder_skip_mode = _resolve_decoder_skip_mode(cfg)
+    output_head_pre_norm = _resolve_output_head_pre_norm(cfg)
     attention_resolutions = {
         int(res) for res in cfg["model"].get("attention_resolutions", [])
     }
@@ -356,7 +370,10 @@ def build_unet(cfg):
         tc_emb = layers.Add(name="tc_emb")([t_emb, c_emb])  # (B, t_emb_dim)
 
     # ---- Downsampling path ----
-    hs = []  # one long skip per encoder ResBlock
+    if decoder_skip_mode == "per_resblock":
+        hs = []  # one long skip per encoder ResBlock
+    else:
+        hs = []  # one skip per resolution level
 
     h = layers.Conv2D(base_channels, 3, padding="same", name="in_conv")(x_in)
 
@@ -371,16 +388,20 @@ def build_unet(cfg):
                 out_ch,
                 name_prefix=f"down_l{level}_b{b}",
             )
-            hs.append(h)
+            if decoder_skip_mode == "per_resblock":
+                hs.append(h)
         if level_resolutions[level] in attention_resolutions:
             h = make_attention_block(
                 h,
                 name_prefix=f"down_l{level}_attn",
                 num_heads=attention_heads,
             )
-            # Keep the skip count tied to ResBlocks while preserving the
-            # attention-refined representation for the deepest block at this level.
-            hs[-1] = h
+            if decoder_skip_mode == "per_resblock":
+                # Keep the skip count tied to ResBlocks while preserving the
+                # attention-refined representation for the deepest block at this level.
+                hs[-1] = h
+        if decoder_skip_mode == "per_level":
+            hs.append(h)
 
         # don’t downsample after last level
         if level != len(channel_mults) - 1:
@@ -398,7 +419,8 @@ def build_unet(cfg):
     h = make_res_block(h, tc_emb, in_ch, name_prefix="bottleneck_1")
 
     # ---- Upsampling path ----
-    # walk back through channel_mults in reverse, consuming one skip per decoder ResBlock
+    # walk back through channel_mults in reverse, consuming either one skip per
+    # decoder ResBlock (modern) or one skip per level (legacy).
     for level, mult in reversed(list(enumerate(channel_mults))):
         # upsample except at the highest-res level (level 0) – but we’ve stored skip before pool,
         # so we first upsample then concat
@@ -407,15 +429,26 @@ def build_unet(cfg):
 
         out_ch = base_channels * mult
 
-        for b in range(num_res_blocks):
+        if decoder_skip_mode == "per_resblock":
+            for b in range(num_res_blocks):
+                skip = hs.pop()
+                h = layers.Concatenate(name=f"up_l{level}_b{b}_concat")([h, skip])
+                h = make_res_block(
+                    h,
+                    tc_emb,
+                    out_ch,
+                    name_prefix=f"up_l{level}_b{b}",
+                )
+        else:
             skip = hs.pop()
-            h = layers.Concatenate(name=f"up_l{level}_b{b}_concat")([h, skip])
-            h = make_res_block(
-                h,
-                tc_emb,
-                out_ch,
-                name_prefix=f"up_l{level}_b{b}",
-            )
+            h = layers.Concatenate(name=f"up_l{level}_concat")([h, skip])
+            for b in range(num_res_blocks):
+                h = make_res_block(
+                    h,
+                    tc_emb,
+                    out_ch,
+                    name_prefix=f"up_l{level}_b{b}",
+                )
         if level_resolutions[level] in attention_resolutions:
             h = make_attention_block(
                 h,
@@ -430,8 +463,9 @@ def build_unet(cfg):
     # dtype="float32" overrides the global mixed_float16 policy so the model
     # always returns float32.  This keeps the loss computation numerically stable
     # regardless of whether mixed precision is enabled.
-    h = GroupNorm(name="out_gn")(h)
-    h = layers.Activation("swish", name="out_act")(h)
+    if output_head_pre_norm:
+        h = GroupNorm(name="out_gn")(h)
+        h = layers.Activation("swish", name="out_act")(h)
     eps_out = layers.Conv2D(
         1,
         3,

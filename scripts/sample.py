@@ -8,6 +8,7 @@
 # (DPM++ 2M sampling)           python -m scripts.sample --name <RUN_NAME> --sampler dpmpp_2m --sampling_steps 25
 
 import argparse
+from copy import deepcopy
 from pathlib import Path
 
 import tensorflow as tf
@@ -92,6 +93,43 @@ def parse_args():
     return p.parse_args()
 
 
+def _legacy_model_cfg(cfg):
+    legacy_cfg = deepcopy(cfg)
+    legacy_cfg.setdefault("model", {})
+    legacy_cfg["model"]["decoder_skip_mode"] = "per_level"
+    legacy_cfg["model"]["output_head_pre_norm"] = False
+    return legacy_cfg
+
+
+def _load_model_with_arch_fallback(cfg, weights_path: Path):
+    model_cfg = cfg.get("model", {})
+    has_explicit_arch_keys = (
+        "decoder_skip_mode" in model_cfg or "output_head_pre_norm" in model_cfg
+    )
+
+    attempts = [("saved config", cfg)]
+    if not has_explicit_arch_keys:
+        attempts.append(("legacy checkpoint compatibility mode", _legacy_model_cfg(cfg)))
+
+    errors = []
+    last_exc = None
+    for label, cfg_variant in attempts:
+        tf.keras.backend.clear_session()
+        model = build_unet(cfg_variant)
+        try:
+            model.load_weights(str(weights_path))
+            if label != "saved config":
+                print(f"[sample] Loaded weights using {label}.")
+            return model
+        except ValueError as exc:
+            errors.append(f"{label}: {exc}")
+            last_exc = exc
+
+    msg = "Could not load checkpoint with any known architecture variant:\n"
+    msg += "\n".join(f"  - {err}" for err in errors)
+    raise ValueError(msg) from last_exc
+
+
 if __name__ == "__main__":
     args = parse_args()
     run_dir = Path("runs") / args.name
@@ -114,7 +152,6 @@ if __name__ == "__main__":
 
     image_size = int(cfg["data"]["image_size"])
 
-    model = build_unet(cfg)
     diffusion = Diffusion(cfg)
 
     def resolve_weights_path(use_ema: bool) -> Path:
@@ -140,7 +177,7 @@ if __name__ == "__main__":
 
     weights_path = resolve_weights_path(args.use_ema)
     print(f"Loading weights from {weights_path}")
-    model.load_weights(str(weights_path))
+    model = _load_model_with_arch_fallback(cfg, weights_path)
 
     cond_value = None if args.uncond else args.ss_cat
     wind_value_kt = None if args.uncond else args.wind_kt
