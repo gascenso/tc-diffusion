@@ -2,6 +2,7 @@
 
 # Usage:
 # (evaluate finished run)     python -m scripts.eval --name <RUN_NAME>
+# (evaluate on test split)    python -m scripts.eval --name <RUN_NAME> --split test
 # (light evaluation)          python -m scripts.eval --name <RUN_NAME> --light
 # (override config)           python -m scripts.eval --name <RUN_NAME> --override evaluation.n_per_class_heavy=100
 # (show progress bar)         python -m scripts.eval --name <RUN_NAME> --show_progress
@@ -15,7 +16,7 @@ import tensorflow as tf
 from tc_diffusion.config import load_config
 from tc_diffusion.model_unet import build_unet
 from tc_diffusion.diffusion import Diffusion
-from tc_diffusion.evaluation.evaluator import TCEvaluator
+from tc_diffusion.evaluation.evaluator import TCEvaluator, resolve_eval_root
 
 
 def parse_args():
@@ -30,6 +31,7 @@ def parse_args():
     p.add_argument("--name", type=str, required=True, help="Name of run under runs/ to load weights from")
     p.add_argument("--out_dir", type=str, default=None, help="Output dir (defaults to run dir inferred from weights path)")
     p.add_argument("--tag", type=str, default="manual_eval")
+    p.add_argument("--split", type=str, choices=["val", "test"], default="val", help="Dataset split to evaluate on.")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--heavy", dest="heavy", action="store_true", help="Run heavy evaluation (default).")
     mode.add_argument("--light", dest="heavy", action="store_false", help="Run light evaluation.")
@@ -142,8 +144,9 @@ if __name__ == "__main__":
         diffusion=diffusion,
         out_dir=out_dir,
         tag=args.tag,
+        split=args.split,
         heavy=bool(args.heavy),
         show_progress=bool(args.show_progress),
     )
 
-    print("Wrote evaluation report to:", out_dir / "eval" / args.tag / "metrics.json")
+    print("Wrote evaluation report to:", resolve_eval_root(out_dir, args.tag, args.split) / "metrics.json")

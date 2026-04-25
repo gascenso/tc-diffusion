@@ -114,6 +114,15 @@ def _write_json(path: Path, obj: Dict[str, Any]):
         json.dump(obj, f, indent=2)
 
 
+def resolve_eval_root(out_dir: Path, tag: str, split: str) -> Path:
+    split = str(split).strip().lower()
+    if split not in {"val", "test"}:
+        raise ValueError(f"Evaluation split must be 'val' or 'test', got {split!r}")
+    if split == "val":
+        return out_dir / "eval" / tag
+    return out_dir / "eval" / split / tag
+
+
 def _ss_class_midpoint_kt(ss_cat: int) -> float:
     cls = int(ss_cat)
     if cls == 0:
@@ -217,8 +226,13 @@ def _sample_real_by_class(
     cfg: Dict[str, Any],
     n_per_class: int,
     seed: int,
+    split: str,
 ) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
     """Load real BT images and their wind speeds, grouped by SS class."""
+    split = str(split).strip().lower()
+    if split not in {"val", "test"}:
+        raise ValueError(f"Real-data evaluation split must be 'val' or 'test', got {split!r}")
+
     data_cfg = cfg["data"]
     index_path = Path(data_cfg["dataset_index"])
     split_dir = Path(data_cfg["split_dir"])
@@ -227,7 +241,7 @@ def _sample_real_by_class(
     backend = build_data_backend(data_cfg)
 
     class_to_files, sample_meta = load_dataset_index(index_path, return_sample_meta=True)
-    allowed = load_split_file_set(split_dir, split="val")
+    allowed = load_split_file_set(split_dir, split=split)
 
     rng = np.random.default_rng(seed)
     out_imgs: Dict[int, np.ndarray] = {}
@@ -772,11 +786,15 @@ class TCEvaluator:
         diffusion,
         out_dir: Path,
         tag: str,
+        split: str = "val",
         heavy: bool,
         show_progress: bool = False,
     ) -> Dict[str, Any]:
         cfg = self.cfg
         ev = _default_eval_cfg(cfg)
+        split = str(split).strip().lower()
+        if split not in {"val", "test"}:
+            raise ValueError(f"Evaluation split must be 'val' or 'test', got {split!r}")
 
         data_cfg = cfg["data"]
         bt_min_k = float(data_cfg["bt_min_k"])
@@ -824,10 +842,10 @@ class TCEvaluator:
         tf.random.set_seed(ev["seed"])
         np.random.seed(ev["seed"])
 
-        eval_root = out_dir / "eval" / tag
+        eval_root = resolve_eval_root(out_dir, tag, split)
         eval_root.mkdir(parents=True, exist_ok=True)
 
-        real_by_class, real_wind_by_class = _sample_real_by_class(cfg, n_per, ev["real_seed"])
+        real_by_class, real_wind_by_class = _sample_real_by_class(cfg, n_per, ev["real_seed"], split)
 
         gen_raw_by_class: Dict[int, np.ndarray] = {}
         gen_post_by_class: Dict[int, np.ndarray] = {}
@@ -1006,6 +1024,7 @@ class TCEvaluator:
 
         report = {
             "tag": tag,
+            "split": split,
             "heavy": heavy,
             "n_per_class": n_per,
             "n_plot_per_group": n_plot,
