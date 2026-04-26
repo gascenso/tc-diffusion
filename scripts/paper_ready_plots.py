@@ -30,7 +30,8 @@ DEFAULT_CLASS_LABELS = {
 FIGURE_PIXEL = "pixel_plausibility"
 FIGURE_RADIAL = "radial_bt_profile"
 FIGURE_DAV = "dav"
-ALL_FIGURES = (FIGURE_PIXEL, FIGURE_RADIAL, FIGURE_DAV)
+FIGURE_COLD = "cold_cloud_fraction"
+ALL_FIGURES = (FIGURE_PIXEL, FIGURE_RADIAL, FIGURE_DAV, FIGURE_COLD)
 
 REAL_COLOR = "#111827"
 MODEL_COLORS = ["#b65f2a", "#1f6f78", "#7b516d"]
@@ -149,6 +150,35 @@ class DAVClassInference:
     supports_image_level_stats: bool = False
 
 
+@dataclass
+class ColdCloudPanel:
+    class_id: int
+    label: str
+    threshold_k: float
+    real_values: np.ndarray
+    gen_values: np.ndarray
+    real_mean_fraction: float
+    gen_mean_fraction: float
+    abs_gap_fraction: float
+
+
+@dataclass
+class ColdCloudModelInference:
+    gen_density_low: np.ndarray | None = None
+    gen_density_high: np.ndarray | None = None
+    gap_ci: tuple[float, float] | None = None
+    gap_null_q95: float | None = None
+    gap_pvalue: float | None = None
+
+
+@dataclass
+class ColdCloudClassInference:
+    real_density_low: np.ndarray | None = None
+    real_density_high: np.ndarray | None = None
+    model: Dict[int, ColdCloudModelInference] = field(default_factory=dict)
+    supports_image_level_stats: bool = False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -167,7 +197,8 @@ def parse_args() -> argparse.Namespace:
             "Optional single-figure mode. If omitted, the script renders every available paper-ready plot. "
             f"{FIGURE_PIXEL!r} reproduces the BT histogram plot; "
             f"{FIGURE_RADIAL!r} renders the azimuthally averaged radial BT profiles; "
-            f"{FIGURE_DAV!r} renders the deviation-angle-variance distributions."
+            f"{FIGURE_DAV!r} renders the deviation-angle-variance distributions; "
+            f"{FIGURE_COLD!r} renders the cold-cloud-fraction distributions."
         ),
     )
     parser.add_argument(
@@ -1158,6 +1189,137 @@ def _load_dav_report(repo_root: Path, spec: InputSpec) -> LoadedReport:
     )
 
 
+def _build_cold_cloud_panel(
+    *,
+    class_id: int,
+    label: str,
+    threshold_k: float,
+    real_values: np.ndarray,
+    gen_values: np.ndarray,
+    abs_gap_fraction: float | None = None,
+) -> ColdCloudPanel:
+    real_values = _ensure_1d_array(real_values, field_name=f"per_class.{class_id}.real_cold_fraction_values")
+    gen_values = _ensure_1d_array(gen_values, field_name=f"per_class.{class_id}.gen_cold_fraction_values")
+    if abs_gap_fraction is None:
+        abs_gap_fraction = float(abs(np.mean(real_values) - np.mean(gen_values)))
+    return ColdCloudPanel(
+        class_id=class_id,
+        label=label,
+        threshold_k=float(threshold_k),
+        real_values=np.asarray(real_values, dtype=np.float64),
+        gen_values=np.asarray(gen_values, dtype=np.float64),
+        real_mean_fraction=float(np.mean(real_values)),
+        gen_mean_fraction=float(np.mean(gen_values)),
+        abs_gap_fraction=float(abs_gap_fraction),
+    )
+
+
+def _load_cold_cloud_panels_from_npz_artifact(
+    *,
+    metrics_path: Path,
+    manifest: Dict[str, Any],
+) -> Dict[int, ColdCloudPanel]:
+    raw_path = manifest.get("path")
+    if not raw_path:
+        raise ValueError(f"Cold-cloud-fraction artifact manifest in {metrics_path} is missing a path.")
+    artifact_path = _resolve_artifact_path(metrics_path, str(raw_path))
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"Cold-cloud-fraction artifact not found for {metrics_path}: {artifact_path}")
+
+    with np.load(artifact_path, allow_pickle=False) as data:
+        class_ids = _ensure_1d_array(data["class_ids"], field_name="class_ids").astype(int)
+        class_labels_arr = (
+            _ensure_1d_string_array(data["class_labels"], field_name="class_labels")
+            if "class_labels" in data.files
+            else np.asarray([], dtype=str)
+        )
+        threshold_arr = _ensure_1d_array(data["cold_threshold_k"], field_name="cold_threshold_k")
+        real_mean_rows = _ensure_1d_array(data["real_mean_fraction"], field_name="real_mean_fraction")
+        gen_mean_rows = _ensure_1d_array(data["gen_mean_fraction"], field_name="gen_mean_fraction")
+        gap_rows = (
+            _ensure_1d_array(data["cold_abs_gap_fraction"], field_name="cold_abs_gap_fraction")
+            if "cold_abs_gap_fraction" in data.files
+            else None
+        )
+        real_flat = _ensure_1d_array(data["real_fraction_flat"], field_name="real_fraction_flat")
+        gen_flat = _ensure_1d_array(data["gen_fraction_flat"], field_name="gen_fraction_flat")
+        real_class_offsets = _ensure_offsets_array(data["real_class_offsets"], field_name="real_class_offsets")
+        gen_class_offsets = _ensure_offsets_array(data["gen_class_offsets"], field_name="gen_class_offsets")
+
+    threshold_k = float(threshold_arr[0])
+    n_classes = class_ids.size
+    if class_labels_arr.size not in {0, n_classes}:
+        raise ValueError(f"Artifact {artifact_path} has {class_labels_arr.size} labels for {n_classes} classes.")
+    if real_mean_rows.size != n_classes or gen_mean_rows.size != n_classes:
+        raise ValueError(
+            f"Artifact {artifact_path} has inconsistent cold-cloud-fraction mean dimensions for {n_classes} classes."
+        )
+    if gap_rows is not None and gap_rows.size != n_classes:
+        raise ValueError(
+            f"Artifact {artifact_path} has {gap_rows.size} cold-cloud-fraction gap values for {n_classes} classes."
+        )
+    if real_class_offsets.size != n_classes + 1 or int(real_class_offsets[-1]) != int(real_flat.size):
+        raise ValueError(f"Artifact {artifact_path} has inconsistent real cold-cloud-fraction offsets.")
+    if gen_class_offsets.size != n_classes + 1 or int(gen_class_offsets[-1]) != int(gen_flat.size):
+        raise ValueError(f"Artifact {artifact_path} has inconsistent generated cold-cloud-fraction offsets.")
+
+    manifest_labels = manifest.get("class_labels", {})
+    if not isinstance(manifest_labels, dict):
+        manifest_labels = {}
+
+    panels: Dict[int, ColdCloudPanel] = {}
+    for idx, class_id in enumerate(class_ids.tolist()):
+        label = str(
+            manifest_labels.get(str(class_id))
+            or (class_labels_arr[idx] if class_labels_arr.size else "")
+            or _default_label(class_id)
+        )
+        real_start = int(real_class_offsets[idx])
+        real_stop = int(real_class_offsets[idx + 1])
+        gen_start = int(gen_class_offsets[idx])
+        gen_stop = int(gen_class_offsets[idx + 1])
+        panels[class_id] = _build_cold_cloud_panel(
+            class_id=class_id,
+            label=label,
+            threshold_k=threshold_k,
+            real_values=real_flat[real_start:real_stop],
+            gen_values=gen_flat[gen_start:gen_stop],
+            abs_gap_fraction=float(gap_rows[idx]) if gap_rows is not None else None,
+        )
+    return panels
+
+
+def _load_cold_cloud_report(repo_root: Path, spec: InputSpec) -> LoadedReport:
+    metrics_path = _resolve_metrics_path(repo_root, spec.run_name, spec.eval_ref)
+    report = _load_json(metrics_path)
+    paper_ready = report.get("paper_ready", {})
+    cold_ref = paper_ready.get("cold_cloud_fraction") if isinstance(paper_ready, dict) else None
+    if not isinstance(cold_ref, dict) or "path" not in cold_ref:
+        raise ValueError(
+            "The metrics JSON does not contain saved cold-cloud-fraction curves for paper-ready plotting. "
+            "Re-run eval with the updated code so it writes paper_ready.cold_cloud_fraction."
+        )
+
+    panels = _load_cold_cloud_panels_from_npz_artifact(metrics_path=metrics_path, manifest=cold_ref)
+    class_ids = sorted(panels.keys())
+    expected_class_ids = list(range(6))
+    if class_ids != expected_class_ids:
+        raise ValueError(f"Expected classes 0..5 in {metrics_path}, found {class_ids}.")
+
+    split = str(report.get("split") or _infer_split_from_eval_ref(spec.eval_ref)).strip().lower()
+    return LoadedReport(
+        figure_kind=FIGURE_COLD,
+        run_name=spec.run_name,
+        label=spec.label,
+        eval_ref=spec.eval_ref,
+        split=split,
+        tag=str(report.get("tag", Path(spec.eval_ref).name)),
+        n_per_class=int(report.get("n_per_class", -1)),
+        metrics_path=metrics_path,
+        panels=panels,
+    )
+
+
 def _load_report(repo_root: Path, spec: InputSpec, *, figure_kind: str) -> LoadedReport:
     if figure_kind == FIGURE_PIXEL:
         return _load_pixel_report(repo_root, spec)
@@ -1165,6 +1327,8 @@ def _load_report(repo_root: Path, spec: InputSpec, *, figure_kind: str) -> Loade
         return _load_radial_report(repo_root, spec)
     if figure_kind == FIGURE_DAV:
         return _load_dav_report(repo_root, spec)
+    if figure_kind == FIGURE_COLD:
+        return _load_cold_cloud_report(repo_root, spec)
     raise ValueError(f"Unsupported figure kind: {figure_kind}")
 
 
@@ -1272,6 +1436,47 @@ def _validate_dav_reports(reports: list[LoadedReport]) -> None:
                 )
 
 
+def _validate_cold_cloud_reports(reports: list[LoadedReport]) -> None:
+    if not reports:
+        raise ValueError("No reports were loaded.")
+
+    ref = reports[0]
+    class_ids = sorted(ref.panels.keys())
+    ref_threshold = float(ref.panels[class_ids[0]].threshold_k)
+    for other in reports[1:]:
+        if other.split != ref.split:
+            raise ValueError(
+                "All plotted reports must use the same split. "
+                f"Found {ref.run_name!r} on {ref.split!r} and {other.run_name!r} on {other.split!r}."
+            )
+        if other.n_per_class != ref.n_per_class:
+            raise ValueError(
+                "All plotted reports must use the same n_per_class for a fair comparison. "
+                f"Found {ref.run_name!r}={ref.n_per_class} and {other.run_name!r}={other.n_per_class}."
+            )
+        if sorted(other.panels.keys()) != class_ids:
+            raise ValueError("All plotted reports must contain the same class panels.")
+        other_threshold = float(other.panels[class_ids[0]].threshold_k)
+        if not np.isclose(other_threshold, ref_threshold):
+            raise ValueError(
+                "All plotted reports must use the same cold-cloud threshold. "
+                f"Found {ref_threshold} K and {other_threshold} K."
+            )
+        for class_id in class_ids:
+            ref_panel = ref.panels[class_id]
+            other_panel = other.panels[class_id]
+            if ref_panel.real_values.shape != other_panel.real_values.shape or not np.allclose(
+                np.sort(ref_panel.real_values),
+                np.sort(other_panel.real_values),
+                atol=1e-12,
+                rtol=0.0,
+            ):
+                raise ValueError(
+                    "Real reference cold-cloud-fraction values differ across reports. "
+                    "Re-run eval with the same split, n_per_class, and real-data seed before plotting together."
+                )
+
+
 def _validate_reports(reports: list[LoadedReport], *, figure_kind: str) -> None:
     if figure_kind == FIGURE_PIXEL:
         _validate_pixel_reports(reports)
@@ -1281,6 +1486,9 @@ def _validate_reports(reports: list[LoadedReport], *, figure_kind: str) -> None:
         return
     if figure_kind == FIGURE_DAV:
         _validate_dav_reports(reports)
+        return
+    if figure_kind == FIGURE_COLD:
+        _validate_cold_cloud_reports(reports)
         return
     raise ValueError(f"Unsupported figure kind: {figure_kind}")
 
@@ -1299,6 +1507,8 @@ def _default_output_filename(reports: list[LoadedReport], *, figure_kind: str) -
         stem = "paper_ready_radial_bt_profile"
     elif figure_kind == FIGURE_DAV:
         stem = "paper_ready_dav"
+    elif figure_kind == FIGURE_COLD:
+        stem = "paper_ready_cold_cloud_fraction"
     else:
         raise ValueError(f"Unsupported figure kind: {figure_kind}")
     return f"{stem}_{split_slug}_{model_slug}.png"
@@ -1989,6 +2199,77 @@ def _format_dav_value(value: float) -> str:
     return f"{value:.2f}"
 
 
+def _compute_cold_cloud_class_inference(
+    reports: list[LoadedReport],
+    class_id: int,
+    bins: np.ndarray,
+    *,
+    smooth_sigma: float,
+    bootstrap_reps: int,
+    null_reps: int,
+    ci_level: float,
+    seed: int,
+) -> ColdCloudClassInference:
+    ref_panel = reports[0].panels[class_id]
+    real_values = np.asarray(ref_panel.real_values, dtype=np.float64) * 100.0
+    real_hist_counts = _scalar_hist_counts_rows(real_values, bins)
+    if real_hist_counts.shape[0] < 2:
+        return ColdCloudClassInference()
+
+    out = ColdCloudClassInference(supports_image_level_stats=True)
+    out.real_density_low, out.real_density_high = _bootstrap_density_band(
+        real_hist_counts,
+        bins,
+        reps=bootstrap_reps,
+        ci_level=ci_level,
+        sigma_bins=smooth_sigma,
+        seed=seed + 101 * class_id,
+    )
+
+    null_gap = _bootstrap_scalar_real_null(
+        real_values,
+        other_sample_size=int(ref_panel.gen_values.shape[0]),
+        reps=null_reps,
+        seed=seed + 1000 + 101 * class_id,
+    )
+
+    for report_idx, report in enumerate(reports):
+        panel = report.panels[class_id]
+        gen_values = np.asarray(panel.gen_values, dtype=np.float64) * 100.0
+        model_stats = ColdCloudModelInference()
+        gen_hist_counts = _scalar_hist_counts_rows(gen_values, bins)
+        model_stats.gen_density_low, model_stats.gen_density_high = _bootstrap_density_band(
+            gen_hist_counts,
+            bins,
+            reps=bootstrap_reps,
+            ci_level=ci_level,
+            sigma_bins=smooth_sigma,
+            seed=seed + 2000 + 211 * class_id + report_idx,
+        )
+        gap_dist = _bootstrap_scalar_gap_distribution(
+            real_values,
+            gen_values,
+            reps=bootstrap_reps,
+            seed=seed + 3000 + 211 * class_id + report_idx,
+        )
+        if gap_dist is not None and gap_dist.size:
+            model_stats.gap_ci = _quantile_interval(gap_dist, ci_level)
+        if null_gap is not None and null_gap.size:
+            model_stats.gap_null_q95 = float(np.quantile(null_gap, 0.95))
+            model_stats.gap_pvalue = _empirical_pvalue(panel.abs_gap_fraction * 100.0, null_gap)
+        out.model[report_idx] = model_stats
+    return out
+
+
+def _format_pct_points(value: float) -> str:
+    value = float(value)
+    if abs(value) >= 10.0:
+        return f"{value:.1f}"
+    if abs(value) >= 1.0:
+        return f"{value:.2f}"
+    return f"{value:.3f}"
+
+
 def _truncate_label(text: str, max_len: int = 18) -> str:
     text = str(text)
     if len(text) <= max_len:
@@ -2160,6 +2441,62 @@ def _draw_dav_metrics_text(
             )
         else:
             lines.append((f"{label}  |Δμ| {_format_dav_value(panel.abs_gap_deg2)} deg²", MODEL_COLORS[idx]))
+
+    text = "\n".join(line for line, _ in lines)
+    ax.text(
+        0.03,
+        0.965,
+        text,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=7.7,
+        linespacing=1.38,
+        color="#111827",
+        bbox={
+            "boxstyle": "round,pad=0.34,rounding_size=0.06",
+            "facecolor": (1.0, 1.0, 1.0, 0.86),
+            "edgecolor": (1.0, 1.0, 1.0, 0.0),
+        },
+        zorder=8,
+    )
+
+    for idx, (_, color) in enumerate(lines):
+        y = 0.946 - idx * 0.084
+        ax.plot(
+            [0.038, 0.055],
+            [y - 0.012, y - 0.012],
+            transform=ax.transAxes,
+            color=color,
+            linewidth=2.2,
+            solid_capstyle="round",
+            zorder=9,
+        )
+
+
+def _draw_cold_cloud_metrics_text(
+    ax,
+    reports: list[LoadedReport],
+    inference: ColdCloudClassInference,
+    class_id: int,
+) -> None:
+    lines = []
+    for idx, report in enumerate(reports):
+        panel = report.panels[class_id]
+        stats = inference.model.get(idx)
+        label = _truncate_label(report.label, max_len=14)
+        gap_pp = panel.abs_gap_fraction * 100.0
+        if stats is not None and stats.gap_ci is not None:
+            lines.append(
+                (
+                    f"{label}  |Δμ| {_format_pct_points(gap_pp)} "
+                    f"[{_format_pct_points(stats.gap_ci[0])}, {_format_pct_points(stats.gap_ci[1])}] pp, "
+                    f"p{_format_pvalue(stats.gap_pvalue)}",
+                    MODEL_COLORS[idx],
+                )
+            )
+        else:
+            lines.append((f"{label}  |Δμ| {_format_pct_points(gap_pp)} pp", MODEL_COLORS[idx]))
 
     text = "\n".join(line for line, _ in lines)
     ax.text(
@@ -2709,6 +3046,217 @@ def _plot_dav_reports(
     plt.close(fig)
 
 
+def _plot_cold_cloud_reports(
+    reports: list[LoadedReport],
+    out_path: Path,
+    *,
+    smooth_sigma: float,
+    bootstrap_reps: int,
+    null_reps: int,
+    ci_level: float,
+    stats_seed: int,
+) -> None:
+    _validate_reports(reports, figure_kind=FIGURE_COLD)
+    _configure_style()
+
+    ref = reports[0]
+    class_ids = sorted(ref.panels.keys())
+    transformed_reports = []
+    for report in reports:
+        transformed_panels = {}
+        for class_id in class_ids:
+            panel = report.panels[class_id]
+            transformed_panels[class_id] = (
+                np.asarray(panel.real_values, dtype=np.float64) * 100.0,
+                np.asarray(panel.gen_values, dtype=np.float64) * 100.0,
+            )
+        transformed_reports.append(transformed_panels)
+
+    bins = _build_scalar_bins(
+        [
+            LoadedReport(
+                figure_kind=FIGURE_COLD,
+                run_name=report.run_name,
+                label=report.label,
+                eval_ref=report.eval_ref,
+                split=report.split,
+                tag=report.tag,
+                n_per_class=report.n_per_class,
+                metrics_path=report.metrics_path,
+                panels={
+                    class_id: DAVPanel(
+                        class_id=class_id,
+                        label=report.panels[class_id].label,
+                        real_values=transformed_reports[idx][class_id][0],
+                        gen_values=transformed_reports[idx][class_id][1],
+                        real_mean=float(np.mean(transformed_reports[idx][class_id][0])),
+                        gen_mean=float(np.mean(transformed_reports[idx][class_id][1])),
+                        abs_gap_deg2=float(abs(np.mean(transformed_reports[idx][class_id][0]) - np.mean(transformed_reports[idx][class_id][1]))),
+                    )
+                    for class_id in class_ids
+                },
+            )
+            for idx, report in enumerate(reports)
+        ],
+        bins_per_panel=56,
+    )
+
+    inference_by_class = {
+        class_id: _compute_cold_cloud_class_inference(
+            reports,
+            class_id,
+            bins,
+            smooth_sigma=smooth_sigma,
+            bootstrap_reps=int(bootstrap_reps),
+            null_reps=int(null_reps),
+            ci_level=float(ci_level),
+            seed=int(stats_seed),
+        )
+        for class_id in class_ids
+    }
+
+    x_min = float(bins[0])
+    x_max = float(bins[-1])
+    display_cache: Dict[tuple[int, int, str], tuple[np.ndarray, np.ndarray]] = {}
+    y_max = 0.0
+    for class_id in class_ids:
+        real_values = transformed_reports[0][class_id][0]
+        real_density = _scalar_density_from_values(real_values, bins)
+        display_cache[(0, class_id, "real")] = _display_curve(real_density, bins, smooth_sigma)
+        y_max = max(y_max, float(np.max(display_cache[(0, class_id, "real")][1])))
+        inference = inference_by_class[class_id]
+        if inference.real_density_low is not None and inference.real_density_high is not None:
+            y_max = max(y_max, float(np.max(inference.real_density_low)), float(np.max(inference.real_density_high)))
+        for report_idx, _report in enumerate(reports):
+            gen_values = transformed_reports[report_idx][class_id][1]
+            gen_density = _scalar_density_from_values(gen_values, bins)
+            curve = _display_curve(gen_density, bins, smooth_sigma)
+            display_cache[(report_idx, class_id, "gen")] = curve
+            y_max = max(y_max, float(np.max(curve[1])))
+            model_inference = inference.model.get(report_idx)
+            if model_inference is not None:
+                if model_inference.gen_density_low is not None:
+                    y_max = max(y_max, float(np.max(model_inference.gen_density_low)))
+                if model_inference.gen_density_high is not None:
+                    y_max = max(y_max, float(np.max(model_inference.gen_density_high)))
+
+    y_top = y_max * 1.14 if y_max > 0.0 else 1.0
+    threshold_k = float(ref.panels[class_ids[0]].threshold_k)
+
+    fig, axes = plt.subplots(2, 3, figsize=(14.4, 8.0), sharex=True, sharey=True)
+    flat_axes = axes.ravel()
+    panel_letters = "ABCDEF"
+
+    for panel_idx, (ax, class_id) in enumerate(zip(flat_axes, class_ids)):
+        panel = ref.panels[class_id]
+        inference = inference_by_class[class_id]
+        x_real, y_real = display_cache[(0, class_id, "real")]
+        if inference.real_density_low is not None and inference.real_density_high is not None:
+            low_x, low_y = _display_curve(inference.real_density_low, bins, 0.0)
+            high_x, high_y = _display_curve(inference.real_density_high, bins, 0.0)
+            ax.fill_between(
+                low_x,
+                low_y,
+                high_y,
+                color="#cbd5e1",
+                alpha=0.42,
+                zorder=1,
+                linewidth=0.0,
+            )
+        ax.fill_between(x_real, 0.0, y_real, color="#dbe4ee", alpha=0.24, zorder=2)
+        ax.plot(
+            x_real,
+            y_real,
+            color=REAL_COLOR,
+            linewidth=2.6,
+            solid_capstyle="round",
+            label="Real",
+            zorder=5,
+        )
+
+        for idx, report in enumerate(reports):
+            x_gen, y_gen = display_cache[(idx, class_id, "gen")]
+            model_inference = inference.model.get(idx)
+            if (
+                model_inference is not None
+                and model_inference.gen_density_low is not None
+                and model_inference.gen_density_high is not None
+            ):
+                low_x, low_y = _display_curve(model_inference.gen_density_low, bins, 0.0)
+                high_x, high_y = _display_curve(model_inference.gen_density_high, bins, 0.0)
+                ax.fill_between(
+                    low_x,
+                    low_y,
+                    high_y,
+                    color=MODEL_COLORS[idx],
+                    alpha=0.10,
+                    zorder=3 + idx,
+                    linewidth=0.0,
+                )
+            ax.plot(
+                x_gen,
+                y_gen,
+                color=MODEL_COLORS[idx],
+                linewidth=2.2,
+                linestyle=MODEL_LINESTYLES[idx],
+                solid_capstyle="round",
+                label=report.label,
+                zorder=6 + idx,
+            )
+
+        ax.set_title(f"{panel_letters[panel_idx]}   {panel.label}", loc="left", pad=8.5)
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(0.0, y_top)
+        ax.grid(axis="y", color="#cbd5e1", linewidth=0.75, alpha=0.42)
+        ax.tick_params(length=3.2, width=0.8, color="#6b7280")
+        ax.margins(x=0.0)
+        _draw_cold_cloud_metrics_text(ax, reports, inference, class_id)
+
+    legend_handles = [Line2D([0], [0], color=REAL_COLOR, lw=2.8, label="Real")]
+    for idx, report in enumerate(reports):
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=MODEL_COLORS[idx],
+                lw=2.15,
+                linestyle=MODEL_LINESTYLES[idx],
+                label=report.label,
+            )
+        )
+
+    fig.legend(
+        handles=legend_handles,
+        labels=[handle.get_label() for handle in legend_handles],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.986),
+        ncol=min(4, len(legend_handles)),
+        frameon=False,
+        handlelength=2.7,
+        columnspacing=1.6,
+    )
+    fig.supxlabel(f"Cold-cloud fraction [% pixels < {threshold_k:.0f} K]", y=0.055)
+    fig.supylabel("Density [1/pp]", x=0.04)
+    fig.text(
+        0.5,
+        0.017,
+        (
+            f"Shaded bands: {int(round(ci_level * 100))}% image-level bootstrap intervals for the real and "
+            "generated cold-cloud-fraction distributions. Reported p-values compare observed |Δμ| in "
+            "percentage points against a matched real-vs-real null."
+        ),
+        ha="center",
+        va="bottom",
+        fontsize=8.8,
+        color="#4b5563",
+    )
+    fig.tight_layout(rect=(0.04, 0.07, 0.995, 0.93))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _resolve_figure_kinds(args: argparse.Namespace) -> list[str]:
     if args.plot_only and args.figure and args.plot_only != args.figure:
         raise ValueError("Use either --plot_only or --figure, not both.")
@@ -2725,6 +3273,8 @@ def _figure_label(figure_kind: str) -> str:
         return "radial BT profile"
     if figure_kind == FIGURE_DAV:
         return "DAV"
+    if figure_kind == FIGURE_COLD:
+        return "cold-cloud fraction"
     raise ValueError(f"Unsupported figure kind: {figure_kind}")
 
 
@@ -2735,6 +3285,8 @@ def _missing_stats_field(figure_kind: str) -> str:
         return "radial-profile"
     if figure_kind == FIGURE_DAV:
         return "DAV"
+    if figure_kind == FIGURE_COLD:
+        return "cold-cloud-fraction"
     raise ValueError(f"Unsupported figure kind: {figure_kind}")
 
 
@@ -2744,6 +3296,8 @@ def _report_missing_image_level_stats(reports: list[LoadedReport], *, figure_kin
     if figure_kind == FIGURE_RADIAL:
         return any(report.panels[0].real_profiles is None for report in reports)
     if figure_kind == FIGURE_DAV:
+        return any(report.panels[0].real_values.size < 2 for report in reports)
+    if figure_kind == FIGURE_COLD:
         return any(report.panels[0].real_values.size < 2 for report in reports)
     raise ValueError(f"Unsupported figure kind: {figure_kind}")
 
@@ -2799,6 +3353,16 @@ def main() -> None:
             )
         elif figure_kind == FIGURE_DAV:
             _plot_dav_reports(
+                reports,
+                output_path,
+                smooth_sigma=float(args.smooth_sigma),
+                bootstrap_reps=int(args.bootstrap_reps),
+                null_reps=int(args.null_reps),
+                ci_level=float(args.ci_level),
+                stats_seed=int(args.stats_seed),
+            )
+        elif figure_kind == FIGURE_COLD:
+            _plot_cold_cloud_reports(
                 reports,
                 output_path,
                 smooth_sigma=float(args.smooth_sigma),

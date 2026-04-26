@@ -44,10 +44,11 @@ PRIMARY_RAW_AGG_KEYS = (
     "gen_exceedance_rate_total",
 )
 
-REPORT_SCHEMA_VERSION = 6
+REPORT_SCHEMA_VERSION = 7
 PAPER_READY_PIXEL_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.pixel_plausibility.v2"
 PAPER_READY_RADIAL_BT_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_bt_profile.v1"
 PAPER_READY_DAV_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.dav.v1"
+PAPER_READY_COLD_CLOUD_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.cold_cloud_fraction.v1"
 PER_CLASS_METRICS_CSV_SCHEMA = "tc_diffusion.per_class_metrics.v1"
 
 
@@ -999,6 +1000,73 @@ def _write_paper_ready_dav_npz(
     }
 
 
+def _write_paper_ready_cold_cloud_fraction_npz(
+    path: Path,
+    *,
+    class_caches: Dict[int, ClassMetricCache],
+    threshold_k: float,
+) -> Dict[str, Any]:
+    if not class_caches:
+        return {}
+
+    class_ids = sorted(int(c) for c in class_caches.keys())
+    class_labels = _default_paper_ready_class_labels(class_ids)
+
+    real_rows = []
+    gen_rows = []
+    real_mean_rows = []
+    gen_mean_rows = []
+    gap_rows = []
+    real_class_offsets = [0]
+    gen_class_offsets = [0]
+
+    for class_id in class_ids:
+        cache = class_caches[class_id]
+        real_cold = np.asarray(cache.real_cold, dtype=np.float32).reshape(-1)
+        gen_cold = np.asarray(cache.gen_raw_cold, dtype=np.float32).reshape(-1)
+        real_rows.append(real_cold)
+        gen_rows.append(gen_cold)
+        real_mean_rows.append(float(real_cold.mean()))
+        gen_mean_rows.append(float(gen_cold.mean()))
+        gap_rows.append(float(abs(real_cold.mean() - gen_cold.mean())))
+        real_class_offsets.append(real_class_offsets[-1] + int(real_cold.shape[0]))
+        gen_class_offsets.append(gen_class_offsets[-1] + int(gen_cold.shape[0]))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        schema=np.asarray(PAPER_READY_COLD_CLOUD_ARTIFACT_SCHEMA),
+        class_ids=np.asarray(class_ids, dtype=np.int32),
+        class_labels=np.asarray([class_labels[c] for c in class_ids]),
+        cold_threshold_k=np.asarray([float(threshold_k)], dtype=np.float64),
+        real_mean_fraction=np.asarray(real_mean_rows, dtype=np.float64),
+        gen_mean_fraction=np.asarray(gen_mean_rows, dtype=np.float64),
+        cold_abs_gap_fraction=np.asarray(gap_rows, dtype=np.float64),
+        real_fraction_flat=np.concatenate(real_rows, axis=0),
+        gen_fraction_flat=np.concatenate(gen_rows, axis=0),
+        real_class_offsets=np.asarray(real_class_offsets, dtype=np.int32),
+        gen_class_offsets=np.asarray(gen_class_offsets, dtype=np.int32),
+    )
+
+    return {
+        "schema": PAPER_READY_COLD_CLOUD_ARTIFACT_SCHEMA,
+        "metric_variant": "raw",
+        "metric_name": "cold_abs_gap_fraction",
+        "metric_units": {"cold_abs_gap_fraction": "fraction", "cold_mean": "fraction"},
+        "threshold_k": float(threshold_k),
+        "class_ids": [int(c) for c in class_ids],
+        "class_labels": {str(c): class_labels[c] for c in class_ids},
+        "per_image_fraction": {
+            "available": True,
+            "encoding": "flat_rows_with_class_offsets",
+            "fields": {
+                "real": {"values": "real_fraction_flat", "offsets": "real_class_offsets"},
+                "generated": {"values": "gen_fraction_flat", "offsets": "gen_class_offsets"},
+            },
+        },
+    }
+
+
 def _compute_aggregate_primary_raw(class_scalars: Dict[int, Dict[str, float]]) -> Dict[str, float]:
     if not class_scalars:
         return {}
@@ -1612,6 +1680,18 @@ class TCEvaluator:
                     "storage": "sidecar_npz",
                     "path": dav_artifact_path.relative_to(eval_root).as_posix(),
                     **dav_manifest,
+                }
+            cold_artifact_path = artifacts_root / "paper_ready" / "cold_cloud_fraction.npz"
+            cold_manifest = _write_paper_ready_cold_cloud_fraction_npz(
+                cold_artifact_path,
+                class_caches=class_caches,
+                threshold_k=200.0,
+            )
+            if cold_manifest:
+                paper_ready_manifest["cold_cloud_fraction"] = {
+                    "storage": "sidecar_npz",
+                    "path": cold_artifact_path.relative_to(eval_root).as_posix(),
+                    **cold_manifest,
                 }
 
         report = {
