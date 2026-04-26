@@ -882,7 +882,7 @@ def train(cfg, resume: bool = False):
             ]
         )
         with tf.GradientTape() as tape:
-            loss = diffusion.loss(model, x0, cond, seed=loss_seed)
+            loss = diffusion.loss(model, x0, cond, seed=loss_seed, global_step=step_index)
             # Loss scaling must happen inside the tape so that the scale factor
             # is included in the gradient computation.
             if use_mixed_precision:

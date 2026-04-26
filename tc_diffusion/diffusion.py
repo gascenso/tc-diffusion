@@ -139,6 +139,8 @@ class Diffusion:
         phys_cfg = cfg.get("physics_loss", {})
         self.physics_enabled = bool(phys_cfg.get("enabled", False))
         self.physics_lambda = float(phys_cfg.get("lambda_phys", 0.0))
+        physics_lambda_warmup_steps = phys_cfg.get("lambda_phys_warmup_steps", 0)
+        physics_lambda_warmup_frac = phys_cfg.get("lambda_phys_warmup_frac", 0.0)
         self.physics_radial_weight = float(phys_cfg.get("radial_weight", 1.0))
         self.physics_cold_weight = float(phys_cfg.get("cold_weight", 1.0))
         self.physics_grad_weight = float(phys_cfg.get("grad_weight", 1.0))
@@ -147,6 +149,8 @@ class Diffusion:
         self.physics_cold_threshold_k = float(phys_cfg.get("cold_threshold_k", 235.0))
         self.physics_cold_softness_k = float(phys_cfg.get("cold_softness_k", 5.0))
         self.physics_charbonnier_eps = float(phys_cfg.get("charbonnier_eps", 1e-3))
+        self.physics_lambda_warmup_steps = int(physics_lambda_warmup_steps)
+        self.physics_lambda_warmup_frac = float(physics_lambda_warmup_frac)
         self.bt_min_k = float(cfg["data"]["bt_min_k"])
         self.bt_max_k = float(cfg["data"]["bt_max_k"])
         self.bt_range_k = self.bt_max_k - self.bt_min_k
@@ -185,10 +189,40 @@ class Diffusion:
                 "physics_loss.charbonnier_eps must be > 0, "
                 f"got {self.physics_charbonnier_eps}"
             )
+        if self.physics_lambda_warmup_steps < 0:
+            raise ValueError(
+                "physics_loss.lambda_phys_warmup_steps must be >= 0, "
+                f"got {self.physics_lambda_warmup_steps}"
+            )
+        if self.physics_lambda_warmup_frac < 0.0 or self.physics_lambda_warmup_frac > 1.0:
+            raise ValueError(
+                "physics_loss.lambda_phys_warmup_frac must be in [0, 1], "
+                f"got {self.physics_lambda_warmup_frac}"
+            )
+        if self.physics_lambda_warmup_steps > 0 and self.physics_lambda_warmup_frac > 0.0:
+            raise ValueError(
+                "Specify only one of physics_loss.lambda_phys_warmup_steps or "
+                "physics_loss.lambda_phys_warmup_frac."
+            )
         if self.bt_range_k <= 0.0:
             raise ValueError(
                 "data.bt_max_k must be > data.bt_min_k to support physics_loss, "
                 f"got bt_min_k={self.bt_min_k}, bt_max_k={self.bt_max_k}"
+            )
+
+        if self.physics_lambda_warmup_frac > 0.0:
+            train_cfg = cfg.get("training", {})
+            total_train_steps = int(train_cfg.get("num_epochs", 0)) * int(
+                train_cfg.get("steps_per_epoch", 0)
+            )
+            if total_train_steps <= 0:
+                raise ValueError(
+                    "physics_loss.lambda_phys_warmup_frac requires positive "
+                    "training.num_epochs and training.steps_per_epoch."
+                )
+            self.physics_lambda_warmup_steps = max(
+                1,
+                int(np.ceil(total_train_steps * self.physics_lambda_warmup_frac)),
             )
 
         self.physics_active = (
@@ -372,6 +406,16 @@ class Diffusion:
         snr = alpha_bar_t / (1.0 - alpha_bar_t + 1e-8)
         gate = snr / (snr + 1.0)
         return tf.clip_by_value(gate, 0.0, tf.cast(self.physics_snr_gate_max, tf.float32))
+
+    def _effective_physics_lambda(self, global_step=None):
+        physics_lambda = tf.cast(self.physics_lambda, tf.float32)
+        if self.physics_lambda_warmup_steps <= 0 or global_step is None:
+            return physics_lambda
+
+        step = tf.cast(global_step, tf.float32)
+        warmup_steps = tf.cast(self.physics_lambda_warmup_steps, tf.float32)
+        progress = tf.clip_by_value((step + 1.0) / warmup_steps, 0.0, 1.0)
+        return physics_lambda * progress
 
     def _physics_loss_per_sample(self, x0_true, x0_hat):
         x0_true = tf.cast(x0_true, tf.float32)
@@ -594,7 +638,7 @@ class Diffusion:
         eps_theta = (x_t - sqrt_alpha_bar * x0_pred) / (sqrt_one_minus_alpha_bar + 1e-8)
         return x0_pred, eps_theta
 
-    def loss(self, model, x0, cond, training: bool = True, t=None, noise=None, seed=None):
+    def loss(self, model, x0, cond, training: bool = True, t=None, noise=None, seed=None, global_step=None):
         """
         One-step diffusion training loss.
         x0: (B, H, W, C) in [-1, 1]
@@ -690,7 +734,8 @@ class Diffusion:
         phys_loss_per_sample = self._physics_loss_per_sample(x0_f32, x0_hat)
         gate = self._physics_gate(alpha_bar_t_f32)
         physics_loss = tf.reduce_mean(gate * phys_loss_per_sample)
-        return base_loss + tf.cast(self.physics_lambda, tf.float32) * physics_loss
+        physics_lambda = self._effective_physics_lambda(global_step if training else None)
+        return base_loss + physics_lambda * physics_loss
 
     # --- for sampling ---
     def p_sample_step(self, model, x_t, t_int, cond, guidance_scale=0.0):
