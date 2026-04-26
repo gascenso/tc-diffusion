@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import tensorflow as tf
 import numpy as np
 from tqdm.auto import tqdm
@@ -897,6 +899,7 @@ class Diffusion:
         timestep_schedule: str | None = None,
         ddim_eta: float = 0.0,
         return_both: bool = False,
+        progress_callback: Callable[[int], None] | None = None,
     ):
         """
         Generate samples starting from pure noise.
@@ -941,25 +944,18 @@ class Diffusion:
                 "wind_kt": wind_kt_t,
             }
 
+        timesteps = self.get_sampling_timesteps(
+            sampler=sampler,
+            num_sampling_steps=num_sampling_steps,
+            timestep_schedule=timestep_schedule,
+        )
         sampler_name = str(sampler).strip().lower()
         if sampler_name == "dpm_solverpp_2m":
             sampler_name = "dpmpp_2m"
-        if sampler_name not in {"ddpm", "ddim", "dpmpp_2m"}:
-            raise ValueError(
-                f"Unsupported sampler '{sampler}'. Expected 'ddpm', 'ddim', or 'dpmpp_2m'."
-            )
-
-        if sampler_name == "ddpm":
-            timesteps = list(range(self.num_steps - 1, -1, -1))
-        else:
-            timesteps = self._build_sampling_timesteps(
-                num_sampling_steps,
-                sampler_name=sampler_name,
-                timestep_schedule=timestep_schedule,
-            )
 
         t_iter = timesteps
-        if show_progress:
+        use_local_progress = bool(show_progress and progress_callback is None)
+        if use_local_progress:
             t_iter = tqdm(
                 t_iter,
                 total=len(timesteps),
@@ -970,6 +966,8 @@ class Diffusion:
         if sampler_name == "ddpm":
             for t_int in t_iter:
                 x_t = self.p_sample_step(model, x_t, t_int, cond, guidance_scale=guidance_scale)
+                if progress_callback is not None:
+                    progress_callback(1)
         elif sampler_name == "ddim":
             for idx, t_int in enumerate(t_iter):
                 t_prev_int = timesteps[idx + 1] if idx + 1 < len(timesteps) else -1
@@ -982,6 +980,8 @@ class Diffusion:
                     guidance_scale=guidance_scale,
                     eta=ddim_eta,
                 )
+                if progress_callback is not None:
+                    progress_callback(1)
         else:
             prev_x0_pred = None
             prev_t_int = None
@@ -998,6 +998,8 @@ class Diffusion:
                     prev_t_int=prev_t_int,
                 )
                 prev_t_int = t_int
+                if progress_callback is not None:
+                    progress_callback(1)
 
         raw_final = x_t
         clipped_final = tf.clip_by_value(raw_final, -1.0, 1.0)
@@ -1007,3 +1009,27 @@ class Diffusion:
                 "clipped_final": clipped_final,
             }
         return raw_final
+
+    def get_sampling_timesteps(
+        self,
+        *,
+        sampler: str = "dpmpp_2m",
+        num_sampling_steps: int | None = None,
+        timestep_schedule: str | None = None,
+    ) -> list[int]:
+        sampler_name = str(sampler).strip().lower()
+        if sampler_name == "dpm_solverpp_2m":
+            sampler_name = "dpmpp_2m"
+        if sampler_name not in {"ddpm", "ddim", "dpmpp_2m"}:
+            raise ValueError(
+                f"Unsupported sampler '{sampler}'. Expected 'ddpm', 'ddim', or 'dpmpp_2m'."
+            )
+
+        if sampler_name == "ddpm":
+            return list(range(self.num_steps - 1, -1, -1))
+
+        return self._build_sampling_timesteps(
+            num_sampling_steps,
+            sampler_name=sampler_name,
+            timestep_schedule=timestep_schedule,
+        )

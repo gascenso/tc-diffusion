@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -27,6 +28,7 @@ from .plots import plot_hist_overlay, plot_psd, plot_radial_profiles
 from ..data import build_data_backend, load_dataset_index, load_split_file_set
 from ..diffusion import resolve_sampling_timestep_schedule
 from ..plotting import save_real_generated_comparison_grid
+from ..sample_bank import SampleBank
 
 
 PRIMARY_RAW_AGG_KEYS = (
@@ -39,6 +41,10 @@ PRIMARY_RAW_AGG_KEYS = (
     "diversity_feature_space_abs_gap",
     "gen_exceedance_rate_total",
 )
+
+REPORT_SCHEMA_VERSION = 5
+PAPER_READY_PIXEL_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.pixel_plausibility.v2"
+PER_CLASS_METRICS_CSV_SCHEMA = "tc_diffusion.per_class_metrics.v1"
 
 
 @dataclass
@@ -104,6 +110,7 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ev.setdefault("profile_bins", 96)
     ev.setdefault("psd_bins", 96)
     ev.setdefault("bootstrap_reps", 500)
+    ev.setdefault("bootstrap_reps_full_test", 0)
     ev.setdefault("bootstrap_ci_level", 0.95)
     return ev
 
@@ -222,13 +229,14 @@ def _load_one_bt_k(backend, rel_path: str, bt_min_k: float, bt_max_k: float) -> 
     return bt
 
 
-def _sample_real_by_class(
+def _select_real_by_class(
     cfg: Dict[str, Any],
     n_per_class: int,
     seed: int,
     split: str,
-) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
-    """Load real BT images and their wind speeds, grouped by SS class."""
+    use_all: bool = False,
+) -> Tuple[Dict[int, list[str]], Dict[int, np.ndarray]]:
+    """Select real BT file paths and wind speeds, grouped by SS class."""
     split = str(split).strip().lower()
     if split not in {"val", "test"}:
         raise ValueError(f"Real-data evaluation split must be 'val' or 'test', got {split!r}")
@@ -236,15 +244,12 @@ def _sample_real_by_class(
     data_cfg = cfg["data"]
     index_path = Path(data_cfg["dataset_index"])
     split_dir = Path(data_cfg["split_dir"])
-    bt_min_k = float(data_cfg["bt_min_k"])
-    bt_max_k = float(data_cfg["bt_max_k"])
-    backend = build_data_backend(data_cfg)
 
     class_to_files, sample_meta = load_dataset_index(index_path, return_sample_meta=True)
     allowed = load_split_file_set(split_dir, split=split)
 
     rng = np.random.default_rng(seed)
-    out_imgs: Dict[int, np.ndarray] = {}
+    out_paths: Dict[int, list[str]] = {}
     out_winds: Dict[int, np.ndarray] = {}
 
     for c, rels in sorted(class_to_files.items()):
@@ -252,14 +257,17 @@ def _sample_real_by_class(
         if not rels:
             continue
 
-        k = min(n_per_class, len(rels))
-        pick = rng.choice(len(rels), size=k, replace=False)
+        if use_all:
+            pick = rng.permutation(len(rels))
+        else:
+            k = min(n_per_class, len(rels))
+            pick = rng.choice(len(rels), size=k, replace=False)
 
-        imgs = []
+        selected_rels = []
         winds = []
         for idx in pick:
             rel = rels[int(idx)]
-            imgs.append(_load_one_bt_k(backend, rel, bt_min_k, bt_max_k))
+            selected_rels.append(rel)
             meta = sample_meta.get(rel, {})
             w = meta.get("wmo_wind_kt")
             if w is not None and np.isfinite(float(w)):
@@ -267,10 +275,23 @@ def _sample_real_by_class(
             else:
                 winds.append(_ss_class_midpoint_kt(c))
 
-        out_imgs[int(c)] = np.stack(imgs, axis=0)
+        out_paths[int(c)] = selected_rels
         out_winds[int(c)] = np.array(winds, dtype=np.float32)
 
-    return out_imgs, out_winds
+    return out_paths, out_winds
+
+
+def _load_real_group_from_paths(
+    backend,
+    rel_paths: list[str],
+    *,
+    bt_min_k: float,
+    bt_max_k: float,
+) -> np.ndarray:
+    if not rel_paths:
+        raise ValueError("Expected at least one real-data path when loading a class group.")
+    imgs = [_load_one_bt_k(backend, rel, bt_min_k, bt_max_k) for rel in rel_paths]
+    return np.stack(imgs, axis=0)
 
 
 # -----------------------------------------------------------------------------
@@ -293,10 +314,31 @@ def _hist_density_from_counts(counts: np.ndarray) -> np.ndarray:
 
 
 def _mean_pair_dist(z: np.ndarray) -> float:
-    if z.shape[0] < 2:
+    z = np.asarray(z, dtype=np.float64)
+    n = z.shape[0]
+    if n < 2:
         return 0.0
-    d = np.sqrt(((z[:, None] - z[None]) ** 2).sum(-1))
-    return float(d.sum() / (z.shape[0] * (z.shape[0] - 1)))
+
+    block_size = 128
+    total = 0.0
+    norms = np.sum(z * z, axis=1)
+    for i0 in range(0, n, block_size):
+        i1 = min(i0 + block_size, n)
+        zi = z[i0:i1]
+        zi_norm = norms[i0:i1][:, None]
+        for j0 in range(i0, n, block_size):
+            j1 = min(j0 + block_size, n)
+            zj = z[j0:j1]
+            zj_norm = norms[j0:j1][None, :]
+            d2 = zi_norm + zj_norm - 2.0 * (zi @ zj.T)
+            np.maximum(d2, 0.0, out=d2)
+            np.sqrt(d2, out=d2)
+            if i0 == j0:
+                total += float(d2.sum() - np.trace(d2))
+            else:
+                total += 2.0 * float(d2.sum())
+
+    return float(total / (n * (n - 1)))
 
 
 def _median_heuristic_gamma(x: np.ndarray, y: np.ndarray) -> float:
@@ -621,26 +663,57 @@ def _default_paper_ready_class_labels(class_ids: list[int]) -> Dict[int, str]:
     return {c: f"Class {c}" for c in class_ids}
 
 
-def _build_pixel_hist_panel(
+def _flatten_mapping_for_csv(node: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    flat: Dict[str, Any] = {}
+    for key, value in node.items():
+        child_prefix = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            flat.update(_flatten_mapping_for_csv(value, prefix=child_prefix))
+        elif isinstance(value, (list, tuple)):
+            flat[child_prefix] = json.dumps(value)
+        elif isinstance(value, np.generic):
+            flat[child_prefix] = value.item()
+        else:
+            flat[child_prefix] = value
+    return flat
+
+
+def _write_per_class_metrics_csv(
+    path: Path,
     *,
-    bins: np.ndarray,
-    real_hist_counts: np.ndarray,
-    gen_hist_counts: np.ndarray,
-    label: str,
-) -> Dict[str, Any]:
-    rh = _hist_density_from_counts(real_hist_counts)
-    gh = _hist_density_from_counts(gen_hist_counts)
-    return {
-        "label": str(label),
-        "bt_bins": np.asarray(bins, dtype=np.float64).tolist(),
-        "hist_real": rh.tolist(),
-        "hist_gen": gh.tolist(),
-        "pixel_hist_js": float(js_divergence(rh, gh)),
-        "pixel_hist_w1": float(wasserstein1_from_hist(rh, gh, bin_edges=bins)),
-    }
+    per_class_metrics: Dict[int, Dict[str, Any]],
+    class_labels: Dict[int, str],
+    split: str,
+    tag: str,
+    heavy: bool,
+    n_per_class: int,
+) -> None:
+    rows = []
+    for class_id in sorted(int(c) for c in per_class_metrics.keys()):
+        metrics = per_class_metrics[class_id]
+        row = {
+            "class_id": int(class_id),
+            "class_label": str(class_labels.get(class_id, f"Class {class_id}")),
+            "split": str(split),
+            "tag": str(tag),
+            "heavy": int(bool(heavy)),
+            "n_per_class": int(n_per_class),
+        }
+        row.update(_flatten_mapping_for_csv(metrics))
+        rows.append(row)
+
+    fieldnames = ["class_id", "class_label", "split", "tag", "heavy", "n_per_class"]
+    extra_fields = sorted({key for row in rows for key in row.keys() if key not in fieldnames})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames + extra_fields)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def _build_paper_ready_pixel_plausibility(
+def _write_paper_ready_pixel_plausibility_npz(
+    path: Path,
+    *,
     class_caches: Dict[int, ClassMetricCache],
 ) -> Dict[str, Any]:
     if not class_caches:
@@ -652,42 +725,84 @@ def _build_paper_ready_pixel_plausibility(
     bins_ref: np.ndarray | None = None
     real_hist_blocks = []
     gen_hist_blocks = []
-    per_class = {}
+    real_mass_rows = []
+    gen_mass_rows = []
+    js_rows = []
+    w1_rows = []
+    real_hist_rows = []
+    gen_hist_rows = []
+    real_class_offsets = [0]
+    gen_class_offsets = [0]
 
-    for c in class_ids:
-        cache = class_caches[c]
+    for class_id in class_ids:
+        cache = class_caches[class_id]
         bins = np.asarray(cache.bins, dtype=np.float64)
         if bins_ref is None:
             bins_ref = bins
         elif bins.shape != bins_ref.shape or not np.allclose(bins, bins_ref):
             raise ValueError("Paper-ready pixel histograms require identical BT bins across classes.")
 
-        real_hist_blocks.append(np.asarray(cache.real_hist_counts, dtype=np.float64))
-        gen_hist_blocks.append(np.asarray(cache.gen_raw_hist_counts, dtype=np.float64))
-        per_class[str(c)] = _build_pixel_hist_panel(
-            bins=bins,
-            real_hist_counts=cache.real_hist_counts,
-            gen_hist_counts=cache.gen_raw_hist_counts,
-            label=class_labels[c],
-        )
+        real_hist_counts = np.asarray(cache.real_hist_counts, dtype=np.float64)
+        gen_hist_counts = np.asarray(cache.gen_raw_hist_counts, dtype=np.float64)
+        real_mass = _hist_density_from_counts(real_hist_counts)
+        gen_mass = _hist_density_from_counts(gen_hist_counts)
+
+        real_hist_blocks.append(real_hist_counts)
+        gen_hist_blocks.append(gen_hist_counts)
+        real_mass_rows.append(real_mass)
+        gen_mass_rows.append(gen_mass)
+        js_rows.append(float(js_divergence(real_mass, gen_mass)))
+        w1_rows.append(float(wasserstein1_from_hist(real_mass, gen_mass, bin_edges=bins)))
+        real_hist_rows.append(real_hist_counts.astype(np.uint32, copy=False))
+        gen_hist_rows.append(gen_hist_counts.astype(np.uint32, copy=False))
+        real_class_offsets.append(real_class_offsets[-1] + int(real_hist_counts.shape[0]))
+        gen_class_offsets.append(gen_class_offsets[-1] + int(gen_hist_counts.shape[0]))
 
     assert bins_ref is not None
 
-    overall = _build_pixel_hist_panel(
-        bins=bins_ref,
-        real_hist_counts=np.concatenate(real_hist_blocks, axis=0),
-        gen_hist_counts=np.concatenate(gen_hist_blocks, axis=0),
-        label="Overall",
+    overall_real_mass = _hist_density_from_counts(np.concatenate(real_hist_blocks, axis=0))
+    overall_gen_mass = _hist_density_from_counts(np.concatenate(gen_hist_blocks, axis=0))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        schema=np.asarray(PAPER_READY_PIXEL_ARTIFACT_SCHEMA),
+        class_ids=np.asarray(class_ids, dtype=np.int32),
+        class_labels=np.asarray([class_labels[c] for c in class_ids]),
+        bt_bins=np.asarray(bins_ref, dtype=np.float64),
+        real_probability_mass=np.asarray(real_mass_rows, dtype=np.float64),
+        gen_probability_mass=np.asarray(gen_mass_rows, dtype=np.float64),
+        pixel_hist_js=np.asarray(js_rows, dtype=np.float64),
+        pixel_hist_w1_k=np.asarray(w1_rows, dtype=np.float64),
+        overall_real_probability_mass=np.asarray(overall_real_mass, dtype=np.float64),
+        overall_gen_probability_mass=np.asarray(overall_gen_mass, dtype=np.float64),
+        overall_pixel_hist_js=np.asarray([js_divergence(overall_real_mass, overall_gen_mass)], dtype=np.float64),
+        overall_pixel_hist_w1_k=np.asarray(
+            [wasserstein1_from_hist(overall_real_mass, overall_gen_mass, bin_edges=bins_ref)],
+            dtype=np.float64,
+        ),
+        real_hist_counts_flat=np.concatenate(real_hist_rows, axis=0),
+        gen_hist_counts_flat=np.concatenate(gen_hist_rows, axis=0),
+        real_class_offsets=np.asarray(real_class_offsets, dtype=np.int32),
+        gen_class_offsets=np.asarray(gen_class_offsets, dtype=np.int32),
     )
 
     return {
+        "schema": PAPER_READY_PIXEL_ARTIFACT_SCHEMA,
         "hist_normalization": "probability_mass",
         "metric_variant": "raw",
         "bin_units": "K",
         "metric_units": {"pixel_hist_w1": "K"},
+        "class_ids": [int(c) for c in class_ids],
         "class_labels": {str(c): class_labels[c] for c in class_ids},
-        "overall": overall,
-        "per_class": per_class,
+        "per_image_histograms": {
+            "available": True,
+            "encoding": "flat_rows_with_class_offsets",
+            "fields": {
+                "real": {"counts": "real_hist_counts_flat", "offsets": "real_class_offsets"},
+                "generated": {"counts": "gen_hist_counts_flat", "offsets": "gen_class_offsets"},
+            },
+        },
     }
 
 
@@ -738,6 +853,7 @@ def _bootstrap_ci_blocks(
     bootstrap_ci_level: float,
     seed: int,
     show_progress: bool,
+    progress_desc: str = "Eval 3/3: bootstrap CIs",
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if bootstrap_reps <= 0 or not class_caches:
         return {}, {}
@@ -748,7 +864,13 @@ def _bootstrap_ci_blocks(
 
     rep_iter = range(bootstrap_reps)
     if show_progress:
-        rep_iter = tqdm(rep_iter, total=bootstrap_reps, desc="Eval: bootstrap", leave=True)
+        rep_iter = tqdm(
+            rep_iter,
+            total=bootstrap_reps,
+            desc=str(progress_desc),
+            unit="rep",
+            leave=True,
+        )
 
     for _ in rep_iter:
         class_scalars = {}
@@ -782,32 +904,69 @@ class TCEvaluator:
     def run(
         self,
         *,
-        model: tf.keras.Model,
-        diffusion,
+        model: tf.keras.Model | None = None,
+        diffusion=None,
         out_dir: Path,
         tag: str,
         split: str = "val",
+        full_test: bool = False,
         heavy: bool,
         show_progress: bool = False,
+        generated_bank: SampleBank | None = None,
+        generated_limit: int | None = None,
+        generated_source: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         cfg = self.cfg
         ev = _default_eval_cfg(cfg)
         split = str(split).strip().lower()
         if split not in {"val", "test"}:
             raise ValueError(f"Evaluation split must be 'val' or 'test', got {split!r}")
+        full_test = bool(full_test)
+        if full_test and split != "test":
+            raise ValueError("full_test=True is only supported when split='test'.")
+        using_cached_generations = generated_bank is not None
 
         data_cfg = cfg["data"]
         bt_min_k = float(data_cfg["bt_min_k"])
         bt_max_k = float(data_cfg["bt_max_k"])
         image_size = int(data_cfg.get("image_size", 256))
+        real_backend = build_data_backend(data_cfg)
 
         num_classes = int(cfg["conditioning"]["num_ss_classes"])
         use_wind_speed = bool(cfg.get("conditioning", {}).get("use_wind_speed", False))
 
-        n_per = int(ev["n_per_class_heavy"] if heavy else ev["n_per_class_light"])
-        if heavy and tag == "post_training" and n_per < 100:
-            print(f"[eval] post_training heavy eval requested {n_per} samples/class; raising to 100.")
-            n_per = 100
+        generated_source = generated_source if isinstance(generated_source, dict) else {}
+        generated_source_info = dict(generated_source)
+        sample_bank_info = generated_source_info.get("sample_bank")
+        if using_cached_generations:
+            assert generated_bank is not None
+            missing_classes = [c for c in range(num_classes) if c not in set(generated_bank.class_ids)]
+            if missing_classes:
+                raise ValueError(
+                    "Cached generated samples are missing required classes: "
+                    f"{missing_classes}. Expected classes 0..{num_classes - 1}."
+                )
+            cached_counts = {
+                c: int(generated_bank.generated_counts_by_class[c])
+                for c in range(num_classes)
+            }
+            if generated_limit is None:
+                n_per = int(min(cached_counts.values()))
+            else:
+                n_per = int(generated_limit)
+                insufficient = {c: available for c, available in cached_counts.items() if available < n_per}
+                if insufficient:
+                    raise ValueError(
+                        "Cached generated bank cannot satisfy the requested generated_limit. "
+                        f"Available counts: {insufficient}"
+                    )
+        else:
+            if model is None or diffusion is None:
+                raise ValueError("Online evaluation requires both model and diffusion instances.")
+            n_per = int(ev["n_per_class_heavy"] if heavy else ev["n_per_class_light"])
+            if heavy and tag == "post_training" and n_per < 100:
+                print(f"[eval] post_training heavy eval requested {n_per} samples/class; raising to 100.")
+                n_per = 100
         if n_per <= 0:
             raise ValueError(f"evaluation n_per_class must be > 0, got {n_per}")
 
@@ -821,7 +980,13 @@ class TCEvaluator:
                 f"n_per_class={n_per}; plotting {n_per} per group instead."
             )
 
-        gen_batch_size_cfg = ev.get("gen_batch_size")
+        if using_cached_generations:
+            generation_meta = sample_bank_info.get("generation", {}) if isinstance(sample_bank_info, dict) else {}
+            gen_batch_size_cfg = generation_meta.get("gen_batch_size")
+            if gen_batch_size_cfg is None:
+                gen_batch_size_cfg = ev.get("gen_batch_size")
+        else:
+            gen_batch_size_cfg = ev.get("gen_batch_size")
         if gen_batch_size_cfg is None:
             gen_batch_size = int(data_cfg.get("batch_size", n_per))
         else:
@@ -829,10 +994,12 @@ class TCEvaluator:
         if gen_batch_size <= 0:
             raise ValueError(f"evaluation.gen_batch_size must be > 0, got {gen_batch_size}")
         gen_batch_size = min(gen_batch_size, n_per)
+        batches_per_class = (n_per + gen_batch_size - 1) // gen_batch_size
 
-        bootstrap_reps = int(ev.get("bootstrap_reps", 500))
+        bootstrap_reps_key = "bootstrap_reps_full_test" if full_test else "bootstrap_reps"
+        bootstrap_reps = int(ev.get(bootstrap_reps_key, 0 if full_test else 500))
         if bootstrap_reps < 0:
-            raise ValueError(f"evaluation.bootstrap_reps must be >= 0, got {bootstrap_reps}")
+            raise ValueError(f"evaluation.{bootstrap_reps_key} must be >= 0, got {bootstrap_reps}")
         bootstrap_ci_level = float(ev.get("bootstrap_ci_level", 0.95))
         if not (0.0 < bootstrap_ci_level < 1.0):
             raise ValueError(
@@ -845,83 +1012,168 @@ class TCEvaluator:
         eval_root = resolve_eval_root(out_dir, tag, split)
         eval_root.mkdir(parents=True, exist_ok=True)
 
-        real_by_class, real_wind_by_class = _sample_real_by_class(cfg, n_per, ev["real_seed"], split)
+        real_paths_by_class, real_wind_by_class = _select_real_by_class(
+            cfg,
+            n_per,
+            ev["real_seed"],
+            split,
+            use_all=full_test,
+        )
+        candidate_generated_class_ids = (
+            set(generated_bank.class_ids) if using_cached_generations and generated_bank is not None else set(range(num_classes))
+        )
+        valid_class_ids = [
+            c for c in range(num_classes)
+            if c in real_paths_by_class and c in candidate_generated_class_ids
+        ]
+        stage_names = []
+        if not using_cached_generations:
+            stage_names.append("sampling")
+        stage_names.append("summaries")
+        if bootstrap_reps > 0:
+            stage_names.append("bootstrap")
+        stage_lookup = {name: (idx + 1, len(stage_names)) for idx, name in enumerate(stage_names)}
 
-        gen_raw_by_class: Dict[int, np.ndarray] = {}
-        gen_post_by_class: Dict[int, np.ndarray] = {}
         wind_targets_kt: Dict[int, float] = {}
-
-        class_iter = range(num_classes)
-        if show_progress:
-            class_iter = tqdm(class_iter, desc="Eval: generating", leave=True)
-
-        for c in class_iter:
-            if use_wind_speed:
-                real_winds_c = real_wind_by_class.get(c)
-                if real_winds_c is not None and len(real_winds_c) > 0:
-                    if len(real_winds_c) >= n_per:
-                        wind_schedule = real_winds_c[:n_per]
-                    else:
-                        rng_w = np.random.default_rng(ev["seed"] + c)
-                        idx = rng_w.choice(len(real_winds_c), size=n_per, replace=True)
-                        wind_schedule = real_winds_c[idx]
-                    wind_targets_kt[int(c)] = float(wind_schedule.mean())
-                else:
-                    wind_schedule = np.full(n_per, _resolve_eval_wind_target_kt(cfg, c), dtype=np.float32)
-                    wind_targets_kt[int(c)] = float(wind_schedule[0])
-            else:
-                wind_schedule = None
-
-            raw_chunks = []
-            post_chunks = []
-            offset = 0
-            remaining = n_per
-            while remaining > 0:
-                bsz = min(gen_batch_size, remaining)
-                wind_batch = wind_schedule[offset:offset + bsz] if wind_schedule is not None else None
-                sampling_steps = ev.get("sampling_steps", ev.get("ddim_steps", None))
-                sample_outputs = diffusion.sample(
-                    model,
-                    batch_size=bsz,
-                    image_size=image_size,
-                    cond_value=c,
-                    wind_value_kt=wind_batch,
-                    guidance_scale=float(ev["guidance_scale"]),
-                    sampler=str(ev["sampler"]),
-                    num_sampling_steps=sampling_steps,
-                    timestep_schedule=str(ev["timestep_schedule"]),
-                    ddim_eta=float(ev.get("ddim_eta", 0.0)),
-                    show_progress=show_progress,
-                    return_both=True,
+        sampling_report = {}
+        if using_cached_generations:
+            if isinstance(sample_bank_info, dict):
+                generation_meta = sample_bank_info.get("generation", {})
+                if isinstance(generation_meta, dict):
+                    sampling_report = {
+                        "sampler": str(generation_meta.get("sampler", ev["sampler"])),
+                        "guidance_scale": float(generation_meta.get("guidance_scale", ev["guidance_scale"])),
+                        "sampling_steps": generation_meta.get("sampling_steps", ev.get("sampling_steps", ev.get("ddim_steps", None))),
+                        "timestep_schedule": str(generation_meta.get("timestep_schedule", ev["timestep_schedule"])),
+                        "ddim_eta": float(generation_meta.get("ddim_eta", ev.get("ddim_eta", 0.0))),
+                    }
+                targets = sample_bank_info.get("conditioning_targets", {}).get("wind_kt_by_class", {})
+                if isinstance(targets, dict):
+                    wind_targets_kt = {int(k): float(v) for k, v in targets.items()}
+            if not sampling_report:
+                sampling_report = {
+                    "sampler": str(ev["sampler"]),
+                    "guidance_scale": float(ev["guidance_scale"]),
+                    "sampling_steps": ev.get("sampling_steps", ev.get("ddim_steps", None)),
+                    "timestep_schedule": str(ev["timestep_schedule"]),
+                    "ddim_eta": float(ev.get("ddim_eta", 0.0)),
+                }
+            if show_progress:
+                real_mode_desc = (
+                    "all available real test samples/class"
+                    if full_test
+                    else f"up to {n_per} sampled real references/class"
                 )
-                raw_chunks.append(sample_outputs["raw_final"].numpy())
-                post_chunks.append(sample_outputs["clipped_final"].numpy())
-                remaining -= bsz
-                offset += bsz
-
-            raw_norm = np.concatenate(raw_chunks, axis=0)
-            post_norm = np.concatenate(post_chunks, axis=0)
-            gen_raw_by_class[c] = denorm_bt(raw_norm, bt_min_k, bt_max_k)[..., 0]
-            gen_post_by_class[c] = denorm_bt(post_norm, bt_min_k, bt_max_k)[..., 0]
-
-        for c in range(num_classes):
-            if c not in real_by_class or c not in gen_raw_by_class:
-                continue
-
-            n_show = min(n_plot, real_by_class[c].shape[0], gen_raw_by_class[c].shape[0])
-            if n_show <= 0:
-                continue
-
-            save_real_generated_comparison_grid(
-                real_k=real_by_class[c],
-                gen_k=gen_raw_by_class[c],
-                path=str(eval_root / f"samples_class_{c}.png"),
-                n_show=n_show,
-                ncols=min(5, n_show),
-                real_title=f"Real (n={n_show})",
-                gen_title=f"Generated (n={n_show})",
-                suptitle=f"Class {c}: Real vs Generated Samples",
+                summary_stage_idx, stage_total = stage_lookup["summaries"]
+                print(f"[eval] Reference mode: {real_mode_desc}. Generated source: cached bank ({n_per}/class).")
+                stage_plan_parts = [f"stage {summary_stage_idx}/{stage_total} summaries={2 * len(valid_class_ids)} class tasks"]
+                if "bootstrap" in stage_lookup:
+                    bootstrap_stage_idx, stage_total = stage_lookup["bootstrap"]
+                    stage_plan_parts.append(f"stage {bootstrap_stage_idx}/{stage_total} bootstrap={bootstrap_reps} reps")
+                print("[eval] Progress plan: " + "; ".join(stage_plan_parts) + ".")
+        else:
+            sampling_steps = ev.get("sampling_steps", ev.get("ddim_steps", None))
+            sampling_timesteps = diffusion.get_sampling_timesteps(
+                sampler=str(ev["sampler"]),
+                num_sampling_steps=sampling_steps,
+                timestep_schedule=str(ev["timestep_schedule"]),
             )
+            sampling_report = {
+                "sampler": str(ev["sampler"]),
+                "guidance_scale": float(ev["guidance_scale"]),
+                "sampling_steps": ev.get("sampling_steps", ev.get("ddim_steps", None)),
+                "timestep_schedule": str(ev["timestep_schedule"]),
+                "ddim_eta": float(ev.get("ddim_eta", 0.0)),
+            }
+
+            gen_raw_by_class: Dict[int, np.ndarray] = {}
+            sampling_pbar = None
+            if show_progress:
+                real_mode_desc = (
+                    "all available real test samples/class"
+                    if full_test
+                    else f"up to {n_per} sampled real references/class"
+                )
+                sampling_stage_idx, stage_total = stage_lookup["sampling"]
+                summary_stage_idx, _ = stage_lookup["summaries"]
+                print(f"[eval] Reference mode: {real_mode_desc}. Generated source: online sampling ({n_per}/class).")
+                stage_plan_parts = [
+                    f"stage {sampling_stage_idx}/{stage_total} sampling={num_classes} classes x {batches_per_class} "
+                    f"batches/class x {len(sampling_timesteps)} reverse steps = "
+                    f"{num_classes * batches_per_class * len(sampling_timesteps)} updates",
+                    f"stage {summary_stage_idx}/{stage_total} summaries={2 * len(valid_class_ids)} class tasks",
+                ]
+                if "bootstrap" in stage_lookup:
+                    bootstrap_stage_idx, _ = stage_lookup["bootstrap"]
+                    stage_plan_parts.append(f"stage {bootstrap_stage_idx}/{stage_total} bootstrap={bootstrap_reps} reps")
+                print("[eval] Progress plan: " + "; ".join(stage_plan_parts) + ".")
+                sampling_pbar = tqdm(
+                    total=num_classes * batches_per_class * len(sampling_timesteps),
+                    desc=f"Eval {sampling_stage_idx}/{stage_total}: sampling",
+                    unit="step",
+                    leave=True,
+                )
+
+            for c in range(num_classes):
+                if use_wind_speed:
+                    real_winds_c = real_wind_by_class.get(c)
+                    if real_winds_c is not None and len(real_winds_c) > 0:
+                        if len(real_winds_c) >= n_per:
+                            wind_schedule = real_winds_c[:n_per]
+                        else:
+                            rng_w = np.random.default_rng(ev["seed"] + c)
+                            idx = rng_w.choice(len(real_winds_c), size=n_per, replace=True)
+                            wind_schedule = real_winds_c[idx]
+                        wind_targets_kt[int(c)] = float(wind_schedule.mean())
+                    else:
+                        wind_schedule = np.full(n_per, _resolve_eval_wind_target_kt(cfg, c), dtype=np.float32)
+                        wind_targets_kt[int(c)] = float(wind_schedule[0])
+                else:
+                    wind_schedule = None
+
+                raw_chunks = []
+                offset = 0
+                remaining = n_per
+                batch_idx = 0
+                while remaining > 0:
+                    bsz = min(gen_batch_size, remaining)
+                    wind_batch = wind_schedule[offset:offset + bsz] if wind_schedule is not None else None
+                    if sampling_pbar is not None:
+                        sampling_pbar.set_postfix_str(
+                            f"class {c} batch {batch_idx + 1}/{batches_per_class}",
+                            refresh=False,
+                        )
+                    sample_outputs = diffusion.sample(
+                        model,
+                        batch_size=bsz,
+                        image_size=image_size,
+                        cond_value=c,
+                        wind_value_kt=wind_batch,
+                        guidance_scale=float(ev["guidance_scale"]),
+                        sampler=str(ev["sampler"]),
+                        num_sampling_steps=sampling_steps,
+                        timestep_schedule=str(ev["timestep_schedule"]),
+                        ddim_eta=float(ev.get("ddim_eta", 0.0)),
+                        show_progress=bool(show_progress and sampling_pbar is None),
+                        return_both=False,
+                        progress_callback=sampling_pbar.update if sampling_pbar is not None else None,
+                    )
+                    raw_chunks.append(sample_outputs.numpy())
+                    remaining -= bsz
+                    offset += bsz
+                    batch_idx += 1
+
+                raw_norm = np.concatenate(raw_chunks, axis=0)
+                gen_raw_by_class[c] = denorm_bt(raw_norm, bt_min_k, bt_max_k)[..., 0]
+
+            if sampling_pbar is not None:
+                sampling_pbar.close()
+
+        real_counts_by_class = {str(c): int(len(paths)) for c, paths in sorted(real_paths_by_class.items())}
+        if using_cached_generations:
+            gen_counts_by_class = {str(c): int(n_per) for c in sorted(candidate_generated_class_ids)}
+        else:
+            gen_counts_by_class = {str(c): int(arr.shape[0]) for c, arr in sorted(gen_raw_by_class.items())}
 
         binner = PolarBinner(image_size, image_size, int(ev["profile_bins"]), 360)
 
@@ -929,23 +1181,66 @@ class TCEvaluator:
         per_class_metrics = {}
         per_class_curves = {}
         class_scalars = {}
+        summary_pbar = None
+        if show_progress and valid_class_ids:
+            summary_stage_idx, stage_total = stage_lookup["summaries"]
+            print(f"[eval] Stage {summary_stage_idx}/{stage_total}: computing class summaries and plots.")
+            summary_pbar = tqdm(
+                total=2 * len(valid_class_ids),
+                desc=f"Eval {summary_stage_idx}/{stage_total}: class summaries",
+                unit="task",
+                leave=True,
+            )
 
         for c in range(num_classes):
-            if c not in real_by_class or c not in gen_raw_by_class or c not in gen_post_by_class:
+            real_paths_c = real_paths_by_class.get(c)
+            if using_cached_generations:
+                if generated_bank is None or c not in candidate_generated_class_ids:
+                    gen_k_raw = None
+                else:
+                    gen_k_raw = generated_bank.load_bt_k(c, limit=n_per, mmap_mode="r")
+            else:
+                gen_k_raw = gen_raw_by_class.pop(c, None)
+            if not real_paths_c or gen_k_raw is None:
                 continue
+            gen_k_raw = np.asarray(gen_k_raw, dtype=np.float32)
+            real_k = _load_real_group_from_paths(
+                real_backend,
+                real_paths_c,
+                bt_min_k=bt_min_k,
+                bt_max_k=bt_max_k,
+            )
+
+            n_show = min(n_plot, real_k.shape[0], gen_k_raw.shape[0])
+            if n_show > 0:
+                save_real_generated_comparison_grid(
+                    real_k=real_k,
+                    gen_k=gen_k_raw,
+                    path=str(eval_root / f"samples_class_{c}.png"),
+                    n_show=n_show,
+                    ncols=min(5, n_show),
+                    real_title=f"Real (n={n_show})",
+                    gen_title=f"Generated (n={n_show})",
+                    suptitle=f"Class {c}: Real vs Generated Samples",
+                )
             cache = _build_class_metric_cache(
-                real_k=real_by_class[c],
-                gen_k_raw=gen_raw_by_class[c],
+                real_k=real_k,
+                gen_k_raw=gen_k_raw,
                 binner=binner,
                 psd_bins=int(ev["psd_bins"]),
                 bt_min_k=bt_min_k,
                 bt_max_k=bt_max_k,
             )
+            del real_k
+            del gen_k_raw
             class_caches[c] = cache
             metrics, curves = _compute_per_class_report(cache)
             per_class_metrics[c] = metrics
             per_class_curves[c] = curves
             class_scalars[c] = _compute_class_scalar_summary(cache)
+            if summary_pbar is not None:
+                summary_pbar.set_postfix_str(f"metrics class {c}", refresh=False)
+                summary_pbar.update(1)
 
         plots_root = eval_root / "plots"
         for c, cur in per_class_curves.items():
@@ -1009,9 +1304,18 @@ class TCEvaluator:
                 gen_std=psd_gen_sd,
                 title=f"Class {c}: Radial PSD",
             )
+            if summary_pbar is not None:
+                summary_pbar.set_postfix_str(f"plots class {c}", refresh=False)
+                summary_pbar.update(1)
+
+        if summary_pbar is not None:
+            summary_pbar.close()
 
         aggregate_primary_raw = _compute_aggregate_primary_raw(class_scalars)
         macro = _compute_macro_metrics(class_scalars)
+        if show_progress and bootstrap_reps > 0:
+            bootstrap_stage_idx, stage_total = stage_lookup["bootstrap"]
+            print(f"[eval] Stage {bootstrap_stage_idx}/{stage_total}: bootstrap confidence intervals.")
         aggregate_primary_raw_ci, macro_ci = _bootstrap_ci_blocks(
             class_caches=class_caches,
             aggregate_primary_raw=aggregate_primary_raw,
@@ -1020,23 +1324,78 @@ class TCEvaluator:
             bootstrap_ci_level=bootstrap_ci_level,
             seed=int(ev["seed"]),
             show_progress=show_progress,
+            progress_desc=(
+                f"Eval {stage_lookup['bootstrap'][0]}/{stage_lookup['bootstrap'][1]}: bootstrap CIs"
+                if "bootstrap" in stage_lookup
+                else "Eval bootstrap CIs"
+            ),
         )
 
+        class_ids_for_report = sorted(int(c) for c in class_caches.keys())
+        class_labels = _default_paper_ready_class_labels(class_ids_for_report) if class_ids_for_report else {}
+
+        artifacts_root = eval_root / "artifacts"
+        artifacts_manifest: Dict[str, Any] = {"manifest_version": 1}
+        if per_class_metrics:
+            per_class_csv_path = artifacts_root / "per_class_metrics.csv"
+            _write_per_class_metrics_csv(
+                per_class_csv_path,
+                per_class_metrics=per_class_metrics,
+                class_labels=class_labels,
+                split=split,
+                tag=tag,
+                heavy=heavy,
+                n_per_class=n_per,
+            )
+            artifacts_manifest["per_class_metrics_csv"] = {
+                "storage": "sidecar_csv",
+                "path": per_class_csv_path.relative_to(eval_root).as_posix(),
+                "schema": PER_CLASS_METRICS_CSV_SCHEMA,
+                "row_type": "per_class",
+            }
+
+        paper_ready_manifest: Dict[str, Any] = {}
+        if class_caches:
+            pixel_artifact_path = artifacts_root / "paper_ready" / "pixel_plausibility.npz"
+            pixel_manifest = _write_paper_ready_pixel_plausibility_npz(
+                pixel_artifact_path,
+                class_caches=class_caches,
+            )
+            if pixel_manifest:
+                paper_ready_manifest["pixel_plausibility"] = {
+                    "storage": "sidecar_npz",
+                    "path": pixel_artifact_path.relative_to(eval_root).as_posix(),
+                    **pixel_manifest,
+                }
+
         report = {
+            "report_schema_version": REPORT_SCHEMA_VERSION,
             "tag": tag,
             "split": split,
+            "full_test": full_test,
             "heavy": heavy,
             "n_per_class": n_per,
             "n_plot_per_group": n_plot,
             "gen_batch_size": gen_batch_size,
-            "sampling": {
-                "sampler": str(ev["sampler"]),
-                "guidance_scale": float(ev["guidance_scale"]),
-                "sampling_steps": ev.get("sampling_steps", ev.get("ddim_steps", None)),
-                "timestep_schedule": str(ev["timestep_schedule"]),
-                "ddim_eta": float(ev.get("ddim_eta", 0.0)),
+            "generated_source": (
+                {
+                    "mode": "sample_bank",
+                    **generated_source_info,
+                }
+                if using_cached_generations
+                else {"mode": "online_sampling"}
+            ),
+            "real_sampling": {
+                "mode": "all_test_samples_per_class" if full_test else "sampled_per_class_cap",
+                "seed": int(ev["real_seed"]),
             },
+            "sample_counts": {
+                "real_by_class": real_counts_by_class,
+                "generated_by_class": gen_counts_by_class,
+            },
+            "sampling": sampling_report,
             "bootstrap": {
+                "config_key": bootstrap_reps_key,
                 "reps": bootstrap_reps,
                 "ci_level": bootstrap_ci_level,
             },
@@ -1045,9 +1404,8 @@ class TCEvaluator:
             "macro": macro,
             "macro_ci": macro_ci,
             "per_class": per_class_metrics,
-            "paper_ready": {
-                "pixel_plausibility": _build_paper_ready_pixel_plausibility(class_caches)
-            },
+            "paper_ready": paper_ready_manifest,
+            "artifacts": artifacts_manifest,
         }
         if wind_targets_kt:
             report["conditioning_targets"] = {

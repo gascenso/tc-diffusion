@@ -278,23 +278,55 @@ def rbf_mmd2(X: np.ndarray, Y: np.ndarray, gamma: Optional[float] = None) -> flo
         med = np.median(d2[d2 > 0])
         gamma = 1.0 / (2.0 * (med + 1e-12))
 
-    def k(a, b):
-        d2 = np.sum((a[:, None, :] - b[None, :, :]) ** 2, axis=-1)
-        return np.exp(-gamma * d2)
-
-    Kxx = k(X, X)
-    Kyy = k(Y, Y)
-    Kxy = k(X, Y)
-
-    # unbiased-ish: remove diagonal
-    np.fill_diagonal(Kxx, 0.0)
-    np.fill_diagonal(Kyy, 0.0)
-
     n = X.shape[0]
     m = Y.shape[0]
-    mmd2 = (Kxx.sum() / (n * (n - 1) + 1e-12)
-            + Kyy.sum() / (m * (m - 1) + 1e-12)
-            - 2.0 * Kxy.mean())
+
+    block_size = 128
+
+    def _rbf_block_sum(a: np.ndarray, b: np.ndarray) -> float:
+        total = 0.0
+        a_norm = np.sum(a * a, axis=1)
+        b_norm = np.sum(b * b, axis=1)
+        for i0 in range(0, a.shape[0], block_size):
+            i1 = min(i0 + block_size, a.shape[0])
+            ai = a[i0:i1]
+            ai_norm = a_norm[i0:i1][:, None]
+            for j0 in range(0, b.shape[0], block_size):
+                j1 = min(j0 + block_size, b.shape[0])
+                bj = b[j0:j1]
+                bj_norm = b_norm[j0:j1][None, :]
+                d2 = ai_norm + bj_norm - 2.0 * (ai @ bj.T)
+                np.maximum(d2, 0.0, out=d2)
+                total += float(np.exp(-gamma * d2).sum())
+        return total
+
+    def _rbf_block_sum_symmetric(a: np.ndarray) -> float:
+        total = 0.0
+        a_norm = np.sum(a * a, axis=1)
+        for i0 in range(0, a.shape[0], block_size):
+            i1 = min(i0 + block_size, a.shape[0])
+            ai = a[i0:i1]
+            ai_norm = a_norm[i0:i1][:, None]
+            for j0 in range(i0, a.shape[0], block_size):
+                j1 = min(j0 + block_size, a.shape[0])
+                aj = a[j0:j1]
+                aj_norm = a_norm[j0:j1][None, :]
+                d2 = ai_norm + aj_norm - 2.0 * (ai @ aj.T)
+                np.maximum(d2, 0.0, out=d2)
+                block = np.exp(-gamma * d2)
+                if i0 == j0:
+                    total += float(block.sum() - np.trace(block))
+                else:
+                    total += 2.0 * float(block.sum())
+        return total
+
+    kxx_sum = _rbf_block_sum_symmetric(X)
+    kyy_sum = _rbf_block_sum_symmetric(Y)
+    kxy_sum = _rbf_block_sum(X, Y)
+
+    mmd2 = (kxx_sum / (n * (n - 1) + 1e-12)
+            + kyy_sum / (m * (m - 1) + 1e-12)
+            - 2.0 * (kxy_sum / (n * m + 1e-12)))
     return float(mmd2)
 
 
