@@ -5,8 +5,14 @@ physics_loss:
   lambda_phys: 0.015
   lambda_phys_warmup_frac: 0.4
   radial_weight: 1.0
-  cold_weight: 0.0
-  grad_weight: 0.25
+  dav_weight: 0.002
+  dav_radius_km: 300.0
+  pixel_size_km: 8.0
+  hist_weight: 0.5
+  hist_bins: 32
+  hist_softness_k: 2.5
+  cold_weight: 0.25
+  grad_weight: 0.0
   snr_gate_max: 0.4
   radial_bins: 64
   cold_threshold_k: 200.0

@@ -12,6 +12,7 @@ import tensorflow as tf
 from tqdm.auto import tqdm
 
 from .metrics import (
+    DAVComputer,
     PolarBinner,
     cold_cloud_fraction,
     denorm_bt,
@@ -35,6 +36,7 @@ PRIMARY_RAW_AGG_KEYS = (
     "pixel_hist_js",
     "pixel_hist_w1",
     "cold_cloud_fraction_200K_abs_gap",
+    "dav_abs_gap_deg2",
     "eye_contrast_proxy_abs_gap",
     "psd_l2",
     "feature_mmd2",
@@ -42,8 +44,10 @@ PRIMARY_RAW_AGG_KEYS = (
     "gen_exceedance_rate_total",
 )
 
-REPORT_SCHEMA_VERSION = 5
+REPORT_SCHEMA_VERSION = 6
 PAPER_READY_PIXEL_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.pixel_plausibility.v2"
+PAPER_READY_RADIAL_BT_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_bt_profile.v1"
+PAPER_READY_DAV_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.dav.v1"
 PER_CLASS_METRICS_CSV_SCHEMA = "tc_diffusion.per_class_metrics.v1"
 
 
@@ -65,6 +69,9 @@ class ClassMetricCache:
     real_cold: np.ndarray
     gen_raw_cold: np.ndarray
     gen_post_cold: np.ndarray
+    real_dav: np.ndarray
+    gen_raw_dav: np.ndarray
+    gen_post_dav: np.ndarray
     real_eye: np.ndarray
     gen_raw_eye: np.ndarray
     gen_post_eye: np.ndarray
@@ -112,6 +119,10 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ev.setdefault("bootstrap_reps", 500)
     ev.setdefault("bootstrap_reps_full_test", 0)
     ev.setdefault("bootstrap_ci_level", 0.95)
+    phys_cfg = cfg.get("physics_loss", {})
+    ev.setdefault("dav_radius_km", float(phys_cfg.get("dav_radius_km", 300.0)))
+    ev.setdefault("dav_pixel_size_km", float(phys_cfg.get("pixel_size_km", 8.0)))
+    ev.setdefault("dav_center_region_size", 3)
     return ev
 
 
@@ -381,6 +392,8 @@ def _compute_structural_suite(
     gen_psd_profiles: np.ndarray,
     real_cold: np.ndarray,
     gen_cold: np.ndarray,
+    real_dav: np.ndarray,
+    gen_dav: np.ndarray,
     real_eye: np.ndarray,
     gen_eye: np.ndarray,
     real_features: np.ndarray,
@@ -417,6 +430,12 @@ def _compute_structural_suite(
             "real_std": float(real_cold.std()),
             "gen_mean": float(gen_cold.mean()),
             "gen_std": float(gen_cold.std()),
+        },
+        "dav_deg2": {
+            "real_mean": float(real_dav.mean()),
+            "real_std": float(real_dav.std()),
+            "gen_mean": float(gen_dav.mean()),
+            "gen_std": float(gen_dav.std()),
         },
         "eye_contrast_proxy": {
             "real_mean": float(real_eye.mean()),
@@ -457,6 +476,7 @@ def _build_class_metric_cache(
     real_k: np.ndarray,
     gen_k_raw: np.ndarray,
     binner: PolarBinner,
+    dav_computer: DAVComputer,
     psd_bins: int,
     bt_min_k: float,
     bt_max_k: float,
@@ -479,6 +499,10 @@ def _build_class_metric_cache(
     real_cold = cold_cloud_fraction(real_k, threshold_k=200.0)
     gen_raw_cold = cold_cloud_fraction(gen_k_raw, threshold_k=200.0)
     gen_post_cold = cold_cloud_fraction(gen_k_post, threshold_k=200.0)
+
+    real_dav = dav_computer.batch(real_k)
+    gen_raw_dav = dav_computer.batch(gen_k_raw)
+    gen_post_dav = dav_computer.batch(gen_k_post)
 
     real_eye = eye_contrast_proxy(real_mean_profiles)
     gen_raw_eye = eye_contrast_proxy(gen_raw_mean_profiles)
@@ -520,6 +544,9 @@ def _build_class_metric_cache(
         real_cold=real_cold,
         gen_raw_cold=gen_raw_cold,
         gen_post_cold=gen_post_cold,
+        real_dav=real_dav,
+        gen_raw_dav=gen_raw_dav,
+        gen_post_dav=gen_post_dav,
         real_eye=real_eye,
         gen_raw_eye=gen_raw_eye,
         gen_post_eye=gen_post_eye,
@@ -560,6 +587,8 @@ def _compute_per_class_report(cache: ClassMetricCache) -> Tuple[Dict[str, Any], 
         gen_psd_profiles=cache.gen_raw_psd_profiles,
         real_cold=cache.real_cold,
         gen_cold=cache.gen_raw_cold,
+        real_dav=cache.real_dav,
+        gen_dav=cache.gen_raw_dav,
         real_eye=cache.real_eye,
         gen_eye=cache.gen_raw_eye,
         real_features=cache.real_features,
@@ -578,6 +607,8 @@ def _compute_per_class_report(cache: ClassMetricCache) -> Tuple[Dict[str, Any], 
         gen_psd_profiles=cache.gen_post_psd_profiles,
         real_cold=cache.real_cold,
         gen_cold=cache.gen_post_cold,
+        real_dav=cache.real_dav,
+        gen_dav=cache.gen_post_dav,
         real_eye=cache.real_eye,
         gen_eye=cache.gen_post_eye,
         real_features=cache.real_features,
@@ -630,6 +661,8 @@ def _compute_class_scalar_summary(
 
     real_cold = _select_rows(cache.real_cold, real_idx)
     gen_cold = _select_rows(cache.gen_raw_cold, gen_idx)
+    real_dav = _select_rows(cache.real_dav, real_idx)
+    gen_dav = _select_rows(cache.gen_raw_dav, gen_idx)
     real_eye = _select_rows(cache.real_eye, real_idx)
     gen_eye = _select_rows(cache.gen_raw_eye, gen_idx)
 
@@ -637,6 +670,7 @@ def _compute_class_scalar_summary(
         "pixel_hist_js": float(js_divergence(rh, gh)),
         "pixel_hist_w1": float(wasserstein1_from_hist(rh, gh, bin_edges=cache.bins)),
         "cold_cloud_fraction_200K_abs_gap": float(abs(real_cold.mean() - gen_cold.mean())),
+        "dav_abs_gap_deg2": float(abs(real_dav.mean() - gen_dav.mean())),
         "eye_contrast_proxy_abs_gap": float(abs(real_eye.mean() - gen_eye.mean())),
         "psd_l2": float(((real_psd.mean(axis=0) - gen_psd.mean(axis=0)) ** 2).mean()),
         "feature_mmd2": float(mmd2),
@@ -644,6 +678,8 @@ def _compute_class_scalar_summary(
         "gen_exceedance_rate_total": float(_select_rows(cache.gen_raw_exceed_total, gen_idx).mean()),
         "real_pixel_mean": float(_select_rows(cache.real_pixel_mean, real_idx).mean()),
         "gen_pixel_mean": float(_select_rows(cache.gen_raw_pixel_mean, gen_idx).mean()),
+        "real_dav_mean_deg2": float(real_dav.mean()),
+        "gen_dav_mean_deg2": float(gen_dav.mean()),
         "real_eye_mean": float(real_eye.mean()),
         "gen_eye_mean": float(gen_eye.mean()),
     }
@@ -806,6 +842,163 @@ def _write_paper_ready_pixel_plausibility_npz(
     }
 
 
+def _write_paper_ready_radial_bt_profile_npz(
+    path: Path,
+    *,
+    class_caches: Dict[int, ClassMetricCache],
+) -> Dict[str, Any]:
+    if not class_caches:
+        return {}
+
+    class_ids = sorted(int(c) for c in class_caches.keys())
+    class_labels = _default_paper_ready_class_labels(class_ids)
+
+    radius_ref: np.ndarray | None = None
+    real_mean_rows = []
+    gen_mean_rows = []
+    profile_mae_rows = []
+    real_profile_rows = []
+    gen_profile_rows = []
+    real_class_offsets = [0]
+    gen_class_offsets = [0]
+
+    for class_id in class_ids:
+        cache = class_caches[class_id]
+        real_profiles = np.asarray(cache.real_mean_profiles, dtype=np.float32)
+        gen_profiles = np.asarray(cache.gen_raw_mean_profiles, dtype=np.float32)
+        if real_profiles.ndim != 2 or gen_profiles.ndim != 2:
+            raise ValueError("Paper-ready radial BT artifacts require 2D per-image profile blocks.")
+        if real_profiles.shape[1] != gen_profiles.shape[1]:
+            raise ValueError("Real and generated radial BT profile widths must match.")
+
+        radius = np.linspace(0.0, 1.0, real_profiles.shape[1], dtype=np.float64)
+        if radius_ref is None:
+            radius_ref = radius
+        elif radius.shape != radius_ref.shape or not np.allclose(radius, radius_ref):
+            raise ValueError("Paper-ready radial BT profiles require identical normalized-radius bins across classes.")
+
+        real_mean = np.asarray(real_profiles.mean(axis=0), dtype=np.float64)
+        gen_mean = np.asarray(gen_profiles.mean(axis=0), dtype=np.float64)
+
+        real_mean_rows.append(real_mean)
+        gen_mean_rows.append(gen_mean)
+        profile_mae_rows.append(float(np.mean(np.abs(real_mean - gen_mean))))
+        real_profile_rows.append(real_profiles.astype(np.float32, copy=False))
+        gen_profile_rows.append(gen_profiles.astype(np.float32, copy=False))
+        real_class_offsets.append(real_class_offsets[-1] + int(real_profiles.shape[0]))
+        gen_class_offsets.append(gen_class_offsets[-1] + int(gen_profiles.shape[0]))
+
+    assert radius_ref is not None
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        schema=np.asarray(PAPER_READY_RADIAL_BT_ARTIFACT_SCHEMA),
+        class_ids=np.asarray(class_ids, dtype=np.int32),
+        class_labels=np.asarray([class_labels[c] for c in class_ids]),
+        radius_normalized=np.asarray(radius_ref, dtype=np.float64),
+        real_mean_profile_k=np.asarray(real_mean_rows, dtype=np.float64),
+        gen_mean_profile_k=np.asarray(gen_mean_rows, dtype=np.float64),
+        radial_profile_mae_k=np.asarray(profile_mae_rows, dtype=np.float64),
+        real_mean_profiles_flat=np.concatenate(real_profile_rows, axis=0),
+        gen_mean_profiles_flat=np.concatenate(gen_profile_rows, axis=0),
+        real_class_offsets=np.asarray(real_class_offsets, dtype=np.int32),
+        gen_class_offsets=np.asarray(gen_class_offsets, dtype=np.int32),
+    )
+
+    return {
+        "schema": PAPER_READY_RADIAL_BT_ARTIFACT_SCHEMA,
+        "metric_variant": "raw",
+        "x_units": "normalized_radius",
+        "y_units": "K",
+        "metric_name": "radial_profile_mae_k",
+        "metric_units": {"radial_profile_mae_k": "K"},
+        "class_ids": [int(c) for c in class_ids],
+        "class_labels": {str(c): class_labels[c] for c in class_ids},
+        "per_image_profiles": {
+            "available": True,
+            "encoding": "flat_rows_with_class_offsets",
+            "fields": {
+                "real": {"profiles": "real_mean_profiles_flat", "offsets": "real_class_offsets"},
+                "generated": {"profiles": "gen_mean_profiles_flat", "offsets": "gen_class_offsets"},
+            },
+        },
+    }
+
+
+def _write_paper_ready_dav_npz(
+    path: Path,
+    *,
+    class_caches: Dict[int, ClassMetricCache],
+    radius_km: float,
+    pixel_size_km: float,
+    center_region_size: int,
+) -> Dict[str, Any]:
+    if not class_caches:
+        return {}
+
+    class_ids = sorted(int(c) for c in class_caches.keys())
+    class_labels = _default_paper_ready_class_labels(class_ids)
+
+    real_dav_rows = []
+    gen_dav_rows = []
+    real_mean_rows = []
+    gen_mean_rows = []
+    dav_gap_rows = []
+    real_class_offsets = [0]
+    gen_class_offsets = [0]
+
+    for class_id in class_ids:
+        cache = class_caches[class_id]
+        real_dav = np.asarray(cache.real_dav, dtype=np.float32).reshape(-1)
+        gen_dav = np.asarray(cache.gen_raw_dav, dtype=np.float32).reshape(-1)
+        real_dav_rows.append(real_dav)
+        gen_dav_rows.append(gen_dav)
+        real_mean_rows.append(float(real_dav.mean()))
+        gen_mean_rows.append(float(gen_dav.mean()))
+        dav_gap_rows.append(float(abs(real_dav.mean() - gen_dav.mean())))
+        real_class_offsets.append(real_class_offsets[-1] + int(real_dav.shape[0]))
+        gen_class_offsets.append(gen_class_offsets[-1] + int(gen_dav.shape[0]))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        schema=np.asarray(PAPER_READY_DAV_ARTIFACT_SCHEMA),
+        class_ids=np.asarray(class_ids, dtype=np.int32),
+        class_labels=np.asarray([class_labels[c] for c in class_ids]),
+        dav_radius_km=np.asarray([float(radius_km)], dtype=np.float64),
+        dav_pixel_size_km=np.asarray([float(pixel_size_km)], dtype=np.float64),
+        dav_center_region_size=np.asarray([int(center_region_size)], dtype=np.int32),
+        real_mean_dav_deg2=np.asarray(real_mean_rows, dtype=np.float64),
+        gen_mean_dav_deg2=np.asarray(gen_mean_rows, dtype=np.float64),
+        dav_abs_gap_deg2=np.asarray(dav_gap_rows, dtype=np.float64),
+        real_dav_flat=np.concatenate(real_dav_rows, axis=0),
+        gen_dav_flat=np.concatenate(gen_dav_rows, axis=0),
+        real_class_offsets=np.asarray(real_class_offsets, dtype=np.int32),
+        gen_class_offsets=np.asarray(gen_class_offsets, dtype=np.int32),
+    )
+
+    return {
+        "schema": PAPER_READY_DAV_ARTIFACT_SCHEMA,
+        "metric_variant": "raw",
+        "metric_name": "dav_abs_gap_deg2",
+        "metric_units": {"dav_abs_gap_deg2": "deg^2", "dav_mean": "deg^2"},
+        "radius_km": float(radius_km),
+        "pixel_size_km": float(pixel_size_km),
+        "center_region_size": int(center_region_size),
+        "class_ids": [int(c) for c in class_ids],
+        "class_labels": {str(c): class_labels[c] for c in class_ids},
+        "per_image_dav": {
+            "available": True,
+            "encoding": "flat_rows_with_class_offsets",
+            "fields": {
+                "real": {"values": "real_dav_flat", "offsets": "real_class_offsets"},
+                "generated": {"values": "gen_dav_flat", "offsets": "gen_class_offsets"},
+            },
+        },
+    }
+
+
 def _compute_aggregate_primary_raw(class_scalars: Dict[int, Dict[str, float]]) -> Dict[str, float]:
     if not class_scalars:
         return {}
@@ -825,6 +1018,8 @@ def _compute_macro_metrics(class_scalars: Dict[int, Dict[str, float]]) -> Dict[s
     classes = np.asarray(class_ids, dtype=np.float64)
     real_mean = np.asarray([class_scalars[c]["real_pixel_mean"] for c in class_ids], dtype=np.float64)
     gen_mean = np.asarray([class_scalars[c]["gen_pixel_mean"] for c in class_ids], dtype=np.float64)
+    real_dav = np.asarray([class_scalars[c]["real_dav_mean_deg2"] for c in class_ids], dtype=np.float64)
+    gen_dav = np.asarray([class_scalars[c]["gen_dav_mean_deg2"] for c in class_ids], dtype=np.float64)
     real_eye = np.asarray([class_scalars[c]["real_eye_mean"] for c in class_ids], dtype=np.float64)
     gen_eye = np.asarray([class_scalars[c]["gen_eye_mean"] for c in class_ids], dtype=np.float64)
 
@@ -834,6 +1029,12 @@ def _compute_macro_metrics(class_scalars: Dict[int, Dict[str, float]]) -> Dict[s
             "corr_class_gen": _pearson(classes, gen_mean),
             "corr_real_gen": _pearson(real_mean, gen_mean),
             "mae_gen_vs_real": float(np.mean(np.abs(gen_mean - real_mean))),
+        },
+        "dav_deg2": {
+            "corr_class_real": _pearson(classes, real_dav),
+            "corr_class_gen": _pearson(classes, gen_dav),
+            "corr_real_gen": _pearson(real_dav, gen_dav),
+            "mae_gen_vs_real": float(np.mean(np.abs(gen_dav - real_dav))),
         },
         "eye_contrast_proxy": {
             "corr_class_real": _pearson(classes, real_eye),
@@ -1004,6 +1205,18 @@ class TCEvaluator:
         if not (0.0 < bootstrap_ci_level < 1.0):
             raise ValueError(
                 f"evaluation.bootstrap_ci_level must lie strictly between 0 and 1, got {bootstrap_ci_level}"
+            )
+        dav_radius_km = float(ev.get("dav_radius_km", 300.0))
+        dav_pixel_size_km = float(ev.get("dav_pixel_size_km", 8.0))
+        dav_center_region_size = int(ev.get("dav_center_region_size", 3))
+        if dav_radius_km <= 0.0:
+            raise ValueError(f"evaluation.dav_radius_km must be > 0, got {dav_radius_km}")
+        if dav_pixel_size_km <= 0.0:
+            raise ValueError(f"evaluation.dav_pixel_size_km must be > 0, got {dav_pixel_size_km}")
+        if dav_center_region_size <= 0 or (dav_center_region_size % 2) != 1:
+            raise ValueError(
+                "evaluation.dav_center_region_size must be a positive odd integer, "
+                f"got {dav_center_region_size}"
             )
 
         tf.random.set_seed(ev["seed"])
@@ -1176,6 +1389,13 @@ class TCEvaluator:
             gen_counts_by_class = {str(c): int(arr.shape[0]) for c, arr in sorted(gen_raw_by_class.items())}
 
         binner = PolarBinner(image_size, image_size, int(ev["profile_bins"]), 360)
+        dav_computer = DAVComputer(
+            image_size,
+            image_size,
+            pixel_size_km=dav_pixel_size_km,
+            radius_km=dav_radius_km,
+            center_region_size=dav_center_region_size,
+        )
 
         class_caches: Dict[int, ClassMetricCache] = {}
         per_class_metrics = {}
@@ -1227,6 +1447,7 @@ class TCEvaluator:
                 real_k=real_k,
                 gen_k_raw=gen_k_raw,
                 binner=binner,
+                dav_computer=dav_computer,
                 psd_bins=int(ev["psd_bins"]),
                 bt_min_k=bt_min_k,
                 bt_max_k=bt_max_k,
@@ -1367,6 +1588,31 @@ class TCEvaluator:
                     "path": pixel_artifact_path.relative_to(eval_root).as_posix(),
                     **pixel_manifest,
                 }
+            radial_artifact_path = artifacts_root / "paper_ready" / "radial_bt_profile.npz"
+            radial_manifest = _write_paper_ready_radial_bt_profile_npz(
+                radial_artifact_path,
+                class_caches=class_caches,
+            )
+            if radial_manifest:
+                paper_ready_manifest["radial_bt_profile"] = {
+                    "storage": "sidecar_npz",
+                    "path": radial_artifact_path.relative_to(eval_root).as_posix(),
+                    **radial_manifest,
+                }
+            dav_artifact_path = artifacts_root / "paper_ready" / "dav.npz"
+            dav_manifest = _write_paper_ready_dav_npz(
+                dav_artifact_path,
+                class_caches=class_caches,
+                radius_km=dav_radius_km,
+                pixel_size_km=dav_pixel_size_km,
+                center_region_size=dav_center_region_size,
+            )
+            if dav_manifest:
+                paper_ready_manifest["dav"] = {
+                    "storage": "sidecar_npz",
+                    "path": dav_artifact_path.relative_to(eval_root).as_posix(),
+                    **dav_manifest,
+                }
 
         report = {
             "report_schema_version": REPORT_SCHEMA_VERSION,
@@ -1398,6 +1644,11 @@ class TCEvaluator:
                 "config_key": bootstrap_reps_key,
                 "reps": bootstrap_reps,
                 "ci_level": bootstrap_ci_level,
+            },
+            "dav_config": {
+                "radius_km": dav_radius_km,
+                "pixel_size_km": dav_pixel_size_km,
+                "center_region_size": dav_center_region_size,
             },
             "aggregate_primary_raw": aggregate_primary_raw,
             "aggregate_primary_raw_ci": aggregate_primary_raw_ci,

@@ -142,10 +142,16 @@ class Diffusion:
         physics_lambda_warmup_steps = phys_cfg.get("lambda_phys_warmup_steps", 0)
         physics_lambda_warmup_frac = phys_cfg.get("lambda_phys_warmup_frac", 0.0)
         self.physics_radial_weight = float(phys_cfg.get("radial_weight", 1.0))
+        self.physics_dav_weight = float(phys_cfg.get("dav_weight", 0.0))
+        self.physics_hist_weight = float(phys_cfg.get("hist_weight", 0.0))
         self.physics_cold_weight = float(phys_cfg.get("cold_weight", 1.0))
         self.physics_grad_weight = float(phys_cfg.get("grad_weight", 1.0))
         self.physics_snr_gate_max = float(phys_cfg.get("snr_gate_max", 0.8))
         self.physics_radial_bins = int(phys_cfg.get("radial_bins", 64))
+        self.physics_dav_radius_km = float(phys_cfg.get("dav_radius_km", 300.0))
+        self.physics_pixel_size_km = float(phys_cfg.get("pixel_size_km", 8.0))
+        self.physics_hist_bins = int(phys_cfg.get("hist_bins", 32))
+        self.physics_hist_softness_k = float(phys_cfg.get("hist_softness_k", 2.5))
         self.physics_cold_threshold_k = float(phys_cfg.get("cold_threshold_k", 235.0))
         self.physics_cold_softness_k = float(phys_cfg.get("cold_softness_k", 5.0))
         self.physics_charbonnier_eps = float(phys_cfg.get("charbonnier_eps", 1e-3))
@@ -163,6 +169,14 @@ class Diffusion:
             raise ValueError(
                 f"physics_loss.radial_weight must be >= 0, got {self.physics_radial_weight}"
             )
+        if self.physics_dav_weight < 0.0:
+            raise ValueError(
+                f"physics_loss.dav_weight must be >= 0, got {self.physics_dav_weight}"
+            )
+        if self.physics_hist_weight < 0.0:
+            raise ValueError(
+                f"physics_loss.hist_weight must be >= 0, got {self.physics_hist_weight}"
+            )
         if self.physics_cold_weight < 0.0:
             raise ValueError(
                 f"physics_loss.cold_weight must be >= 0, got {self.physics_cold_weight}"
@@ -178,6 +192,26 @@ class Diffusion:
         if self.physics_radial_bins <= 0:
             raise ValueError(
                 f"physics_loss.radial_bins must be >= 1, got {self.physics_radial_bins}"
+            )
+        if self.physics_dav_radius_km <= 0.0:
+            raise ValueError(
+                "physics_loss.dav_radius_km must be > 0, "
+                f"got {self.physics_dav_radius_km}"
+            )
+        if self.physics_pixel_size_km <= 0.0:
+            raise ValueError(
+                "physics_loss.pixel_size_km must be > 0, "
+                f"got {self.physics_pixel_size_km}"
+            )
+        if self.physics_hist_bins < 2:
+            raise ValueError(
+                "physics_loss.hist_bins must be >= 2, "
+                f"got {self.physics_hist_bins}"
+            )
+        if self.physics_hist_softness_k <= 0.0:
+            raise ValueError(
+                "physics_loss.hist_softness_k must be > 0, "
+                f"got {self.physics_hist_softness_k}"
             )
         if self.physics_cold_softness_k <= 0.0:
             raise ValueError(
@@ -230,6 +264,8 @@ class Diffusion:
             and self.physics_lambda > 0.0
             and (
                 self.physics_radial_weight > 0.0
+                or self.physics_dav_weight > 0.0
+                or self.physics_hist_weight > 0.0
                 or self.physics_cold_weight > 0.0
                 or self.physics_grad_weight > 0.0
             )
@@ -247,6 +283,22 @@ class Diffusion:
             self.physics_image_size = image_size
             self.physics_radial_bin_index = tf.constant(radial_bin_index, dtype=tf.int32)
             self.physics_radial_bin_counts = tf.constant(radial_bin_counts, dtype=tf.float32)
+            dav_radial_x, dav_radial_y, dav_mask = self._build_dav_lookup(
+                image_size=image_size,
+                pixel_size_km=self.physics_pixel_size_km,
+                radius_km=self.physics_dav_radius_km,
+            )
+            self.physics_dav_radial_x = tf.constant(dav_radial_x, dtype=tf.float32)
+            self.physics_dav_radial_y = tf.constant(dav_radial_y, dtype=tf.float32)
+            self.physics_dav_mask = tf.constant(dav_mask, dtype=tf.float32)
+            hist_edges_k = np.linspace(
+                self.bt_min_k,
+                self.bt_max_k,
+                num=self.physics_hist_bins + 1,
+                dtype=np.float32,
+            )
+            self.physics_hist_thresholds_k = tf.constant(hist_edges_k[1:-1], dtype=tf.float32)
+            self.physics_hist_bin_width_k = float(hist_edges_k[1] - hist_edges_k[0])
 
     def _default_wind_from_ss_tensor(self, ss_cat):
         ss_cat = tf.cast(ss_cat, tf.int32)
@@ -364,6 +416,26 @@ class Diffusion:
         radial_bin_counts = np.maximum(radial_bin_counts, 1.0)
         return radial_bin_index, radial_bin_counts
 
+    def _build_dav_lookup(self, image_size: int, pixel_size_km: float, radius_km: float):
+        yy, xx = np.mgrid[0:image_size, 0:image_size]
+        cy = (image_size - 1) / 2.0
+        cx = (image_size - 1) / 2.0
+        dy = yy - cy
+        dx = xx - cx
+        radius_px = np.sqrt(dx * dx + dy * dy)
+        radius_px_safe = np.maximum(radius_px, 1e-12)
+        radial_x = (dx / radius_px_safe).reshape(-1).astype(np.float32)
+        radial_y = (dy / radius_px_safe).reshape(-1).astype(np.float32)
+        radius_km_grid = (radius_px * float(pixel_size_km)).reshape(-1)
+        mask = np.logical_and(radius_km_grid > 0.0, radius_km_grid <= float(radius_km)).astype(np.float32)
+        if not np.any(mask > 0.0):
+            raise ValueError(
+                "physics_loss.dav_radius_km selects no pixels. "
+                f"Got image_size={image_size}, pixel_size_km={pixel_size_km}, "
+                f"dav_radius_km={radius_km}."
+            )
+        return radial_x, radial_y, mask
+
     def _charbonnier(self, diff):
         diff = tf.cast(diff, tf.float32)
         eps = tf.cast(self.physics_charbonnier_eps, tf.float32)
@@ -395,11 +467,48 @@ class Diffusion:
         cold_score = tf.nn.sigmoid((threshold - field) / softness)
         return tf.reduce_mean(cold_score, axis=[1, 2])  # [B]
 
-    def _sobel_gradient_magnitude(self, x):
+    def _sobel_gradient_components(self, x):
         x = tf.cast(x, tf.float32)
         field = tf.reduce_mean(x, axis=-1, keepdims=True)
         sobel = tf.image.sobel_edges(field)  # [B, H, W, 1, 2]
-        return tf.sqrt(tf.reduce_sum(tf.square(sobel), axis=-1) + 1e-8)  # [B, H, W, 1]
+        grad_y = sobel[..., 0]
+        grad_x = sobel[..., 1]
+        return grad_x, grad_y
+
+    def _sobel_gradient_magnitude(self, x):
+        grad_x, grad_y = self._sobel_gradient_components(x)
+        return tf.sqrt(tf.square(grad_x) + tf.square(grad_y) + 1e-8)  # [B, H, W, 1]
+
+    def _dav_per_sample(self, x):
+        grad_x, grad_y = self._sobel_gradient_components(x)
+        grad_x = tf.reshape(grad_x, [tf.shape(grad_x)[0], -1])
+        grad_y = tf.reshape(grad_y, [tf.shape(grad_y)[0], -1])
+        grad_norm = tf.sqrt(tf.square(grad_x) + tf.square(grad_y) + 1e-8)
+
+        radial_x = tf.reshape(self.physics_dav_radial_x, [1, -1])
+        radial_y = tf.reshape(self.physics_dav_radial_y, [1, -1])
+        mask = tf.reshape(self.physics_dav_mask, [1, -1])
+
+        cos_theta = (grad_x * radial_x + grad_y * radial_y) / (grad_norm + 1e-8)
+        cos_theta = tf.clip_by_value(cos_theta, -1.0, 1.0)
+        dev_angle_deg = tf.acos(cos_theta) * (180.0 / np.pi)
+
+        weight_sum = tf.reduce_sum(mask, axis=1, keepdims=True)
+        mean_angle = tf.reduce_sum(dev_angle_deg * mask, axis=1, keepdims=True) / weight_sum
+        return tf.reduce_sum(tf.square(dev_angle_deg - mean_angle) * mask, axis=1) / tf.squeeze(weight_sum, axis=1)
+
+    def _soft_bt_cdf(self, x_bt_k):
+        x_bt_k = tf.cast(x_bt_k, tf.float32)
+        flat = tf.reshape(x_bt_k, [tf.shape(x_bt_k)[0], -1, 1])
+        thresholds = tf.reshape(self.physics_hist_thresholds_k, [1, 1, -1])
+        softness = tf.cast(self.physics_hist_softness_k, tf.float32)
+        return tf.reduce_mean(tf.nn.sigmoid((thresholds - flat) / softness), axis=1)
+
+    def _hist_cdf_loss_per_sample(self, x0_true, x0_hat):
+        cdf_true = self._soft_bt_cdf(self._denorm_bt_k(x0_true))
+        cdf_hat = self._soft_bt_cdf(self._denorm_bt_k(x0_hat))
+        cdf_gap = self._charbonnier(cdf_hat - cdf_true)
+        return tf.reduce_sum(cdf_gap, axis=1) * tf.cast(self.physics_hist_bin_width_k, tf.float32)
 
     def _physics_gate(self, alpha_bar_t):
         alpha_bar_t = tf.reshape(tf.cast(alpha_bar_t, tf.float32), [-1])
@@ -427,6 +536,16 @@ class Diffusion:
             radial_hat = self._radial_mean_profile(x0_hat)
             radial_loss = tf.reduce_mean(self._charbonnier(radial_hat - radial_true), axis=1)
             loss = loss + tf.cast(self.physics_radial_weight, tf.float32) * radial_loss
+
+        if self.physics_dav_weight > 0.0:
+            dav_true = self._dav_per_sample(x0_true)
+            dav_hat = self._dav_per_sample(x0_hat)
+            dav_loss = self._charbonnier(dav_hat - dav_true)
+            loss = loss + tf.cast(self.physics_dav_weight, tf.float32) * dav_loss
+
+        if self.physics_hist_weight > 0.0:
+            hist_loss = self._hist_cdf_loss_per_sample(x0_true, x0_hat)
+            loss = loss + tf.cast(self.physics_hist_weight, tf.float32) * hist_loss
 
         if self.physics_cold_weight > 0.0:
             cold_true = self._soft_cold_cloud_fraction(self._denorm_bt_k(x0_true))

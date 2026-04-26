@@ -165,6 +165,119 @@ class PolarBinner:
         return mean_r.astype(np.float32), az_std.astype(np.float32)
 
 
+@dataclass
+class DAVComputer:
+    """
+    Literature-style Deviation Angle Variance (DAV) helper.
+
+    DAV is computed from Sobel image gradients inside a fixed-radius disk around
+    the storm center. For each pixel, the deviation angle is the angle between
+    the image-gradient vector and the radial vector extending from the center.
+    The per-image DAV is the variance of those deviation angles, expressed in
+    degree squared.
+
+    To reduce sensitivity to small center-location errors, the literature often
+    averages DAV over a small center neighborhood. We follow that approach with
+    a default 3x3 center region.
+    """
+
+    H: int
+    W: int
+    pixel_size_km: float = 8.0
+    radius_km: float = 300.0
+    center_region_size: int = 3
+
+    def __post_init__(self):
+        if self.H <= 0 or self.W <= 0:
+            raise ValueError(f"DAVComputer expects positive image dimensions, got H={self.H}, W={self.W}.")
+        if self.pixel_size_km <= 0.0:
+            raise ValueError(f"DAVComputer.pixel_size_km must be > 0, got {self.pixel_size_km}.")
+        if self.radius_km <= 0.0:
+            raise ValueError(f"DAVComputer.radius_km must be > 0, got {self.radius_km}.")
+        if self.center_region_size <= 0 or (self.center_region_size % 2) != 1:
+            raise ValueError(
+                "DAVComputer.center_region_size must be a positive odd integer, "
+                f"got {self.center_region_size}."
+            )
+
+        yy, xx = np.mgrid[0:self.H, 0:self.W]
+        cy0 = (self.H - 1) / 2.0
+        cx0 = (self.W - 1) / 2.0
+        half = self.center_region_size // 2
+
+        radial_x_rows = []
+        radial_y_rows = []
+        mask_rows = []
+        for y_shift in range(-half, half + 1):
+            for x_shift in range(-half, half + 1):
+                cy = cy0 + float(y_shift)
+                cx = cx0 + float(x_shift)
+                dy = yy - cy
+                dx = xx - cx
+                radius_px = np.sqrt(dx * dx + dy * dy)
+                radius_px_safe = np.maximum(radius_px, 1e-12)
+                radial_x_rows.append((dx / radius_px_safe).reshape(-1).astype(np.float32))
+                radial_y_rows.append((dy / radius_px_safe).reshape(-1).astype(np.float32))
+                radius_km_grid = radius_px * float(self.pixel_size_km)
+                mask = np.logical_and(radius_km_grid > 0.0, radius_km_grid <= float(self.radius_km))
+                if not np.any(mask):
+                    raise ValueError(
+                        "DAVComputer radius selects no pixels. "
+                        f"Got H={self.H}, W={self.W}, pixel_size_km={self.pixel_size_km}, "
+                        f"radius_km={self.radius_km}, center_region_size={self.center_region_size}."
+                    )
+                mask_rows.append(mask.reshape(-1).astype(np.float32))
+
+        self.radial_x = np.stack(radial_x_rows, axis=0)
+        self.radial_y = np.stack(radial_y_rows, axis=0)
+        self.mask = np.stack(mask_rows, axis=0)
+        self.weight_sum = np.maximum(np.sum(self.mask, axis=1, keepdims=True), 1.0)
+
+    def _sobel_gradient_components(self, img2d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        x = np.asarray(img2d, dtype=np.float64)
+        if x.shape != (self.H, self.W):
+            raise ValueError(f"DAVComputer expected image shape {(self.H, self.W)}, got {x.shape}.")
+
+        p = np.pad(x, pad_width=1, mode="reflect")
+        x00 = p[:-2, :-2]
+        x01 = p[:-2, 1:-1]
+        x02 = p[:-2, 2:]
+        x10 = p[1:-1, :-2]
+        x12 = p[1:-1, 2:]
+        x20 = p[2:, :-2]
+        x21 = p[2:, 1:-1]
+        x22 = p[2:, 2:]
+
+        grad_x = (x00 + 2.0 * x10 + x20) - (x02 + 2.0 * x12 + x22)
+        grad_y = (x00 + 2.0 * x01 + x02) - (x20 + 2.0 * x21 + x22)
+        return grad_x, grad_y
+
+    def per_image(self, img2d: np.ndarray) -> float:
+        grad_x, grad_y = self._sobel_gradient_components(img2d)
+        grad_x_flat = grad_x.reshape(1, -1)
+        grad_y_flat = grad_y.reshape(1, -1)
+        grad_norm = np.sqrt(grad_x_flat * grad_x_flat + grad_y_flat * grad_y_flat + 1e-8)
+
+        cos_theta = (grad_x_flat * self.radial_x + grad_y_flat * self.radial_y) / (grad_norm + 1e-8)
+        np.clip(cos_theta, -1.0, 1.0, out=cos_theta)
+        dev_angle_deg = np.arccos(cos_theta) * (180.0 / np.pi)
+
+        mean_angle = np.sum(dev_angle_deg * self.mask, axis=1, keepdims=True) / self.weight_sum
+        dav_by_center = np.sum(np.square(dev_angle_deg - mean_angle) * self.mask, axis=1) / self.weight_sum[:, 0]
+        return float(np.mean(dav_by_center))
+
+    def batch(self, imgs: np.ndarray) -> np.ndarray:
+        arr = np.asarray(imgs, dtype=np.float64)
+        if arr.ndim != 3 or arr.shape[1:] != (self.H, self.W):
+            raise ValueError(
+                f"DAVComputer.batch expects shape (N, {self.H}, {self.W}), got {arr.shape}."
+            )
+        out = np.zeros(arr.shape[0], dtype=np.float32)
+        for i in range(arr.shape[0]):
+            out[i] = self.per_image(arr[i])
+        return out
+
+
 def radial_profile_batch(
     imgs: np.ndarray, binner: PolarBinner
 ) -> Tuple[np.ndarray, np.ndarray]:
