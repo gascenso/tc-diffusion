@@ -30,6 +30,7 @@ from ..data import build_data_backend, load_dataset_index, load_split_file_set
 from ..diffusion import resolve_sampling_timestep_schedule
 from ..plotting import save_real_generated_comparison_grid
 from ..sample_bank import SampleBank
+from ..sampling_guidance import sampling_guidance_summary
 
 
 PRIMARY_RAW_AGG_KEYS = (
@@ -1187,6 +1188,7 @@ class TCEvaluator:
     ) -> Dict[str, Any]:
         cfg = self.cfg
         ev = _default_eval_cfg(cfg)
+        sampling_guidance_cfg = sampling_guidance_summary(cfg)
         split = str(split).strip().lower()
         if split not in {"val", "test"}:
             raise ValueError(f"Evaluation split must be 'val' or 'test', got {split!r}")
@@ -1327,6 +1329,9 @@ class TCEvaluator:
                         "sampling_steps": generation_meta.get("sampling_steps", ev.get("sampling_steps", ev.get("ddim_steps", None))),
                         "timestep_schedule": str(generation_meta.get("timestep_schedule", ev["timestep_schedule"])),
                         "ddim_eta": float(generation_meta.get("ddim_eta", ev.get("ddim_eta", 0.0))),
+                        "sampling_guidance": dict(
+                            generation_meta.get("sampling_guidance", sampling_guidance_cfg)
+                        ),
                     }
                 targets = sample_bank_info.get("conditioning_targets", {}).get("wind_kt_by_class", {})
                 if isinstance(targets, dict):
@@ -1338,6 +1343,7 @@ class TCEvaluator:
                     "sampling_steps": ev.get("sampling_steps", ev.get("ddim_steps", None)),
                     "timestep_schedule": str(ev["timestep_schedule"]),
                     "ddim_eta": float(ev.get("ddim_eta", 0.0)),
+                    "sampling_guidance": dict(sampling_guidance_cfg),
                 }
             if show_progress:
                 real_mode_desc = (
@@ -1365,6 +1371,11 @@ class TCEvaluator:
                 "sampling_steps": ev.get("sampling_steps", ev.get("ddim_steps", None)),
                 "timestep_schedule": str(ev["timestep_schedule"]),
                 "ddim_eta": float(ev.get("ddim_eta", 0.0)),
+                "sampling_guidance": (
+                    diffusion.get_sampling_guidance_report()
+                    if hasattr(diffusion, "get_sampling_guidance_report")
+                    else dict(sampling_guidance_cfg)
+                ),
             }
 
             gen_raw_by_class: Dict[int, np.ndarray] = {}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -91,6 +92,7 @@ def default_sample_bank_name(
     timestep_schedule: str | None,
     n_per_class: int,
     seed: int,
+    sampling_guidance: Dict[str, Any] | None = None,
 ) -> str:
     parts = [
         f"g{format_float_token(guidance_scale)}",
@@ -99,8 +101,18 @@ def default_sample_bank_name(
         str(timestep_schedule).strip().lower() if timestep_schedule else "schedule_default",
         f"n{int(n_per_class)}",
         f"seed{int(seed)}",
+        _sampling_guidance_token(sampling_guidance),
     ]
     return "_".join(parts)
+
+
+def _sampling_guidance_token(sampling_guidance: Dict[str, Any] | None) -> str:
+    if not isinstance(sampling_guidance, dict) or not bool(sampling_guidance.get("enabled", False)):
+        return "sgoff"
+
+    payload = json.dumps(sampling_guidance, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha1(payload).hexdigest()[:8]
+    return f"sgon{digest}"
 
 
 def repo_relative_or_abs(path: Path, base_repo_root: Path) -> str:

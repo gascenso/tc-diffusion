@@ -4,6 +4,12 @@ import tensorflow as tf
 import numpy as np
 from tqdm.auto import tqdm
 
+from .sampling_guidance import (
+    load_or_build_sampling_guidance_target_bank,
+    resolve_sampling_guidance_cfg,
+    sampling_guidance_summary,
+)
+
 
 _VALID_BETA_SCHEDULES = ("linear", "cosine")
 _VALID_TIMESTEP_SCHEDULES = ("linear", "leading", "trailing")
@@ -86,6 +92,7 @@ class Diffusion:
         loss: Computes the training loss for one diffusion step.
     """
     def __init__(self, cfg):
+        self.cfg = cfg
         self.num_steps = int(cfg["diffusion"]["num_steps"])
         self.beta_schedule_name, self.rescale_zero_terminal_snr = _resolve_beta_schedule_spec(
             cfg["diffusion"]["beta_schedule"],
@@ -160,6 +167,18 @@ class Diffusion:
         self.bt_min_k = float(cfg["data"]["bt_min_k"])
         self.bt_max_k = float(cfg["data"]["bt_max_k"])
         self.bt_range_k = self.bt_max_k - self.bt_min_k
+        self.sampling_guidance_cfg = resolve_sampling_guidance_cfg(cfg)
+        self.sampling_guidance_report = sampling_guidance_summary(cfg)
+        self.sampling_guidance_enabled = bool(self.sampling_guidance_cfg["enabled"])
+        self.sampling_guidance_active = (
+            self.sampling_guidance_enabled
+            and (
+                float(self.sampling_guidance_cfg["radial_weight"]) > 0.0
+                or float(self.sampling_guidance_cfg["dav_weight"]) > 0.0
+                or float(self.sampling_guidance_cfg["hist_weight"]) > 0.0
+            )
+        )
+        self._sampling_guidance_target_bank = None
 
         if self.physics_lambda < 0.0:
             raise ValueError(
@@ -300,6 +319,45 @@ class Diffusion:
             self.physics_hist_thresholds_k = tf.constant(hist_edges_k[1:-1], dtype=tf.float32)
             self.physics_hist_bin_width_k = float(hist_edges_k[1] - hist_edges_k[0])
 
+        if self.sampling_guidance_active:
+            image_size = int(cfg["data"]["image_size"])
+            if image_size <= 0:
+                raise ValueError(
+                    "data.image_size must be >= 1 when sampling_guidance is enabled, "
+                    f"got {image_size}"
+                )
+            sg_cfg = self.sampling_guidance_cfg
+            radial_bin_index, radial_bin_counts = self._build_radial_bin_lookup(
+                image_size=image_size,
+                radial_bins=int(sg_cfg["radial_bins"]),
+            )
+            self.sg_image_size = image_size
+            self.sg_radial_bins = int(sg_cfg["radial_bins"])
+            self.sg_radial_bin_index = tf.constant(radial_bin_index, dtype=tf.int32)
+            self.sg_radial_bin_counts = tf.constant(radial_bin_counts, dtype=tf.float32)
+            (
+                sg_dav_radial_x,
+                sg_dav_radial_y,
+                sg_dav_mask,
+                sg_dav_weight_sum,
+            ) = self._build_dav_lookup_multi_center(
+                image_size=image_size,
+                pixel_size_km=float(sg_cfg["pixel_size_km"]),
+                radius_km=float(sg_cfg["dav_radius_km"]),
+                center_region_size=int(sg_cfg["dav_center_region_size"]),
+            )
+            self.sg_dav_radial_x = tf.constant(sg_dav_radial_x, dtype=tf.float32)
+            self.sg_dav_radial_y = tf.constant(sg_dav_radial_y, dtype=tf.float32)
+            self.sg_dav_mask = tf.constant(sg_dav_mask, dtype=tf.float32)
+            self.sg_dav_weight_sum = tf.constant(sg_dav_weight_sum, dtype=tf.float32)
+            hist_edges_k = np.linspace(
+                self.bt_min_k,
+                self.bt_max_k,
+                num=int(sg_cfg["hist_bins"]) + 1,
+                dtype=np.float32,
+            )
+            self.sg_hist_thresholds_k = tf.constant(hist_edges_k[1:-1], dtype=tf.float32)
+
     def _default_wind_from_ss_tensor(self, ss_cat):
         ss_cat = tf.cast(ss_cat, tf.int32)
         if self.num_ss_classes == 6:
@@ -436,6 +494,50 @@ class Diffusion:
             )
         return radial_x, radial_y, mask
 
+    def _build_dav_lookup_multi_center(
+        self,
+        image_size: int,
+        pixel_size_km: float,
+        radius_km: float,
+        center_region_size: int,
+    ):
+        yy, xx = np.mgrid[0:image_size, 0:image_size]
+        cy0 = (image_size - 1) / 2.0
+        cx0 = (image_size - 1) / 2.0
+        half = int(center_region_size) // 2
+
+        radial_x_rows = []
+        radial_y_rows = []
+        mask_rows = []
+        for y_shift in range(-half, half + 1):
+            for x_shift in range(-half, half + 1):
+                cy = cy0 + float(y_shift)
+                cx = cx0 + float(x_shift)
+                dy = yy - cy
+                dx = xx - cx
+                radius_px = np.sqrt(dx * dx + dy * dy)
+                radius_px_safe = np.maximum(radius_px, 1e-12)
+                radial_x_rows.append((dx / radius_px_safe).reshape(-1).astype(np.float32))
+                radial_y_rows.append((dy / radius_px_safe).reshape(-1).astype(np.float32))
+                radius_km_grid = radius_px * float(pixel_size_km)
+                mask = np.logical_and(
+                    radius_km_grid > 0.0,
+                    radius_km_grid <= float(radius_km),
+                )
+                if not np.any(mask):
+                    raise ValueError(
+                        "sampling_guidance.dav_radius_km selects no pixels. "
+                        f"Got image_size={image_size}, pixel_size_km={pixel_size_km}, "
+                        f"dav_radius_km={radius_km}, center_region_size={center_region_size}."
+                    )
+                mask_rows.append(mask.reshape(-1).astype(np.float32))
+
+        radial_x = np.stack(radial_x_rows, axis=0)
+        radial_y = np.stack(radial_y_rows, axis=0)
+        mask = np.stack(mask_rows, axis=0)
+        weight_sum = np.maximum(np.sum(mask, axis=1, keepdims=True), 1.0).astype(np.float32)
+        return radial_x, radial_y, mask, weight_sum
+
     def _charbonnier(self, diff):
         diff = tf.cast(diff, tf.float32)
         eps = tf.cast(self.physics_charbonnier_eps, tf.float32)
@@ -479,21 +581,48 @@ class Diffusion:
         grad_x, grad_y = self._sobel_gradient_components(x)
         return tf.sqrt(tf.square(grad_x) + tf.square(grad_y) + 1e-8)  # [B, H, W, 1]
 
+    def _dav_deviation_angle_deg(self, grad_x, grad_y, radial_x, radial_y, valid_mask):
+        grad_x = tf.cast(grad_x, tf.float32)
+        grad_y = tf.cast(grad_y, tf.float32)
+        radial_x = tf.cast(radial_x, tf.float32)
+        radial_y = tf.cast(radial_y, tf.float32)
+        valid_mask = tf.cast(valid_mask, tf.bool)
+
+        # Normalize gradient vectors before comparing directions. For invalid
+        # pixels (outside the DAV mask or with near-zero gradients), swap in
+        # the radial unit vector so atan2 never sees the undefined (0, 0) case.
+        grad_norm = tf.sqrt(tf.square(grad_x) + tf.square(grad_y))
+        safe_grad_norm = tf.maximum(grad_norm, 1e-6)
+        unit_grad_x = grad_x / safe_grad_norm
+        unit_grad_y = grad_y / safe_grad_norm
+        safe_grad_x = tf.where(valid_mask, unit_grad_x, radial_x)
+        safe_grad_y = tf.where(valid_mask, unit_grad_y, radial_y)
+
+        dot = safe_grad_x * radial_x + safe_grad_y * radial_y
+        dot = tf.clip_by_value(dot, -1.0, 1.0)
+        cross = safe_grad_x * radial_y - safe_grad_y * radial_x
+        return tf.atan2(tf.abs(cross), dot) * (180.0 / np.pi)
+
     def _dav_per_sample(self, x):
         grad_x, grad_y = self._sobel_gradient_components(x)
         grad_x = tf.reshape(grad_x, [tf.shape(grad_x)[0], -1])
         grad_y = tf.reshape(grad_y, [tf.shape(grad_y)[0], -1])
-        grad_norm = tf.sqrt(tf.square(grad_x) + tf.square(grad_y) + 1e-8)
 
         radial_x = tf.reshape(self.physics_dav_radial_x, [1, -1])
         radial_y = tf.reshape(self.physics_dav_radial_y, [1, -1])
-        mask = tf.reshape(self.physics_dav_mask, [1, -1])
+        base_mask = tf.reshape(self.physics_dav_mask, [1, -1])
+        grad_valid = tf.sqrt(tf.square(grad_x) + tf.square(grad_y)) > 1e-6
+        valid_mask = tf.logical_and(base_mask > 0.0, grad_valid)
+        mask = tf.cast(valid_mask, tf.float32)
+        dev_angle_deg = self._dav_deviation_angle_deg(
+            grad_x,
+            grad_y,
+            radial_x,
+            radial_y,
+            valid_mask,
+        )
 
-        cos_theta = (grad_x * radial_x + grad_y * radial_y) / (grad_norm + 1e-8)
-        cos_theta = tf.clip_by_value(cos_theta, -1.0, 1.0)
-        dev_angle_deg = tf.acos(cos_theta) * (180.0 / np.pi)
-
-        weight_sum = tf.reduce_sum(mask, axis=1, keepdims=True)
+        weight_sum = tf.maximum(tf.reduce_sum(mask, axis=1, keepdims=True), 1.0)
         mean_angle = tf.reduce_sum(dev_angle_deg * mask, axis=1, keepdims=True) / weight_sum
         return tf.reduce_sum(tf.square(dev_angle_deg - mean_angle) * mask, axis=1) / tf.squeeze(weight_sum, axis=1)
 
@@ -503,6 +632,66 @@ class Diffusion:
         thresholds = tf.reshape(self.physics_hist_thresholds_k, [1, 1, -1])
         softness = tf.cast(self.physics_hist_softness_k, tf.float32)
         return tf.reduce_mean(tf.nn.sigmoid((thresholds - flat) / softness), axis=1)
+
+    def _sg_radial_mean_profile_bt_k(self, x_bt_k):
+        x_bt_k = tf.cast(x_bt_k, tf.float32)
+        field = tf.reduce_mean(x_bt_k, axis=-1)
+        flat = tf.reshape(field, [tf.shape(field)[0], -1])
+        flat_t = tf.transpose(flat, [1, 0])
+        radial_sum = tf.math.unsorted_segment_sum(
+            flat_t,
+            self.sg_radial_bin_index,
+            self.sg_radial_bins,
+        )
+        radial_mean = radial_sum / tf.reshape(self.sg_radial_bin_counts, [-1, 1])
+        return tf.transpose(radial_mean, [1, 0])
+
+    def _sg_dav_per_sample_bt_k(self, x_bt_k):
+        grad_x, grad_y = self._sobel_gradient_components(x_bt_k)
+        grad_x = tf.reshape(grad_x, [tf.shape(grad_x)[0], 1, -1])
+        grad_y = tf.reshape(grad_y, [tf.shape(grad_y)[0], 1, -1])
+
+        num_centers = int(self.sg_dav_radial_x.shape[0])
+        num_pixels = int(self.sg_dav_radial_x.shape[1])
+        radial_x = tf.reshape(self.sg_dav_radial_x, [1, num_centers, num_pixels])
+        radial_y = tf.reshape(self.sg_dav_radial_y, [1, num_centers, num_pixels])
+        base_mask = tf.reshape(self.sg_dav_mask, [1, num_centers, num_pixels])
+        grad_valid = tf.sqrt(tf.square(grad_x) + tf.square(grad_y)) > 1e-6
+        valid_mask = tf.logical_and(base_mask > 0.0, grad_valid)
+        mask = tf.cast(valid_mask, tf.float32)
+        dev_angle_deg = self._dav_deviation_angle_deg(
+            grad_x,
+            grad_y,
+            radial_x,
+            radial_y,
+            valid_mask,
+        )
+
+        weight_sum = tf.maximum(tf.reduce_sum(mask, axis=2, keepdims=True), 1.0)
+        mean_angle = tf.reduce_sum(dev_angle_deg * mask, axis=2, keepdims=True) / weight_sum
+        dav_by_center = tf.reduce_sum(
+            tf.square(dev_angle_deg - mean_angle) * mask,
+            axis=2,
+        ) / tf.squeeze(weight_sum, axis=2)
+        return tf.reduce_mean(dav_by_center, axis=1)
+
+    def _sg_soft_bt_cdf(self, x_bt_k):
+        x_bt_k = tf.cast(x_bt_k, tf.float32)
+        flat = tf.reshape(x_bt_k, [tf.shape(x_bt_k)[0], -1, 1])
+        thresholds = tf.reshape(self.sg_hist_thresholds_k, [1, 1, -1])
+        softness = tf.cast(self.sampling_guidance_cfg["hist_softness_k"], tf.float32)
+        return tf.reduce_mean(tf.nn.sigmoid((thresholds - flat) / softness), axis=1)
+
+    def _sampling_guidance_band_penalty(self, current, target_mean, target_std, sigma_floor):
+        current = tf.cast(current, tf.float32)
+        target_mean = tf.cast(target_mean, tf.float32)
+        target_std = tf.cast(target_std, tf.float32)
+        sigma_floor = tf.cast(sigma_floor, tf.float32)
+        band_width = tf.cast(self.sampling_guidance_cfg["band_width_sigma"], tf.float32)
+        scale = tf.maximum(target_std, sigma_floor)
+        excess = tf.nn.relu(tf.abs(current - target_mean) - band_width * scale)
+        standardized_excess = excess / (scale + 1e-6)
+        return self._charbonnier(standardized_excess)
 
     def _hist_cdf_loss_per_sample(self, x0_true, x0_hat):
         cdf_true = self._soft_bt_cdf(self._denorm_bt_k(x0_true))
@@ -560,6 +749,176 @@ class Diffusion:
             loss = loss + tf.cast(self.physics_grad_weight, tf.float32) * grad_loss
 
         return loss
+
+    def _ensure_sampling_guidance_target_bank(self, show_progress: bool = False):
+        if not self.sampling_guidance_active:
+            return None
+        if self._sampling_guidance_target_bank is None:
+            self._sampling_guidance_target_bank = load_or_build_sampling_guidance_target_bank(
+                self.cfg,
+                show_progress=show_progress,
+            )
+        return self._sampling_guidance_target_bank
+
+    def _prepare_sampling_guidance_targets(self, cond, batch_size, *, show_progress: bool = False):
+        if not self.sampling_guidance_active:
+            return None
+
+        bank = self._ensure_sampling_guidance_target_bank(show_progress=show_progress)
+        if bank is None:
+            return None
+
+        ss_cat, wind_kt = self._prepare_condition_tensors(cond, batch_size)
+        ss_cat_np = np.asarray(ss_cat.numpy(), dtype=np.int32).reshape(-1)
+        wind_kt_np = np.asarray(wind_kt.numpy(), dtype=np.float32).reshape(-1)
+        if ss_cat_np.size == 0:
+            return None
+        if np.all(ss_cat_np == int(self.null_label)):
+            return None
+        if np.any(ss_cat_np == int(self.null_label)):
+            raise ValueError(
+                "sampling_guidance does not support batches that mix null-conditioning "
+                "tokens with conditioned samples."
+            )
+        if not np.all(ss_cat_np == ss_cat_np[0]):
+            raise ValueError(
+                "sampling_guidance currently expects the batch to share a single SS class."
+            )
+
+        class_id = int(ss_cat_np[0])
+        class_targets = bank.class_targets.get(class_id)
+        if class_targets is None:
+            raise ValueError(
+                f"Sampling-guidance target bank has no entries for class {class_id}."
+            )
+
+        num_refs = int(class_targets.wind_kt.shape[0])
+        if num_refs <= 0:
+            raise ValueError(
+                f"Sampling-guidance target bank has no usable reference winds for class {class_id}."
+            )
+        k = min(int(self.sampling_guidance_cfg["neighbor_k"]), num_refs)
+        distances = np.abs(wind_kt_np[:, None] - class_targets.wind_kt[None, :])
+        nn_idx = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
+
+        targets = {
+            "class_id": class_id,
+            "neighbor_k": k,
+        }
+        if float(self.sampling_guidance_cfg["radial_weight"]) > 0.0:
+            radial_neighbors = class_targets.radial_profiles_k[nn_idx]
+            targets["radial_mean"] = tf.constant(
+                radial_neighbors.mean(axis=1).astype(np.float32, copy=False)
+            )
+            targets["radial_std"] = tf.constant(
+                radial_neighbors.std(axis=1).astype(np.float32, copy=False)
+            )
+        if float(self.sampling_guidance_cfg["dav_weight"]) > 0.0:
+            dav_neighbors = class_targets.dav_deg2[nn_idx]
+            targets["dav_mean"] = tf.constant(
+                dav_neighbors.mean(axis=1).astype(np.float32, copy=False)
+            )
+            targets["dav_std"] = tf.constant(
+                dav_neighbors.std(axis=1).astype(np.float32, copy=False)
+            )
+        if float(self.sampling_guidance_cfg["hist_weight"]) > 0.0:
+            hist_neighbors = class_targets.hist_cdf[nn_idx]
+            targets["hist_mean"] = tf.constant(
+                hist_neighbors.mean(axis=1).astype(np.float32, copy=False)
+            )
+            targets["hist_std"] = tf.constant(
+                hist_neighbors.std(axis=1).astype(np.float32, copy=False)
+            )
+        return targets
+
+    def _sampling_guidance_energy_per_sample(self, x0_pred, targets):
+        x0_pred = tf.cast(x0_pred, tf.float32)
+        x_bt_k = self._denorm_bt_k(x0_pred)
+        loss = tf.zeros([tf.shape(x0_pred)[0]], dtype=tf.float32)
+
+        if float(self.sampling_guidance_cfg["radial_weight"]) > 0.0:
+            radial_cur = self._sg_radial_mean_profile_bt_k(x_bt_k)
+            radial_penalty = self._sampling_guidance_band_penalty(
+                radial_cur,
+                targets["radial_mean"],
+                targets["radial_std"],
+                sigma_floor=float(self.sampling_guidance_cfg["sigma_floor_radial_k"]),
+            )
+            loss = loss + tf.cast(
+                self.sampling_guidance_cfg["radial_weight"],
+                tf.float32,
+            ) * tf.reduce_mean(radial_penalty, axis=1)
+
+        if float(self.sampling_guidance_cfg["dav_weight"]) > 0.0:
+            dav_cur = self._sg_dav_per_sample_bt_k(x_bt_k)
+            dav_penalty = self._sampling_guidance_band_penalty(
+                dav_cur,
+                targets["dav_mean"],
+                targets["dav_std"],
+                sigma_floor=float(self.sampling_guidance_cfg["sigma_floor_dav_deg2"]),
+            )
+            loss = loss + tf.cast(
+                self.sampling_guidance_cfg["dav_weight"],
+                tf.float32,
+            ) * dav_penalty
+
+        if float(self.sampling_guidance_cfg["hist_weight"]) > 0.0:
+            hist_cur = self._sg_soft_bt_cdf(x_bt_k)
+            hist_penalty = self._sampling_guidance_band_penalty(
+                hist_cur,
+                targets["hist_mean"],
+                targets["hist_std"],
+                sigma_floor=float(self.sampling_guidance_cfg["sigma_floor_hist_cdf"]),
+            )
+            loss = loss + tf.cast(
+                self.sampling_guidance_cfg["hist_weight"],
+                tf.float32,
+            ) * tf.reduce_mean(hist_penalty, axis=1)
+
+        return loss
+
+    def _apply_sampling_guidance_to_x0(self, x0_pred, targets, guidance_step_scale: float):
+        if targets is None or float(guidance_step_scale) <= 0.0:
+            return x0_pred
+
+        x0_pred_f32 = tf.cast(x0_pred, tf.float32)
+        with tf.GradientTape() as tape:
+            tape.watch(x0_pred_f32)
+            energy_per_sample = self._sampling_guidance_energy_per_sample(x0_pred_f32, targets)
+            energy = tf.reduce_mean(energy_per_sample)
+
+        grad = tape.gradient(energy, x0_pred_f32)
+        if grad is None:
+            return x0_pred
+
+        grad = tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
+        grad_rms = tf.sqrt(tf.reduce_mean(tf.square(grad), axis=[1, 2, 3], keepdims=True) + 1e-8)
+        direction = grad / grad_rms
+        x0_guided = x0_pred_f32 - tf.cast(float(guidance_step_scale), tf.float32) * direction
+        if self.dynamic_threshold:
+            x0_guided, _ = self._dynamic_threshold_x0(x0_guided, p=self.dynamic_threshold_p)
+        return tf.cast(x0_guided, x0_pred.dtype)
+
+    def _sampling_guidance_step_scale(self, step_index: int, total_steps: int) -> float:
+        if not self.sampling_guidance_active or total_steps <= 0:
+            return 0.0
+
+        base_step_size = float(self.sampling_guidance_cfg["step_size"])
+        if base_step_size <= 0.0:
+            return 0.0
+
+        start_frac = float(self.sampling_guidance_cfg["guide_start_step_frac"])
+        start_index = int(np.floor(total_steps * start_frac))
+        start_index = min(max(start_index, 0), max(total_steps - 1, 0))
+        if step_index < start_index:
+            return 0.0
+
+        guided_steps = max(total_steps - start_index, 1)
+        ramp = float(step_index - start_index + 1) / float(guided_steps)
+        return base_step_size * ramp
+
+    def get_sampling_guidance_report(self) -> dict:
+        return dict(self.sampling_guidance_report)
 
     def _betas_for_alpha_bar(self, num_steps: int, alpha_bar_fn):
         t = np.linspace(0.0, 1.0, num_steps + 1, dtype=np.float64)
@@ -938,6 +1297,8 @@ class Diffusion:
         guidance_scale=0.0,
         prev_x0_pred=None,
         prev_t_int=None,
+        sampling_guidance_targets=None,
+        sampling_guidance_step_scale: float = 0.0,
     ):
         """Single deterministic DPM-Solver++(2M, midpoint) step."""
         x0_pred, _ = self._predict_x0_and_eps(
@@ -946,6 +1307,11 @@ class Diffusion:
             t_int,
             cond,
             guidance_scale=guidance_scale,
+        )
+        x0_pred = self._apply_sampling_guidance_to_x0(
+            x0_pred,
+            sampling_guidance_targets,
+            guidance_step_scale=sampling_guidance_step_scale,
         )
 
         if t_prev_int < 0:
@@ -1116,6 +1482,10 @@ class Diffusion:
         sampler_name = str(sampler).strip().lower()
         if sampler_name == "dpm_solverpp_2m":
             sampler_name = "dpmpp_2m"
+        if self.sampling_guidance_active and sampler_name != "dpmpp_2m":
+            raise ValueError(
+                "sampling_guidance is currently supported only with sampler='dpmpp_2m'."
+            )
 
         t_iter = timesteps
         use_local_progress = bool(show_progress and progress_callback is None)
@@ -1147,10 +1517,19 @@ class Diffusion:
                 if progress_callback is not None:
                     progress_callback(1)
         else:
+            sampling_guidance_targets = self._prepare_sampling_guidance_targets(
+                cond,
+                batch_size,
+                show_progress=bool(show_progress),
+            )
             prev_x0_pred = None
             prev_t_int = None
             for idx, t_int in enumerate(t_iter):
                 t_prev_int = timesteps[idx + 1] if idx + 1 < len(timesteps) else -1
+                sampling_guidance_step_scale = self._sampling_guidance_step_scale(
+                    idx,
+                    len(timesteps),
+                )
                 x_t, prev_x0_pred = self.dpmpp_2m_step(
                     model,
                     x_t,
@@ -1160,6 +1539,8 @@ class Diffusion:
                     guidance_scale=guidance_scale,
                     prev_x0_pred=prev_x0_pred,
                     prev_t_int=prev_t_int,
+                    sampling_guidance_targets=sampling_guidance_targets,
+                    sampling_guidance_step_scale=sampling_guidance_step_scale,
                 )
                 prev_t_int = t_int
                 if progress_callback is not None:

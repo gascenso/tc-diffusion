@@ -24,6 +24,7 @@ from tc_diffusion.sample_bank import (
     utc_now_iso,
     write_sample_bank_manifest,
 )
+from tc_diffusion.sampling_guidance import sampling_guidance_summary
 
 
 def parse_args() -> argparse.Namespace:
@@ -221,14 +222,18 @@ def _canonical_generation_settings(
     sampling_steps: int | None,
     timestep_schedule: str,
     ddim_eta: float,
+    sampling_guidance: Dict[str, object],
 ) -> Dict[str, object]:
-    return {
+    settings = {
         "guidance_scale": float(guidance_scale),
         "sampler": str(sampler).strip().lower(),
         "sampling_steps": None if sampling_steps is None else int(sampling_steps),
         "timestep_schedule": str(timestep_schedule).strip().lower(),
         "ddim_eta": float(ddim_eta),
     }
+    if bool(sampling_guidance.get("enabled", False)):
+        settings["sampling_guidance"] = dict(sampling_guidance)
+    return settings
 
 
 def _build_new_manifest(
@@ -381,12 +386,14 @@ if __name__ == "__main__":
         args.timestep_schedule or ev_cfg.get("timestep_schedule") or resolve_sampling_timestep_schedule(cfg)
     )
     ddim_eta = float(args.ddim_eta) if args.ddim_eta is not None else float(ev_cfg.get("ddim_eta", 0.0))
+    sampling_guidance = sampling_guidance_summary(cfg)
     generation_settings = _canonical_generation_settings(
         guidance_scale=guidance_scale,
         sampler=sampler,
         sampling_steps=sampling_steps,
         timestep_schedule=timestep_schedule,
         ddim_eta=ddim_eta,
+        sampling_guidance=sampling_guidance,
     )
 
     gen_batch_size = args.gen_batch_size
@@ -412,6 +419,7 @@ if __name__ == "__main__":
         timestep_schedule=timestep_schedule,
         n_per_class=n_per_class,
         seed=seed if seed is not None else default_seed,
+        sampling_guidance=sampling_guidance,
     )
     if args.out_dir is None:
         bank_root = sample_bank_dir(repo, args.name, split, bank_name)

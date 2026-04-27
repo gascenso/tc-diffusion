@@ -80,6 +80,28 @@ physics_loss:
   cold_softness_k: 5.0
   charbonnier_eps: 1.0e-3
 
+sampling_guidance:
+  enabled: false
+  target_split: "train"
+  cache_path: null
+  build_batch_size: 16
+  neighbor_k: 64
+  guide_start_step_frac: 0.65
+  step_size: 0.01
+  band_width_sigma: 1.0
+  radial_weight: 1.0
+  dav_weight: 1.0
+  hist_weight: 1.0
+  radial_bins: 64
+  dav_radius_km: 300.0
+  pixel_size_km: 8.0
+  dav_center_region_size: 3
+  hist_bins: 32
+  hist_softness_k: 2.5
+  sigma_floor_radial_k: 2.0
+  sigma_floor_dav_deg2: 100.0
+  sigma_floor_hist_cdf: 0.02
+
 training:
   seed: 42              # authoritative seed for data order, RNG streams, and resumable training
   num_epochs: 140
