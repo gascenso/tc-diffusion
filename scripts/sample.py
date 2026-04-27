@@ -27,6 +27,7 @@ def parse_args():
         default=None,
         help="Config path. Defaults to runs/<name>/config.yaml saved at training time.",
     )
+    p.add_argument("--override", nargs="*", default=[])
     p.add_argument(
         "--batch_size",
         type=int,
@@ -139,7 +140,7 @@ if __name__ == "__main__":
             f"Config file not found: {config_path}. "
             "Pass --config explicitly or ensure the run has a saved config.yaml."
         )
-    cfg = load_config(str(config_path), overrides=[])
+    cfg = load_config(str(config_path), overrides=args.override)
 
     # GPU memory growth (optional, same as train)
     gpus = tf.config.list_physical_devices("GPU")
