@@ -896,6 +896,13 @@ def train(cfg, resume: bool = False):
         if use_mixed_precision:
             if hasattr(optimizer, "get_unscaled_gradients"):
                 grads = optimizer.get_unscaled_gradients(grads)
+        safe_grads = []
+        for grad, var in zip(grads, model.trainable_variables):
+            if grad is None:
+                safe_grads.append(tf.zeros_like(var))
+                continue
+            safe_grads.append(tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad)))
+        grads = safe_grads
         # Clip after unscaling so the norm is in the natural gradient space.
         # A non-positive or null grad_clip_norm disables clipping entirely.
         if clip_gradients:
