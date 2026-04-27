@@ -156,6 +156,12 @@ def apply_overrides(cfg, overrides):
         keys = key.split(".")
         d = cfg
         for k in keys[:-1]:
+            if k not in d:
+                d[k] = {}
+            if not isinstance(d[k], dict):
+                raise ValueError(
+                    f"Cannot apply override {key!r}: intermediate key {k!r} is not a mapping."
+                )
             d = d[k]
         # naive type inference
         v = parse_scalar(value)
