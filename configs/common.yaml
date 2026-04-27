@@ -160,3 +160,21 @@ evaluation:
   bootstrap_reps: 500
   bootstrap_reps_full_test: 0  # full-test eval uses all real test samples/class; disable expensive CI bootstrap by default
   bootstrap_ci_level: 0.95
+  evaluator_feature_metric:
+    enabled: "auto"  # auto-enables for cached-bank full-test evals
+    run_name: "evaluator_cat4plus_mild_rebalanced_s035"
+    config_path: null
+    weights_path: null
+    weights_name: "best_tail"
+    embedding_layer: "embedding_silu"
+    batch_size: 32
+    covariance_eps: 1.0e-6
+    null_reference_reps: 0
+    null_reference_seed: 123
+    negative_controls:
+      enabled: "auto"  # auto-enables whenever evaluator_feature_metric is enabled
+      controls: ["gaussian_blur", "pixel_shuffle"]
+      seed: 123
+      match_generated_counts: true
+      gaussian_blur_sigma_px: 6.0
+      gaussian_blur_kernel_size: 25

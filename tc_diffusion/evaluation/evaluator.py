@@ -18,16 +18,19 @@ from .metrics import (
     denorm_bt,
     eye_contrast_proxy,
     flatten_features_for_diversity,
+    frechet_distance_from_stats,
     js_divergence,
     psd_radial_batch,
     radial_profile_batch,
     rbf_mmd2,
     summary_stats,
+    weighted_mean_and_cov,
     wasserstein1_from_hist,
 )
 from .plots import plot_hist_overlay, plot_psd, plot_radial_profiles
 from ..data import build_data_backend, load_dataset_index, load_split_file_set
 from ..diffusion import resolve_sampling_timestep_schedule
+from ..evaluator.features import EvaluatorEmbeddingExtractor
 from ..plotting import save_real_generated_comparison_grid
 from ..sample_bank import SampleBank
 from ..sampling_guidance import sampling_guidance_summary
@@ -45,12 +48,13 @@ PRIMARY_RAW_AGG_KEYS = (
     "gen_exceedance_rate_total",
 )
 
-REPORT_SCHEMA_VERSION = 7
+REPORT_SCHEMA_VERSION = 9
 PAPER_READY_PIXEL_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.pixel_plausibility.v2"
 PAPER_READY_RADIAL_BT_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_bt_profile.v1"
 PAPER_READY_DAV_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.dav.v1"
 PAPER_READY_COLD_CLOUD_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.cold_cloud_fraction.v1"
 PER_CLASS_METRICS_CSV_SCHEMA = "tc_diffusion.per_class_metrics.v1"
+EVALUATOR_FD_NEGATIVE_CONTROL_NAMES = ("gaussian_blur", "pixel_shuffle")
 
 
 @dataclass
@@ -125,6 +129,26 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ev.setdefault("dav_radius_km", float(phys_cfg.get("dav_radius_km", 300.0)))
     ev.setdefault("dav_pixel_size_km", float(phys_cfg.get("pixel_size_km", 8.0)))
     ev.setdefault("dav_center_region_size", 3)
+    evaluator_fd_cfg = dict(ev.get("evaluator_feature_metric", {}))
+    evaluator_fd_cfg.setdefault("enabled", "auto")
+    evaluator_fd_cfg.setdefault("run_name", "evaluator_cat4plus_mild_rebalanced_s035")
+    evaluator_fd_cfg.setdefault("config_path", None)
+    evaluator_fd_cfg.setdefault("weights_path", None)
+    evaluator_fd_cfg.setdefault("weights_name", "best_tail")
+    evaluator_fd_cfg.setdefault("embedding_layer", "embedding_silu")
+    evaluator_fd_cfg.setdefault("batch_size", max(8, int(cfg.get("data", {}).get("batch_size", 8))))
+    evaluator_fd_cfg.setdefault("covariance_eps", 1.0e-6)
+    evaluator_fd_cfg.setdefault("null_reference_reps", 0)
+    evaluator_fd_cfg.setdefault("null_reference_seed", int(ev.get("seed", 123)))
+    negative_controls_cfg = dict(evaluator_fd_cfg.get("negative_controls", {}))
+    negative_controls_cfg.setdefault("enabled", "auto")
+    negative_controls_cfg.setdefault("controls", list(EVALUATOR_FD_NEGATIVE_CONTROL_NAMES))
+    negative_controls_cfg.setdefault("seed", int(ev.get("seed", 123)))
+    negative_controls_cfg.setdefault("match_generated_counts", True)
+    negative_controls_cfg.setdefault("gaussian_blur_sigma_px", 6.0)
+    negative_controls_cfg.setdefault("gaussian_blur_kernel_size", 25)
+    evaluator_fd_cfg["negative_controls"] = negative_controls_cfg
+    ev["evaluator_feature_metric"] = evaluator_fd_cfg
     return ev
 
 
@@ -1114,6 +1138,455 @@ def _compute_macro_metrics(class_scalars: Dict[int, Dict[str, float]]) -> Dict[s
     }
 
 
+def _resolve_auto_bool(
+    raw: Any,
+    *,
+    auto_value: bool,
+    field_name: str,
+) -> tuple[bool, str]:
+    if isinstance(raw, bool):
+        return bool(raw), "bool"
+    text = str(raw).strip().lower()
+    if text == "auto":
+        return bool(auto_value), "auto"
+    if text in {"1", "true", "yes", "on"}:
+        return True, "boolish"
+    if text in {"0", "false", "no", "off"}:
+        return False, "boolish"
+    raise ValueError(
+        f"{field_name} must be a boolean or 'auto', got {raw!r}"
+    )
+
+
+def _effective_sample_size_from_weights(weights: np.ndarray) -> float:
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if w.size == 0:
+        return 0.0
+    denom = float(np.sum(w * w))
+    if denom <= 0.0:
+        return 0.0
+    return float(1.0 / denom)
+
+
+def _parse_evaluator_fd_negative_control_names(raw: Any) -> list[str]:
+    aliases = {
+        "gaussian_blur": "gaussian_blur",
+        "blur": "gaussian_blur",
+        "gaussian": "gaussian_blur",
+        "pixel_shuffle": "pixel_shuffle",
+        "shuffle": "pixel_shuffle",
+        "pixel_shuffled_real": "pixel_shuffle",
+    }
+    if raw is None:
+        items: list[str] = []
+    elif isinstance(raw, str):
+        items = [part.strip() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple)):
+        items = [str(part).strip() for part in raw if str(part).strip()]
+    else:
+        raise ValueError(
+            "evaluation.evaluator_feature_metric.negative_controls.controls must be "
+            f"a string or list of strings, got {type(raw).__name__}."
+        )
+
+    out: list[str] = []
+    seen = set()
+    for item in items:
+        key = str(item).strip().lower()
+        if key not in aliases:
+            raise ValueError(
+                "Unsupported evaluator-FD negative control "
+                f"{item!r}; expected one of {sorted(EVALUATOR_FD_NEGATIVE_CONTROL_NAMES)}."
+            )
+        name = aliases[key]
+        if name not in seen:
+            out.append(name)
+            seen.add(name)
+    return out
+
+
+def _sample_real_images_for_negative_control(
+    real_k: np.ndarray,
+    *,
+    draw_n: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    arr = np.asarray(real_k, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(
+            f"Expected real_k shaped [N,H,W] for evaluator-FD negative controls, got {arr.shape}."
+        )
+
+    draw_n = int(draw_n)
+    if draw_n <= 0:
+        raise ValueError(f"Negative-control draw_n must be > 0, got {draw_n}.")
+    source_n = int(arr.shape[0])
+    if source_n <= 0:
+        raise ValueError("Cannot build evaluator-FD negative controls from an empty real set.")
+
+    replace = bool(draw_n > source_n)
+    if replace:
+        idx = rng.integers(source_n, size=draw_n)
+        draw_mode = "with_replacement"
+    elif draw_n == source_n:
+        idx = np.arange(source_n, dtype=np.int64)
+        draw_mode = "full_without_replacement"
+    else:
+        idx = rng.choice(source_n, size=draw_n, replace=False)
+        draw_mode = "without_replacement"
+
+    sampled = np.asarray(arr[idx], dtype=np.float32)
+    return sampled, {
+        "draw_n": int(draw_n),
+        "source_n": int(source_n),
+        "draw_mode": str(draw_mode),
+    }
+
+
+def _gaussian_kernel_2d(*, sigma_px: float, kernel_size: int) -> np.ndarray:
+    sigma_px = float(sigma_px)
+    kernel_size = int(kernel_size)
+    if sigma_px <= 0.0:
+        raise ValueError(f"gaussian_blur_sigma_px must be > 0, got {sigma_px}")
+    if kernel_size <= 0 or (kernel_size % 2) != 1:
+        raise ValueError(
+            "gaussian_blur_kernel_size must be a positive odd integer, "
+            f"got {kernel_size}"
+        )
+
+    radius = kernel_size // 2
+    grid = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel_1d = np.exp(-0.5 * (grid / sigma_px) ** 2)
+    kernel_1d /= np.sum(kernel_1d)
+    kernel_2d = np.outer(kernel_1d, kernel_1d).astype(np.float32)
+    kernel_2d /= np.sum(kernel_2d)
+    return kernel_2d
+
+
+def _apply_gaussian_blur_bt_k(
+    bt_k: np.ndarray,
+    *,
+    sigma_px: float,
+    kernel_size: int,
+) -> np.ndarray:
+    arr = np.asarray(bt_k, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim != 3:
+        raise ValueError(
+            "Expected BT array shaped [N,H,W] or [H,W] for gaussian blur control, "
+            f"got {arr.shape}."
+        )
+
+    kernel = _gaussian_kernel_2d(sigma_px=sigma_px, kernel_size=kernel_size)
+    kernel_tf = tf.convert_to_tensor(kernel[:, :, None, None], dtype=tf.float32)
+    field = tf.convert_to_tensor(arr[..., None], dtype=tf.float32)
+    pad = kernel.shape[0] // 2
+    field = tf.pad(field, [[0, 0], [pad, pad], [pad, pad], [0, 0]], mode="REFLECT")
+    blurred = tf.nn.depthwise_conv2d(
+        field,
+        filter=kernel_tf,
+        strides=[1, 1, 1, 1],
+        padding="VALID",
+    )
+    return np.asarray(blurred.numpy()[..., 0], dtype=np.float32)
+
+
+def _build_shared_pixel_shuffle_permutation(
+    *,
+    image_shape: tuple[int, int],
+    seed: int,
+) -> np.ndarray:
+    h, w = int(image_shape[0]), int(image_shape[1])
+    if h <= 0 or w <= 0:
+        raise ValueError(f"Invalid image shape for pixel-shuffle control: {(h, w)}")
+    rng = np.random.default_rng(int(seed))
+    return np.asarray(rng.permutation(h * w), dtype=np.int64)
+
+
+def _apply_shared_pixel_shuffle_bt_k(
+    bt_k: np.ndarray,
+    *,
+    permutation: np.ndarray,
+) -> np.ndarray:
+    arr = np.asarray(bt_k, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim != 3:
+        raise ValueError(
+            "Expected BT array shaped [N,H,W] or [H,W] for pixel-shuffle control, "
+            f"got {arr.shape}."
+        )
+
+    flat = arr.reshape(arr.shape[0], -1)
+    perm = np.asarray(permutation, dtype=np.int64).reshape(-1)
+    if flat.shape[1] != perm.shape[0]:
+        raise ValueError(
+            "Pixel-shuffle permutation length must match flattened image size, "
+            f"got {perm.shape[0]} vs {flat.shape[1]}."
+        )
+    shuffled = flat[:, perm]
+    return np.asarray(shuffled.reshape(arr.shape), dtype=np.float32)
+
+
+def _compute_evaluator_fd(
+    *,
+    real_embeddings_by_class: Dict[int, np.ndarray],
+    gen_embeddings_by_class: Dict[int, np.ndarray],
+    covariance_eps: float,
+) -> Dict[str, Any]:
+    valid_class_ids = sorted(
+        int(c) for c in real_embeddings_by_class.keys()
+        if c in gen_embeddings_by_class
+        and int(real_embeddings_by_class[c].shape[0]) > 0
+        and int(gen_embeddings_by_class[c].shape[0]) > 0
+    )
+    if not valid_class_ids:
+        raise ValueError("Cannot compute evaluator FD without overlapping real/generated classes.")
+
+    real_counts = {c: int(real_embeddings_by_class[c].shape[0]) for c in valid_class_ids}
+    gen_counts = {c: int(gen_embeddings_by_class[c].shape[0]) for c in valid_class_ids}
+    total_real = int(sum(real_counts.values()))
+    if total_real <= 0:
+        raise ValueError("Cannot compute evaluator FD from an empty real reference set.")
+
+    real_blocks = []
+    gen_blocks = []
+    gen_weight_blocks = []
+    class_priors = {}
+    feature_dim: int | None = None
+
+    for c in valid_class_ids:
+        real_block = np.asarray(real_embeddings_by_class[c], dtype=np.float64)
+        gen_block = np.asarray(gen_embeddings_by_class[c], dtype=np.float64)
+        if real_block.ndim != 2 or gen_block.ndim != 2:
+            raise ValueError("Evaluator embeddings must be 2D [N,D] blocks.")
+        if real_block.shape[1] != gen_block.shape[1]:
+            raise ValueError(
+                f"Evaluator embedding width mismatch for class {c}: "
+                f"{real_block.shape[1]} vs {gen_block.shape[1]}"
+            )
+        if feature_dim is None:
+            feature_dim = int(real_block.shape[1])
+        elif int(real_block.shape[1]) != feature_dim:
+            raise ValueError("Evaluator embedding width must match across classes.")
+
+        prior = float(real_counts[c]) / float(total_real)
+        class_priors[c] = prior
+        real_blocks.append(real_block)
+        gen_blocks.append(gen_block)
+        gen_weight_blocks.append(
+            np.full((gen_block.shape[0],), prior / float(gen_block.shape[0]), dtype=np.float64)
+        )
+
+    assert feature_dim is not None
+    real_all = np.concatenate(real_blocks, axis=0)
+    gen_all = np.concatenate(gen_blocks, axis=0)
+    real_weights = np.full((real_all.shape[0],), 1.0 / float(real_all.shape[0]), dtype=np.float64)
+    gen_weights = np.concatenate(gen_weight_blocks, axis=0)
+
+    mu_real, cov_real = weighted_mean_and_cov(
+        real_all,
+        real_weights,
+        covariance_eps=covariance_eps,
+    )
+    mu_gen, cov_gen = weighted_mean_and_cov(
+        gen_all,
+        gen_weights,
+        covariance_eps=covariance_eps,
+    )
+    fd = frechet_distance_from_stats(mu_real, cov_real, mu_gen, cov_gen)
+
+    return {
+        "value": float(fd),
+        "feature_dim": int(feature_dim),
+        "reference_prior": "empirical_real_reference",
+        "valid_class_ids": [int(c) for c in valid_class_ids],
+        "real_counts_by_class": {str(c): int(real_counts[c]) for c in valid_class_ids},
+        "generated_counts_by_class": {str(c): int(gen_counts[c]) for c in valid_class_ids},
+        "class_priors": {str(c): float(class_priors[c]) for c in valid_class_ids},
+        "num_real_images": int(real_all.shape[0]),
+        "num_generated_images": int(gen_all.shape[0]),
+        "effective_num_real_images": _effective_sample_size_from_weights(real_weights),
+        "effective_num_generated_images": _effective_sample_size_from_weights(gen_weights),
+    }
+
+
+def _summarize_numeric_distribution(values: np.ndarray) -> Dict[str, float]:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        raise ValueError("Cannot summarize an empty numeric distribution.")
+    return {
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+        "min": float(arr.min()),
+        "q05": float(np.quantile(arr, 0.05)),
+        "q50": float(np.quantile(arr, 0.50)),
+        "q95": float(np.quantile(arr, 0.95)),
+        "max": float(arr.max()),
+    }
+
+
+def _compute_evaluator_fd_real_vs_real_reference(
+    *,
+    real_embeddings_by_class: Dict[int, np.ndarray],
+    generated_counts_by_class: Dict[int, int],
+    covariance_eps: float,
+    reps: int,
+    seed: int,
+    observed_value: float | None = None,
+) -> Dict[str, Any]:
+    reps = int(reps)
+    if reps <= 0:
+        raise ValueError(f"real-vs-real reference reps must be > 0, got {reps}")
+
+    valid_class_ids = sorted(
+        int(c) for c in real_embeddings_by_class.keys()
+        if int(generated_counts_by_class.get(int(c), 0)) > 0
+        and int(real_embeddings_by_class[c].shape[0]) > 0
+    )
+    if not valid_class_ids:
+        raise ValueError("Cannot compute evaluator FD real-vs-real reference without valid classes.")
+
+    real_counts = {c: int(real_embeddings_by_class[c].shape[0]) for c in valid_class_ids}
+    total_real = int(sum(real_counts.values()))
+    if total_real <= 0:
+        raise ValueError("Cannot compute evaluator FD real-vs-real reference from an empty real set.")
+
+    class_priors = {c: float(real_counts[c]) / float(total_real) for c in valid_class_ids}
+    real_blocks = [np.asarray(real_embeddings_by_class[c], dtype=np.float64) for c in valid_class_ids]
+    real_all = np.concatenate(real_blocks, axis=0)
+    real_weights = np.full((real_all.shape[0],), 1.0 / float(real_all.shape[0]), dtype=np.float64)
+    mu_real, cov_real = weighted_mean_and_cov(
+        real_all,
+        real_weights,
+        covariance_eps=covariance_eps,
+    )
+
+    rng = np.random.default_rng(int(seed))
+    null_values = np.zeros((reps,), dtype=np.float64)
+    for rep_idx in range(reps):
+        pseudo_blocks = []
+        pseudo_weight_blocks = []
+        for c in valid_class_ids:
+            emb = np.asarray(real_embeddings_by_class[c], dtype=np.float64)
+            draw_n = int(generated_counts_by_class[c])
+            idx = rng.integers(emb.shape[0], size=draw_n)
+            pseudo_blocks.append(emb[idx])
+            pseudo_weight_blocks.append(
+                np.full((draw_n,), class_priors[c] / float(draw_n), dtype=np.float64)
+            )
+
+        pseudo_all = np.concatenate(pseudo_blocks, axis=0)
+        pseudo_weights = np.concatenate(pseudo_weight_blocks, axis=0)
+        mu_pseudo, cov_pseudo = weighted_mean_and_cov(
+            pseudo_all,
+            pseudo_weights,
+            covariance_eps=covariance_eps,
+        )
+        null_values[rep_idx] = frechet_distance_from_stats(mu_real, cov_real, mu_pseudo, cov_pseudo)
+
+    out: Dict[str, Any] = {
+        "enabled": True,
+        "variant": "fixed_reference_pseudo_generated_from_real",
+        "draw_mode": "with_replacement",
+        "reps": int(reps),
+        "seed": int(seed),
+        "pseudo_generated_counts_by_class": {
+            str(c): int(generated_counts_by_class[c]) for c in valid_class_ids
+        },
+        "summary": _summarize_numeric_distribution(null_values),
+        "valid_class_ids": [int(c) for c in valid_class_ids],
+    }
+    if observed_value is not None:
+        observed = float(observed_value)
+        ge_count = int(np.sum(null_values >= observed))
+        le_count = int(np.sum(null_values <= observed))
+        q50 = out["summary"]["q50"]
+        q95 = out["summary"]["q95"]
+        out.update(
+            {
+                "observed_value": observed,
+                "observed_minus_q50": float(observed - q50),
+                "observed_minus_q95": float(observed - q95),
+                "observed_percentile_within_null": float(le_count / float(reps)),
+                "upper_tail_pvalue": float((ge_count + 1.0) / (reps + 1.0)),
+            }
+        )
+    return out
+
+
+def _compute_evaluator_fd_negative_controls(
+    *,
+    real_embeddings_by_class: Dict[int, np.ndarray],
+    control_embeddings_by_name: Dict[str, Dict[int, np.ndarray]],
+    source_sampling_by_class: Dict[int, Dict[str, Any]],
+    covariance_eps: float,
+    observed_value: float | None = None,
+    negative_controls_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    controls_out: Dict[str, Any] = {}
+    gaussian_sigma_px = float(negative_controls_cfg.get("gaussian_blur_sigma_px", 6.0))
+    gaussian_kernel_size = int(negative_controls_cfg.get("gaussian_blur_kernel_size", 25))
+    pixel_shuffle_seed = int(negative_controls_cfg.get("seed", 123))
+
+    descriptions = {
+        "gaussian_blur": (
+            "Real test images degraded by a fixed Gaussian blur before evaluator-feature encoding."
+        ),
+        "pixel_shuffle": (
+            "Real test images with a shared random pixel permutation applied per image, "
+            "preserving per-image BT histograms while destroying spatial structure."
+        ),
+    }
+    severities = {
+        "gaussian_blur": "moderate",
+        "pixel_shuffle": "strong",
+    }
+
+    for control_name, control_embeddings_by_class in control_embeddings_by_name.items():
+        summary = _compute_evaluator_fd(
+            real_embeddings_by_class=real_embeddings_by_class,
+            gen_embeddings_by_class=control_embeddings_by_class,
+            covariance_eps=covariance_eps,
+        )
+        control_out: Dict[str, Any] = {
+            **summary,
+            "description": descriptions.get(control_name, ""),
+            "severity": severities.get(control_name, "custom"),
+            "source": "corrupted_real_test_images",
+            "source_sampling_by_class": {
+                str(c): dict(meta) for c, meta in sorted(source_sampling_by_class.items())
+            },
+        }
+        if control_name == "gaussian_blur":
+            control_out["transformation"] = {
+                "name": "gaussian_blur",
+                "sigma_px": float(gaussian_sigma_px),
+                "kernel_size": int(gaussian_kernel_size),
+            }
+        elif control_name == "pixel_shuffle":
+            control_out["transformation"] = {
+                "name": "pixel_shuffle",
+                "permutation": "shared_flattened_pixel_permutation",
+                "seed": int(pixel_shuffle_seed),
+            }
+        if observed_value is not None:
+            control_value = float(control_out["value"])
+            observed = float(observed_value)
+            control_out.update(
+                {
+                    "observed_model_value": observed,
+                    "observed_minus_control": float(observed - control_value),
+                    "observed_over_control": (
+                        float(observed / control_value) if control_value > 0.0 else None
+                    ),
+                }
+            )
+        controls_out[control_name] = control_out
+    return controls_out
+
+
 def _bootstrap_ci_blocks(
     *,
     class_caches: Dict[int, ClassMetricCache],
@@ -1289,11 +1762,133 @@ class TCEvaluator:
                 f"got {dav_center_region_size}"
             )
 
+        evaluator_fd_cfg = dict(ev.get("evaluator_feature_metric", {}))
+        evaluator_fd_enabled, evaluator_fd_enable_mode = _resolve_auto_bool(
+            evaluator_fd_cfg.get("enabled", "auto"),
+            auto_value=bool(split == "test" and full_test and using_cached_generations),
+            field_name="evaluation.evaluator_feature_metric.enabled",
+        )
+        evaluator_fd_covariance_eps = float(evaluator_fd_cfg.get("covariance_eps", 1.0e-6))
+        if evaluator_fd_covariance_eps < 0.0:
+            raise ValueError(
+                "evaluation.evaluator_feature_metric.covariance_eps must be >= 0, "
+                f"got {evaluator_fd_covariance_eps}"
+            )
+        evaluator_fd_null_reps = int(evaluator_fd_cfg.get("null_reference_reps", 0))
+        if evaluator_fd_null_reps < 0:
+            raise ValueError(
+                "evaluation.evaluator_feature_metric.null_reference_reps must be >= 0, "
+                f"got {evaluator_fd_null_reps}"
+            )
+        evaluator_fd_null_seed = int(evaluator_fd_cfg.get("null_reference_seed", ev["seed"]))
+        negative_controls_cfg = dict(evaluator_fd_cfg.get("negative_controls", {}))
+        negative_controls_enabled, negative_controls_enable_mode = _resolve_auto_bool(
+            negative_controls_cfg.get("enabled", "auto"),
+            auto_value=bool(evaluator_fd_enabled),
+            field_name="evaluation.evaluator_feature_metric.negative_controls.enabled",
+        )
+        negative_control_names = _parse_evaluator_fd_negative_control_names(
+            negative_controls_cfg.get("controls", list(EVALUATOR_FD_NEGATIVE_CONTROL_NAMES))
+        )
+        negative_controls_seed = int(negative_controls_cfg.get("seed", ev["seed"]))
+        negative_controls_match_generated_counts = bool(
+            negative_controls_cfg.get("match_generated_counts", True)
+        )
+        negative_controls_blur_sigma = float(
+            negative_controls_cfg.get("gaussian_blur_sigma_px", 6.0)
+        )
+        negative_controls_blur_kernel_size = int(
+            negative_controls_cfg.get("gaussian_blur_kernel_size", 25)
+        )
+        if negative_controls_blur_sigma <= 0.0:
+            raise ValueError(
+                "evaluation.evaluator_feature_metric.negative_controls.gaussian_blur_sigma_px "
+                f"must be > 0, got {negative_controls_blur_sigma}"
+            )
+        if negative_controls_blur_kernel_size <= 0 or (negative_controls_blur_kernel_size % 2) != 1:
+            raise ValueError(
+                "evaluation.evaluator_feature_metric.negative_controls.gaussian_blur_kernel_size "
+                f"must be a positive odd integer, got {negative_controls_blur_kernel_size}"
+            )
+
         tf.random.set_seed(ev["seed"])
         np.random.seed(ev["seed"])
 
         eval_root = resolve_eval_root(out_dir, tag, split)
         eval_root.mkdir(parents=True, exist_ok=True)
+
+        evaluator_feature_metric_report: Dict[str, Any] = {
+            "enabled": False,
+            "enable_mode": str(evaluator_fd_enable_mode),
+            "configured_enabled": evaluator_fd_cfg.get("enabled", "auto"),
+            "metric_name": "evaluator_fd",
+            "reference_prior": "empirical_real_reference",
+            "covariance_eps": float(evaluator_fd_covariance_eps),
+            "null_reference_reps": int(evaluator_fd_null_reps),
+            "null_reference_seed": int(evaluator_fd_null_seed),
+            "negative_controls": {
+                "enabled": False,
+                "enable_mode": str(negative_controls_enable_mode),
+                "configured_enabled": negative_controls_cfg.get("enabled", "auto"),
+                "controls_requested": list(negative_control_names),
+                "match_generated_counts": bool(negative_controls_match_generated_counts),
+                "seed": int(negative_controls_seed),
+            },
+        }
+        feature_extractor: EvaluatorEmbeddingExtractor | None = None
+        if evaluator_fd_enabled:
+            try:
+                feature_extractor = EvaluatorEmbeddingExtractor.from_run(
+                    run_name=str(evaluator_fd_cfg.get("run_name", "evaluator_cat4plus_mild_rebalanced_s035")),
+                    config_path=evaluator_fd_cfg.get("config_path"),
+                    weights_path=evaluator_fd_cfg.get("weights_path"),
+                    weights_name=evaluator_fd_cfg.get("weights_name", "best_tail"),
+                    batch_size=int(evaluator_fd_cfg.get("batch_size", 32)),
+                    embedding_layer=str(evaluator_fd_cfg.get("embedding_layer", "embedding_silu")),
+                )
+            except Exception as exc:
+                if evaluator_fd_enable_mode == "auto":
+                    evaluator_feature_metric_report["reason"] = (
+                        "auto-disabled because the evaluator feature extractor could not be loaded: "
+                        f"{exc}"
+                    )
+                    feature_extractor = None
+                else:
+                    raise
+
+        if feature_extractor is not None:
+            evaluator_feature_metric_report["enabled"] = True
+            evaluator_feature_metric_report["extractor"] = feature_extractor.metadata()
+            evaluator_feature_metric_report["input_preprocessing"] = (
+                "clip to evaluator BT range, normalize to [-1, 1]"
+            )
+        elif "reason" not in evaluator_feature_metric_report:
+            evaluator_feature_metric_report["reason"] = (
+                (
+                    "auto-disabled; default policy only enables this metric for cached-bank "
+                    "full-test evals"
+                    if evaluator_fd_enable_mode == "auto" and not evaluator_fd_enabled
+                    else "disabled by configuration"
+                )
+                if not evaluator_fd_enabled
+                else "evaluator feature extractor unavailable"
+            )
+        negative_controls_report = evaluator_feature_metric_report["negative_controls"]
+        if feature_extractor is not None and negative_controls_enabled and negative_control_names:
+            negative_controls_report["enabled"] = True
+            negative_controls_report["source"] = "corrupted_real_test_images"
+        elif not negative_controls_enabled:
+            negative_controls_report["reason"] = (
+                (
+                    "auto-disabled because evaluator_feature_metric is not enabled"
+                    if negative_controls_enable_mode == "auto"
+                    else "disabled by configuration"
+                )
+            )
+        elif feature_extractor is None:
+            negative_controls_report["reason"] = "evaluator feature extractor unavailable"
+        else:
+            negative_controls_report["reason"] = "no negative controls requested"
 
         real_paths_by_class, real_wind_by_class = _select_real_by_class(
             cfg,
@@ -1309,6 +1904,11 @@ class TCEvaluator:
             c for c in range(num_classes)
             if c in real_paths_by_class and c in candidate_generated_class_ids
         ]
+        negative_controls_active = bool(
+            feature_extractor is not None and negative_controls_enabled and negative_control_names
+        )
+        summary_tasks_per_class = 2 + int(feature_extractor is not None) + int(negative_controls_active)
+        summary_total_tasks = summary_tasks_per_class * len(valid_class_ids)
         stage_names = []
         if not using_cached_generations:
             stage_names.append("sampling")
@@ -1353,7 +1953,7 @@ class TCEvaluator:
                 )
                 summary_stage_idx, stage_total = stage_lookup["summaries"]
                 print(f"[eval] Reference mode: {real_mode_desc}. Generated source: cached bank ({n_per}/class).")
-                stage_plan_parts = [f"stage {summary_stage_idx}/{stage_total} summaries={2 * len(valid_class_ids)} class tasks"]
+                stage_plan_parts = [f"stage {summary_stage_idx}/{stage_total} summaries={summary_total_tasks} class tasks"]
                 if "bootstrap" in stage_lookup:
                     bootstrap_stage_idx, stage_total = stage_lookup["bootstrap"]
                     stage_plan_parts.append(f"stage {bootstrap_stage_idx}/{stage_total} bootstrap={bootstrap_reps} reps")
@@ -1393,7 +1993,7 @@ class TCEvaluator:
                     f"stage {sampling_stage_idx}/{stage_total} sampling={num_classes} classes x {batches_per_class} "
                     f"batches/class x {len(sampling_timesteps)} reverse steps = "
                     f"{num_classes * batches_per_class * len(sampling_timesteps)} updates",
-                    f"stage {summary_stage_idx}/{stage_total} summaries={2 * len(valid_class_ids)} class tasks",
+                    f"stage {summary_stage_idx}/{stage_total} summaries={summary_total_tasks} class tasks",
                 ]
                 if "bootstrap" in stage_lookup:
                     bootstrap_stage_idx, _ = stage_lookup["bootstrap"]
@@ -1480,12 +2080,19 @@ class TCEvaluator:
         per_class_metrics = {}
         per_class_curves = {}
         class_scalars = {}
+        real_evaluator_embeddings: Dict[int, np.ndarray] = {}
+        gen_evaluator_embeddings: Dict[int, np.ndarray] = {}
+        negative_control_embeddings: Dict[str, Dict[int, np.ndarray]] = {
+            name: {} for name in negative_control_names
+        } if negative_controls_active else {}
+        negative_control_source_sampling_by_class: Dict[int, Dict[str, Any]] = {}
+        pixel_shuffle_permutation: np.ndarray | None = None
         summary_pbar = None
         if show_progress and valid_class_ids:
             summary_stage_idx, stage_total = stage_lookup["summaries"]
             print(f"[eval] Stage {summary_stage_idx}/{stage_total}: computing class summaries and plots.")
             summary_pbar = tqdm(
-                total=2 * len(valid_class_ids),
+                total=summary_total_tasks,
                 desc=f"Eval {summary_stage_idx}/{stage_total}: class summaries",
                 unit="task",
                 leave=True,
@@ -1531,6 +2138,48 @@ class TCEvaluator:
                 bt_min_k=bt_min_k,
                 bt_max_k=bt_max_k,
             )
+            if feature_extractor is not None:
+                real_evaluator_embeddings[c] = feature_extractor.encode_bt_k(real_k)
+                gen_evaluator_embeddings[c] = feature_extractor.encode_bt_k(gen_k_raw)
+                if summary_pbar is not None:
+                    summary_pbar.set_postfix_str(f"features class {c}", refresh=False)
+                    summary_pbar.update(1)
+                if negative_controls_active:
+                    draw_n = (
+                        int(gen_k_raw.shape[0])
+                        if negative_controls_match_generated_counts
+                        else int(real_k.shape[0])
+                    )
+                    class_rng = np.random.default_rng(
+                        int(negative_controls_seed + 7919 * (c + 1))
+                    )
+                    control_source_k, source_meta = _sample_real_images_for_negative_control(
+                        real_k,
+                        draw_n=draw_n,
+                        rng=class_rng,
+                    )
+                    negative_control_source_sampling_by_class[c] = source_meta
+                    if "gaussian_blur" in negative_control_embeddings:
+                        blur_k = _apply_gaussian_blur_bt_k(
+                            control_source_k,
+                            sigma_px=negative_controls_blur_sigma,
+                            kernel_size=negative_controls_blur_kernel_size,
+                        )
+                        negative_control_embeddings["gaussian_blur"][c] = feature_extractor.encode_bt_k(blur_k)
+                    if "pixel_shuffle" in negative_control_embeddings:
+                        if pixel_shuffle_permutation is None:
+                            pixel_shuffle_permutation = _build_shared_pixel_shuffle_permutation(
+                                image_shape=(int(control_source_k.shape[1]), int(control_source_k.shape[2])),
+                                seed=int(negative_controls_seed),
+                            )
+                        shuffled_k = _apply_shared_pixel_shuffle_bt_k(
+                            control_source_k,
+                            permutation=pixel_shuffle_permutation,
+                        )
+                        negative_control_embeddings["pixel_shuffle"][c] = feature_extractor.encode_bt_k(shuffled_k)
+                    if summary_pbar is not None:
+                        summary_pbar.set_postfix_str(f"controls class {c}", refresh=False)
+                        summary_pbar.update(1)
             del real_k
             del gen_k_raw
             class_caches[c] = cache
@@ -1611,7 +2260,42 @@ class TCEvaluator:
         if summary_pbar is not None:
             summary_pbar.close()
 
+        evaluator_fd_summary: Dict[str, Any] | None = None
+        if feature_extractor is not None and real_evaluator_embeddings and gen_evaluator_embeddings:
+            evaluator_fd_summary = _compute_evaluator_fd(
+                real_embeddings_by_class=real_evaluator_embeddings,
+                gen_embeddings_by_class=gen_evaluator_embeddings,
+                covariance_eps=evaluator_fd_covariance_eps,
+            )
+            evaluator_feature_metric_report.update(evaluator_fd_summary)
+            if evaluator_fd_null_reps > 0:
+                evaluator_feature_metric_report["real_vs_real_reference"] = _compute_evaluator_fd_real_vs_real_reference(
+                    real_embeddings_by_class=real_evaluator_embeddings,
+                    generated_counts_by_class={
+                        int(c): int(arr.shape[0]) for c, arr in gen_evaluator_embeddings.items()
+                    },
+                    covariance_eps=evaluator_fd_covariance_eps,
+                    reps=evaluator_fd_null_reps,
+                    seed=evaluator_fd_null_seed,
+                    observed_value=float(evaluator_fd_summary["value"]),
+                )
+            if negative_controls_active and negative_control_embeddings:
+                negative_controls_report["controls"] = _compute_evaluator_fd_negative_controls(
+                    real_embeddings_by_class=real_evaluator_embeddings,
+                    control_embeddings_by_name=negative_control_embeddings,
+                    source_sampling_by_class=negative_control_source_sampling_by_class,
+                    covariance_eps=evaluator_fd_covariance_eps,
+                    observed_value=float(evaluator_fd_summary["value"]),
+                    negative_controls_cfg=negative_controls_cfg,
+                )
+        elif feature_extractor is not None:
+            evaluator_feature_metric_report["reason"] = (
+                "enabled, but no overlapping real/generated embeddings were available"
+            )
+
         aggregate_primary_raw = _compute_aggregate_primary_raw(class_scalars)
+        if evaluator_fd_summary is not None:
+            aggregate_primary_raw["evaluator_fd"] = float(evaluator_fd_summary["value"])
         macro = _compute_macro_metrics(class_scalars)
         if show_progress and bootstrap_reps > 0:
             bootstrap_stage_idx, stage_total = stage_lookup["bootstrap"]
@@ -1743,6 +2427,7 @@ class TCEvaluator:
             },
             "aggregate_primary_raw": aggregate_primary_raw,
             "aggregate_primary_raw_ci": aggregate_primary_raw_ci,
+            "evaluator_feature_metric": evaluator_feature_metric_report,
             "macro": macro,
             "macro_ci": macro_ci,
             "per_class": per_class_metrics,

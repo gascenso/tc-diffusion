@@ -443,6 +443,117 @@ def rbf_mmd2(X: np.ndarray, Y: np.ndarray, gamma: Optional[float] = None) -> flo
     return float(mmd2)
 
 
+def weighted_mean_and_cov(
+    X: np.ndarray,
+    sample_weights: Optional[np.ndarray] = None,
+    *,
+    covariance_eps: float = 1.0e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Weighted empirical mean/covariance for FID-style Gaussian summaries.
+
+    When sample_weights is None, this matches the usual unbiased sample
+    covariance (normalisation by N-1). When weights are supplied, they are
+    normalised to sum to 1 and a weighted Bessel correction is applied via
+    1 - sum(w_i^2), which reduces to N-1 for uniform weights.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"X must be rank-2 [N,D], got shape {X.shape}")
+    n, d = X.shape
+    if n <= 0:
+        raise ValueError("X must contain at least one sample.")
+
+    if sample_weights is None:
+        mu = np.mean(X, axis=0)
+        if n >= 2:
+            xc = X - mu
+            cov = (xc.T @ xc) / float(n - 1)
+        else:
+            cov = np.zeros((d, d), dtype=np.float64)
+    else:
+        w = np.asarray(sample_weights, dtype=np.float64).reshape(-1)
+        if w.shape[0] != n:
+            raise ValueError(
+                f"sample_weights must have length {n} to match X, got {w.shape[0]}"
+            )
+        if not np.all(np.isfinite(w)):
+            raise ValueError("sample_weights must be finite.")
+        if np.any(w < 0.0):
+            raise ValueError("sample_weights must be non-negative.")
+        wsum = float(np.sum(w))
+        if wsum <= 0.0:
+            raise ValueError("sample_weights must sum to a positive value.")
+        w = w / wsum
+        mu = np.sum(X * w[:, None], axis=0)
+        xc = X - mu
+        denom = 1.0 - float(np.sum(w * w))
+        if denom > 1.0e-12:
+            cov = ((xc * w[:, None]).T @ xc) / denom
+        else:
+            cov = np.zeros((d, d), dtype=np.float64)
+
+    cov = 0.5 * (cov + cov.T)
+    eps = float(max(covariance_eps, 0.0))
+    if eps > 0.0:
+        cov = cov + np.eye(d, dtype=np.float64) * eps
+    return mu.astype(np.float64, copy=False), cov.astype(np.float64, copy=False)
+
+
+def frechet_distance_from_stats(
+    mu_real: np.ndarray,
+    cov_real: np.ndarray,
+    mu_gen: np.ndarray,
+    cov_gen: np.ndarray,
+) -> float:
+    """
+    Fréchet distance between two Gaussian summaries.
+
+    This is the standard FID formula, implemented via PSD eigendecomposition
+    rather than scipy.linalg.sqrtm to keep the dependency footprint small.
+    """
+    mu_real = np.asarray(mu_real, dtype=np.float64).reshape(-1)
+    mu_gen = np.asarray(mu_gen, dtype=np.float64).reshape(-1)
+    cov_real = np.asarray(cov_real, dtype=np.float64)
+    cov_gen = np.asarray(cov_gen, dtype=np.float64)
+
+    if mu_real.shape != mu_gen.shape:
+        raise ValueError(
+            f"Mean vectors must have identical shape, got {mu_real.shape} vs {mu_gen.shape}"
+        )
+    if cov_real.shape != cov_gen.shape:
+        raise ValueError(
+            f"Covariance matrices must have identical shape, got {cov_real.shape} vs {cov_gen.shape}"
+        )
+    if cov_real.shape[0] != cov_real.shape[1]:
+        raise ValueError(f"Covariance matrix must be square, got {cov_real.shape}")
+    if cov_real.shape[0] != mu_real.shape[0]:
+        raise ValueError(
+            "Mean/covariance dimension mismatch: "
+            f"mean has dim {mu_real.shape[0]}, covariance has shape {cov_real.shape}"
+        )
+
+    cov_real = 0.5 * (cov_real + cov_real.T)
+    cov_gen = 0.5 * (cov_gen + cov_gen.T)
+    diff = mu_real - mu_gen
+
+    sqrt_cov_real = _psd_matrix_sqrt(cov_real)
+    middle = sqrt_cov_real @ cov_gen @ sqrt_cov_real
+    middle = 0.5 * (middle + middle.T)
+    sqrt_middle = _psd_matrix_sqrt(middle)
+    fd = float(diff @ diff + np.trace(cov_real + cov_gen - 2.0 * sqrt_middle))
+    return float(max(fd, 0.0))
+
+
+def _psd_matrix_sqrt(mat: np.ndarray) -> np.ndarray:
+    mat = np.asarray(mat, dtype=np.float64)
+    mat = 0.5 * (mat + mat.T)
+    eigvals, eigvecs = np.linalg.eigh(mat)
+    eigvals = np.clip(eigvals, 0.0, None)
+    sqrt_eigvals = np.sqrt(eigvals)
+    return (eigvecs * sqrt_eigvals[None, :]) @ eigvecs.T
+
+
 def flatten_features_for_diversity(
     mean_prof: np.ndarray,
     psd_prof: np.ndarray,
