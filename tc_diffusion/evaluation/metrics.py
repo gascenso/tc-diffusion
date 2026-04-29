@@ -85,6 +85,220 @@ def summary_stats(x: np.ndarray) -> Dict[str, float]:
     }
 
 
+def pairwise_squared_distances_block(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> np.ndarray:
+    """Squared Euclidean distances for one block pair."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.ndim != 2 or y.ndim != 2:
+        raise ValueError(f"Expected rank-2 feature blocks, got {x.shape} and {y.shape}.")
+    if x.shape[1] != y.shape[1]:
+        raise ValueError(f"Feature dimensions differ: {x.shape[1]} vs {y.shape[1]}.")
+
+    x_norm = np.sum(x * x, axis=1)[:, None]
+    y_norm = np.sum(y * y, axis=1)[None, :]
+    d2 = x_norm + y_norm - 2.0 * (x @ y.T)
+    np.maximum(d2, 0.0, out=d2)
+    return d2
+
+
+def nearest_neighbor_distances(
+    query: np.ndarray,
+    reference: np.ndarray,
+    *,
+    block_size: int = 256,
+) -> np.ndarray:
+    """
+    Euclidean distance from each query row to its nearest reference row.
+
+    The computation is blockwise to avoid materialising large full distance
+    matrices for full-test and train-reference evaluations.
+    """
+    distances, _indices = nearest_neighbor_distances_and_indices(
+        query,
+        reference,
+        block_size=block_size,
+    )
+    return distances
+
+
+def nearest_neighbor_distances_and_indices(
+    query: np.ndarray,
+    reference: np.ndarray,
+    *,
+    block_size: int = 256,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Euclidean nearest-neighbor distance and reference-row index for each query row.
+
+    This is the same blockwise computation as nearest_neighbor_distances, with
+    the extra index output needed for qualitative nearest-neighbor inspection.
+    """
+    query = np.asarray(query, dtype=np.float64)
+    reference = np.asarray(reference, dtype=np.float64)
+    if query.ndim != 2 or reference.ndim != 2:
+        raise ValueError(f"Expected rank-2 feature matrices, got {query.shape} and {reference.shape}.")
+    if query.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    if reference.shape[0] == 0:
+        raise ValueError("nearest_neighbor_distances_and_indices requires at least one reference row.")
+    if query.shape[1] != reference.shape[1]:
+        raise ValueError(f"Feature dimensions differ: {query.shape[1]} vs {reference.shape[1]}.")
+
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}.")
+
+    out_d2 = np.full((query.shape[0],), np.inf, dtype=np.float64)
+    out_idx = np.full((query.shape[0],), -1, dtype=np.int64)
+    for i0 in range(0, query.shape[0], block_size):
+        i1 = min(i0 + block_size, query.shape[0])
+        qi = query[i0:i1]
+        best_d2 = np.full((i1 - i0,), np.inf, dtype=np.float64)
+        best_idx = np.full((i1 - i0,), -1, dtype=np.int64)
+        for j0 in range(0, reference.shape[0], block_size):
+            j1 = min(j0 + block_size, reference.shape[0])
+            d2 = pairwise_squared_distances_block(qi, reference[j0:j1])
+            local_idx = np.argmin(d2, axis=1)
+            local_d2 = d2[np.arange(i1 - i0), local_idx]
+            improve = local_d2 < best_d2
+            best_d2[improve] = local_d2[improve]
+            best_idx[improve] = j0 + local_idx[improve]
+        out_d2[i0:i1] = best_d2
+        out_idx[i0:i1] = best_idx
+    return np.sqrt(out_d2).astype(np.float32), out_idx
+
+
+def kth_neighbor_distances_within_set(
+    x: np.ndarray,
+    *,
+    k: int = 3,
+    block_size: int = 256,
+) -> np.ndarray:
+    """
+    Distance from each row to its kth nearest *other* row in the same set.
+
+    This gives each real sample a local manifold radius for coverage. For very
+    small sets, k is reduced to the largest valid neighbor rank.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError(f"Expected rank-2 feature matrix, got {x.shape}.")
+    n = int(x.shape[0])
+    if n == 0:
+        return np.zeros((0,), dtype=np.float32)
+    if n == 1:
+        return np.zeros((1,), dtype=np.float32)
+
+    k_eff = min(max(int(k), 1), n - 1)
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}.")
+
+    out = np.zeros((n,), dtype=np.float64)
+    for i0 in range(0, n, block_size):
+        i1 = min(i0 + block_size, n)
+        d2_blocks = []
+        xi = x[i0:i1]
+        for j0 in range(0, n, block_size):
+            j1 = min(j0 + block_size, n)
+            d2 = pairwise_squared_distances_block(xi, x[j0:j1])
+            if i0 == j0:
+                local = np.arange(i1 - i0)
+                d2[local, local] = np.inf
+            d2_blocks.append(d2)
+        d2_all = np.concatenate(d2_blocks, axis=1)
+        kth = np.partition(d2_all, kth=k_eff - 1, axis=1)[:, k_eff - 1]
+        out[i0:i1] = np.sqrt(kth)
+    return out.astype(np.float32)
+
+
+def mean_pairwise_distance(
+    x: np.ndarray,
+    *,
+    block_size: int = 256,
+) -> float:
+    """Mean Euclidean distance over all unordered pairs in one feature set."""
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError(f"Expected rank-2 feature matrix, got {x.shape}.")
+    n = int(x.shape[0])
+    if n < 2:
+        return 0.0
+
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}.")
+
+    total = 0.0
+    count = 0
+    for i0 in range(0, n, block_size):
+        i1 = min(i0 + block_size, n)
+        xi = x[i0:i1]
+        for j0 in range(i0, n, block_size):
+            j1 = min(j0 + block_size, n)
+            d2 = pairwise_squared_distances_block(xi, x[j0:j1])
+            d = np.sqrt(d2)
+            if i0 == j0:
+                tri = np.triu_indices(i1 - i0, k=1)
+                total += float(np.sum(d[tri]))
+                count += int(tri[0].shape[0])
+            else:
+                total += float(np.sum(d))
+                count += int(d.size)
+    return float(total / max(count, 1))
+
+
+def summarize_distances(values: np.ndarray) -> Dict[str, float]:
+    """Compact summary for nearest-neighbor and pairwise distance distributions."""
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        raise ValueError("Cannot summarize an empty distance distribution.")
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "min": float(np.min(arr)),
+        "q01": float(np.quantile(arr, 0.01)),
+        "q05": float(np.quantile(arr, 0.05)),
+        "q50": float(np.quantile(arr, 0.50)),
+        "q95": float(np.quantile(arr, 0.95)),
+        "q99": float(np.quantile(arr, 0.99)),
+        "max": float(np.max(arr)),
+    }
+
+
+def coverage_from_real_radii(
+    *,
+    real_to_gen_nn: np.ndarray,
+    real_radii: np.ndarray,
+) -> Dict[str, float]:
+    """
+    Fraction of real samples covered by generated samples.
+
+    A real sample is covered when its nearest generated neighbor lies within
+    that real sample's local real-manifold radius.
+    """
+    nn = np.asarray(real_to_gen_nn, dtype=np.float64).reshape(-1)
+    radii = np.asarray(real_radii, dtype=np.float64).reshape(-1)
+    if nn.shape != radii.shape:
+        raise ValueError(f"real_to_gen_nn and real_radii shape mismatch: {nn.shape} vs {radii.shape}.")
+    if nn.size == 0:
+        raise ValueError("Cannot compute coverage from an empty reference set.")
+
+    covered = nn <= radii
+    return {
+        "value": float(np.mean(covered)),
+        "covered_count": int(np.sum(covered)),
+        "reference_count": int(nn.size),
+        "mean_real_radius": float(np.mean(radii)),
+        "median_real_radius": float(np.median(radii)),
+        "real_to_generated_nn": summarize_distances(nn),
+        "real_radius": summarize_distances(radii),
+    }
+
+
 @dataclass
 class PolarBinner:
     """

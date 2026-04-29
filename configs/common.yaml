@@ -171,6 +171,15 @@ evaluation:
     covariance_eps: 1.0e-6
     null_reference_reps: 0
     null_reference_seed: 123
+    distributional:
+      enabled: "auto"  # auto-enables with evaluator_feature_metric
+      feature_space: "evaluator_embedding"
+      coverage_k: 3
+      distance_block_size: 256
+      memorization_train_split: "train"
+      memorization_train_limit_per_class: null  # null means all available training samples/class
+      memorization_train_seed: 123
+      memorization_pairs_per_class: 3  # qualitative nearest generated/train pairs saved for paper-ready plots; 0 disables
     negative_controls:
       enabled: "auto"  # auto-enables whenever evaluator_feature_metric is enabled
       controls: ["gaussian_blur", "pixel_shuffle"]

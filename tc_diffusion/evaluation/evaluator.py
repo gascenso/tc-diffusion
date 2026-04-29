@@ -15,14 +15,20 @@ from .metrics import (
     DAVComputer,
     PolarBinner,
     cold_cloud_fraction,
+    coverage_from_real_radii,
     denorm_bt,
     eye_contrast_proxy,
     flatten_features_for_diversity,
     frechet_distance_from_stats,
     js_divergence,
+    kth_neighbor_distances_within_set,
+    mean_pairwise_distance,
+    nearest_neighbor_distances,
+    nearest_neighbor_distances_and_indices,
     psd_radial_batch,
     radial_profile_batch,
     rbf_mmd2,
+    summarize_distances,
     summary_stats,
     weighted_mean_and_cov,
     wasserstein1_from_hist,
@@ -48,11 +54,13 @@ PRIMARY_RAW_AGG_KEYS = (
     "gen_exceedance_rate_total",
 )
 
-REPORT_SCHEMA_VERSION = 9
+REPORT_SCHEMA_VERSION = 11
 PAPER_READY_PIXEL_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.pixel_plausibility.v2"
 PAPER_READY_RADIAL_BT_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_bt_profile.v1"
+PAPER_READY_PSD_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_psd_profile.v1"
 PAPER_READY_DAV_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.dav.v1"
 PAPER_READY_COLD_CLOUD_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.cold_cloud_fraction.v1"
+PAPER_READY_MEMORIZATION_PAIRS_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.memorization_pairs.v1"
 PER_CLASS_METRICS_CSV_SCHEMA = "tc_diffusion.per_class_metrics.v1"
 EVALUATOR_FD_NEGATIVE_CONTROL_NAMES = ("gaussian_blur", "pixel_shuffle")
 
@@ -140,6 +148,16 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     evaluator_fd_cfg.setdefault("covariance_eps", 1.0e-6)
     evaluator_fd_cfg.setdefault("null_reference_reps", 0)
     evaluator_fd_cfg.setdefault("null_reference_seed", int(ev.get("seed", 123)))
+    distributional_cfg = dict(evaluator_fd_cfg.get("distributional", {}))
+    distributional_cfg.setdefault("enabled", "auto")
+    distributional_cfg.setdefault("feature_space", "evaluator_embedding")
+    distributional_cfg.setdefault("coverage_k", 3)
+    distributional_cfg.setdefault("distance_block_size", 256)
+    distributional_cfg.setdefault("memorization_train_split", "train")
+    distributional_cfg.setdefault("memorization_train_limit_per_class", None)
+    distributional_cfg.setdefault("memorization_train_seed", int(ev.get("real_seed", ev.get("seed", 123))))
+    distributional_cfg.setdefault("memorization_pairs_per_class", 3)
+    evaluator_fd_cfg["distributional"] = distributional_cfg
     negative_controls_cfg = dict(evaluator_fd_cfg.get("negative_controls", {}))
     negative_controls_cfg.setdefault("enabled", "auto")
     negative_controls_cfg.setdefault("controls", list(EVALUATOR_FD_NEGATIVE_CONTROL_NAMES))
@@ -275,8 +293,8 @@ def _select_real_by_class(
 ) -> Tuple[Dict[int, list[str]], Dict[int, np.ndarray]]:
     """Select real BT file paths and wind speeds, grouped by SS class."""
     split = str(split).strip().lower()
-    if split not in {"val", "test"}:
-        raise ValueError(f"Real-data evaluation split must be 'val' or 'test', got {split!r}")
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"Real-data split must be one of 'train', 'val', or 'test', got {split!r}")
 
     data_cfg = cfg["data"]
     index_path = Path(data_cfg["dataset_index"])
@@ -329,6 +347,64 @@ def _load_real_group_from_paths(
         raise ValueError("Expected at least one real-data path when loading a class group.")
     imgs = [_load_one_bt_k(backend, rel, bt_min_k, bt_max_k) for rel in rel_paths]
     return np.stack(imgs, axis=0)
+
+
+def _encode_real_paths_by_class(
+    *,
+    backend,
+    paths_by_class: Dict[int, list[str]],
+    feature_extractor: EvaluatorEmbeddingExtractor,
+    bt_min_k: float,
+    bt_max_k: float,
+    load_batch_size: int,
+    show_progress: bool = False,
+    progress_desc: str = "Encoding train references",
+) -> Dict[int, np.ndarray]:
+    load_batch_size = int(load_batch_size)
+    if load_batch_size <= 0:
+        raise ValueError(f"load_batch_size must be > 0, got {load_batch_size}")
+
+    total_batches = sum(
+        (len(paths) + load_batch_size - 1) // load_batch_size
+        for paths in paths_by_class.values()
+        if paths
+    )
+    pbar = None
+    if show_progress and total_batches > 0:
+        pbar = tqdm(total=total_batches, desc=progress_desc, unit="batch", leave=True)
+
+    out: Dict[int, np.ndarray] = {}
+    for class_id in sorted(int(c) for c in paths_by_class.keys()):
+        paths = list(paths_by_class[class_id])
+        if not paths:
+            continue
+        chunks = []
+        for start in range(0, len(paths), load_batch_size):
+            stop = min(start + load_batch_size, len(paths))
+            if hasattr(backend, "load_bt_batch"):
+                batch = backend.load_bt_batch(paths[start:stop])
+                batch = np.asarray(batch, dtype=np.float32)
+                np.nan_to_num(batch, copy=False, nan=bt_min_k)
+                np.clip(batch, bt_min_k, bt_max_k, out=batch)
+            else:
+                batch = _load_real_group_from_paths(
+                    backend,
+                    paths[start:stop],
+                    bt_min_k=bt_min_k,
+                    bt_max_k=bt_max_k,
+                )
+            chunks.append(feature_extractor.encode_bt_k(batch))
+            if pbar is not None:
+                pbar.set_postfix_str(f"class {class_id}", refresh=False)
+                pbar.update(1)
+        out[class_id] = np.concatenate(chunks, axis=0) if chunks else np.zeros(
+            (0, feature_extractor.embedding_dim),
+            dtype=np.float32,
+        )
+
+    if pbar is not None:
+        pbar.close()
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -952,6 +1028,90 @@ def _write_paper_ready_radial_bt_profile_npz(
     }
 
 
+def _write_paper_ready_psd_profile_npz(
+    path: Path,
+    *,
+    class_caches: Dict[int, ClassMetricCache],
+) -> Dict[str, Any]:
+    if not class_caches:
+        return {}
+
+    class_ids = sorted(int(c) for c in class_caches.keys())
+    class_labels = _default_paper_ready_class_labels(class_ids)
+
+    freq_ref: np.ndarray | None = None
+    real_mean_rows = []
+    gen_mean_rows = []
+    psd_l2_rows = []
+    real_profile_rows = []
+    gen_profile_rows = []
+    real_class_offsets = [0]
+    gen_class_offsets = [0]
+
+    for class_id in class_ids:
+        cache = class_caches[class_id]
+        real_profiles = np.asarray(cache.real_psd_profiles, dtype=np.float32)
+        gen_profiles = np.asarray(cache.gen_raw_psd_profiles, dtype=np.float32)
+        if real_profiles.ndim != 2 or gen_profiles.ndim != 2:
+            raise ValueError("Paper-ready PSD artifacts require 2D per-image profile blocks.")
+        if real_profiles.shape[1] != gen_profiles.shape[1]:
+            raise ValueError("Real and generated PSD profile widths must match.")
+
+        freq = np.linspace(0.0, 1.0, real_profiles.shape[1], dtype=np.float64)
+        if freq_ref is None:
+            freq_ref = freq
+        elif freq.shape != freq_ref.shape or not np.allclose(freq, freq_ref):
+            raise ValueError("Paper-ready PSD profiles require identical normalized-frequency bins across classes.")
+
+        real_mean = np.asarray(real_profiles.mean(axis=0), dtype=np.float64)
+        gen_mean = np.asarray(gen_profiles.mean(axis=0), dtype=np.float64)
+
+        real_mean_rows.append(real_mean)
+        gen_mean_rows.append(gen_mean)
+        psd_l2_rows.append(float(np.mean(np.square(real_mean - gen_mean))))
+        real_profile_rows.append(real_profiles.astype(np.float32, copy=False))
+        gen_profile_rows.append(gen_profiles.astype(np.float32, copy=False))
+        real_class_offsets.append(real_class_offsets[-1] + int(real_profiles.shape[0]))
+        gen_class_offsets.append(gen_class_offsets[-1] + int(gen_profiles.shape[0]))
+
+    assert freq_ref is not None
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        schema=np.asarray(PAPER_READY_PSD_ARTIFACT_SCHEMA),
+        class_ids=np.asarray(class_ids, dtype=np.int32),
+        class_labels=np.asarray([class_labels[c] for c in class_ids]),
+        frequency_normalized=np.asarray(freq_ref, dtype=np.float64),
+        real_mean_psd_log10=np.asarray(real_mean_rows, dtype=np.float64),
+        gen_mean_psd_log10=np.asarray(gen_mean_rows, dtype=np.float64),
+        psd_l2=np.asarray(psd_l2_rows, dtype=np.float64),
+        real_psd_profiles_flat=np.concatenate(real_profile_rows, axis=0),
+        gen_psd_profiles_flat=np.concatenate(gen_profile_rows, axis=0),
+        real_class_offsets=np.asarray(real_class_offsets, dtype=np.int32),
+        gen_class_offsets=np.asarray(gen_class_offsets, dtype=np.int32),
+    )
+
+    return {
+        "schema": PAPER_READY_PSD_ARTIFACT_SCHEMA,
+        "metric_variant": "raw",
+        "x_units": "normalized_radial_frequency",
+        "y_units": "log10_power",
+        "metric_name": "psd_l2",
+        "metric_units": {"psd_l2": "log10_power^2"},
+        "class_ids": [int(c) for c in class_ids],
+        "class_labels": {str(c): class_labels[c] for c in class_ids},
+        "per_image_profiles": {
+            "available": True,
+            "encoding": "flat_rows_with_class_offsets",
+            "fields": {
+                "real": {"profiles": "real_psd_profiles_flat", "offsets": "real_class_offsets"},
+                "generated": {"profiles": "gen_psd_profiles_flat", "offsets": "gen_class_offsets"},
+            },
+        },
+    }
+
+
 def _write_paper_ready_dav_npz(
     path: Path,
     *,
@@ -1088,6 +1248,132 @@ def _write_paper_ready_cold_cloud_fraction_npz(
                 "real": {"values": "real_fraction_flat", "offsets": "real_class_offsets"},
                 "generated": {"values": "gen_fraction_flat", "offsets": "gen_class_offsets"},
             },
+        },
+    }
+
+
+def _write_paper_ready_memorization_pairs_npz(
+    path: Path,
+    *,
+    generated_bank: SampleBank | None,
+    train_paths_by_class: Dict[int, list[str]] | None,
+    train_embeddings_by_class: Dict[int, np.ndarray] | None,
+    gen_embeddings_by_class: Dict[int, np.ndarray],
+    backend,
+    bt_min_k: float,
+    bt_max_k: float,
+    pairs_per_class: int,
+    distance_block_size: int,
+    feature_space: str,
+) -> Dict[str, Any]:
+    pairs_per_class = int(pairs_per_class)
+    if pairs_per_class <= 0:
+        return {}
+    if generated_bank is None or train_paths_by_class is None or train_embeddings_by_class is None:
+        return {}
+    if not gen_embeddings_by_class:
+        return {}
+
+    valid_class_ids = sorted(
+        int(c) for c in gen_embeddings_by_class.keys()
+        if c in train_embeddings_by_class
+        and c in train_paths_by_class
+        and int(gen_embeddings_by_class[c].shape[0]) > 0
+        and int(train_embeddings_by_class[c].shape[0]) > 0
+        and len(train_paths_by_class[c]) >= int(train_embeddings_by_class[c].shape[0])
+    )
+    if not valid_class_ids:
+        return {}
+
+    class_labels = _default_paper_ready_class_labels(valid_class_ids)
+    pair_class_ids = []
+    pair_ranks = []
+    distances = []
+    generated_indices = []
+    train_indices = []
+    train_rel_paths = []
+    generated_rows = []
+    train_rows = []
+    class_offsets = [0]
+
+    for class_id in valid_class_ids:
+        gen_embeddings = np.asarray(gen_embeddings_by_class[class_id], dtype=np.float32)
+        train_embeddings = np.asarray(train_embeddings_by_class[class_id], dtype=np.float32)
+        nn_dist, nn_train_idx = nearest_neighbor_distances_and_indices(
+            gen_embeddings,
+            train_embeddings,
+            block_size=int(distance_block_size),
+        )
+        if nn_dist.size == 0:
+            class_offsets.append(class_offsets[-1])
+            continue
+
+        gen_order = np.lexsort((np.arange(nn_dist.size, dtype=np.int64), nn_dist.astype(np.float64)))
+        gen_order = gen_order[: min(pairs_per_class, gen_order.size)]
+        selected_train_idx = nn_train_idx[gen_order].astype(np.int64, copy=False)
+        selected_dist = nn_dist[gen_order].astype(np.float32, copy=False)
+
+        max_gen_index = int(np.max(gen_order))
+        generated_bt = generated_bank.load_bt_k(class_id, limit=max_gen_index + 1, mmap_mode="r")
+        generated_bt = np.asarray(generated_bt[gen_order], dtype=np.float32)
+        selected_paths = [str(train_paths_by_class[class_id][int(idx)]) for idx in selected_train_idx.tolist()]
+        train_bt = _load_real_group_from_paths(
+            backend,
+            selected_paths,
+            bt_min_k=float(bt_min_k),
+            bt_max_k=float(bt_max_k),
+        ).astype(np.float32, copy=False)
+
+        n_pairs = int(gen_order.size)
+        pair_class_ids.extend([int(class_id)] * n_pairs)
+        pair_ranks.extend(list(range(n_pairs)))
+        distances.extend(float(v) for v in selected_dist.tolist())
+        generated_indices.extend(int(v) for v in gen_order.tolist())
+        train_indices.extend(int(v) for v in selected_train_idx.tolist())
+        train_rel_paths.extend(selected_paths)
+        generated_rows.append(generated_bt)
+        train_rows.append(train_bt)
+        class_offsets.append(class_offsets[-1] + n_pairs)
+
+    if not generated_rows:
+        return {}
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        schema=np.asarray(PAPER_READY_MEMORIZATION_PAIRS_ARTIFACT_SCHEMA),
+        feature_space=np.asarray(str(feature_space)),
+        distance=np.asarray("euclidean"),
+        class_ids=np.asarray(valid_class_ids, dtype=np.int32),
+        class_labels=np.asarray([class_labels[c] for c in valid_class_ids]),
+        class_offsets=np.asarray(class_offsets, dtype=np.int32),
+        pair_class_ids=np.asarray(pair_class_ids, dtype=np.int32),
+        rank_within_class=np.asarray(pair_ranks, dtype=np.int32),
+        nearest_train_distance=np.asarray(distances, dtype=np.float32),
+        generated_index=np.asarray(generated_indices, dtype=np.int32),
+        train_index=np.asarray(train_indices, dtype=np.int32),
+        train_rel_path=np.asarray(train_rel_paths),
+        generated_bt_k=np.concatenate(generated_rows, axis=0).astype(np.float32, copy=False),
+        train_bt_k=np.concatenate(train_rows, axis=0).astype(np.float32, copy=False),
+    )
+
+    return {
+        "schema": PAPER_READY_MEMORIZATION_PAIRS_ARTIFACT_SCHEMA,
+        "metric_variant": "nearest_train_memorization",
+        "feature_space": str(feature_space),
+        "distance": "euclidean",
+        "selection": "smallest generated-to-train nearest-neighbor distances per class",
+        "pairs_per_class": int(pairs_per_class),
+        "bt_units": "K",
+        "class_ids": [int(c) for c in valid_class_ids],
+        "class_labels": {str(c): class_labels[c] for c in valid_class_ids},
+        "fields": {
+            "generated": "generated_bt_k",
+            "nearest_train": "train_bt_k",
+            "nearest_train_distance": "nearest_train_distance",
+            "train_rel_path": "train_rel_path",
+            "generated_index": "generated_index",
+            "train_index": "train_index",
         },
     }
 
@@ -1587,6 +1873,229 @@ def _compute_evaluator_fd_negative_controls(
     return controls_out
 
 
+def _safe_ratio(num: float, den: float) -> float | None:
+    den = float(den)
+    if den <= 0.0:
+        return None
+    return float(float(num) / den)
+
+
+def _weighted_mean_from_per_class(
+    per_class: Dict[int, Dict[str, Any]],
+    path: tuple[str, ...],
+    weights_by_class: Dict[int, float],
+) -> float | None:
+    vals = []
+    weights = []
+    for class_id, node in per_class.items():
+        cur: Any = node
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                cur = None
+                break
+            cur = cur[key]
+        if cur is None:
+            continue
+        val = float(cur)
+        weight = float(weights_by_class.get(int(class_id), 0.0))
+        if weight > 0.0:
+            vals.append(val)
+            weights.append(weight)
+    if not vals:
+        return None
+    vals_arr = np.asarray(vals, dtype=np.float64)
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    weights_sum = float(weights_arr.sum())
+    if weights_sum <= 0.0:
+        return None
+    weights_arr = weights_arr / weights_sum
+    return float(np.sum(vals_arr * weights_arr))
+
+
+def _compute_embedding_distributional_metrics(
+    *,
+    real_embeddings_by_class: Dict[int, np.ndarray],
+    gen_embeddings_by_class: Dict[int, np.ndarray],
+    train_embeddings_by_class: Dict[int, np.ndarray] | None,
+    coverage_k: int,
+    distance_block_size: int,
+) -> Dict[str, Any]:
+    valid_class_ids = sorted(
+        int(c) for c in real_embeddings_by_class.keys()
+        if c in gen_embeddings_by_class
+        and int(real_embeddings_by_class[c].shape[0]) > 0
+        and int(gen_embeddings_by_class[c].shape[0]) > 0
+    )
+    if not valid_class_ids:
+        raise ValueError("Cannot compute distributional metrics without overlapping real/generated classes.")
+
+    coverage_k = int(coverage_k)
+    if coverage_k <= 0:
+        raise ValueError(f"coverage_k must be > 0, got {coverage_k}")
+    distance_block_size = int(distance_block_size)
+    if distance_block_size <= 0:
+        raise ValueError(f"distance_block_size must be > 0, got {distance_block_size}")
+
+    real_counts = {c: int(real_embeddings_by_class[c].shape[0]) for c in valid_class_ids}
+    gen_counts = {c: int(gen_embeddings_by_class[c].shape[0]) for c in valid_class_ids}
+    total_real = float(sum(real_counts.values()))
+    total_gen = float(sum(gen_counts.values()))
+    real_weights = {c: float(real_counts[c]) / total_real for c in valid_class_ids}
+    gen_weights = {c: float(gen_counts[c]) / total_gen for c in valid_class_ids}
+
+    per_class: Dict[int, Dict[str, Any]] = {}
+    for class_id in valid_class_ids:
+        real = np.asarray(real_embeddings_by_class[class_id], dtype=np.float32)
+        gen = np.asarray(gen_embeddings_by_class[class_id], dtype=np.float32)
+
+        real_div = mean_pairwise_distance(real, block_size=distance_block_size)
+        gen_div = mean_pairwise_distance(gen, block_size=distance_block_size)
+        real_to_gen_nn = nearest_neighbor_distances(
+            real,
+            gen,
+            block_size=distance_block_size,
+        )
+        real_radii = kth_neighbor_distances_within_set(
+            real,
+            k=coverage_k,
+            block_size=distance_block_size,
+        )
+        class_report: Dict[str, Any] = {
+            "counts": {
+                "real_reference": int(real.shape[0]),
+                "generated": int(gen.shape[0]),
+            },
+            "diversity": {
+                "real_mean_pairwise_distance": float(real_div),
+                "generated_mean_pairwise_distance": float(gen_div),
+                "generated_over_real": _safe_ratio(gen_div, real_div),
+                "abs_gap": float(abs(gen_div - real_div)),
+            },
+            "coverage": coverage_from_real_radii(
+                real_to_gen_nn=real_to_gen_nn,
+                real_radii=real_radii,
+            ),
+        }
+
+        if train_embeddings_by_class is not None and class_id in train_embeddings_by_class:
+            train = np.asarray(train_embeddings_by_class[class_id], dtype=np.float32)
+            if train.shape[0] > 0:
+                gen_to_train_nn = nearest_neighbor_distances(
+                    gen,
+                    train,
+                    block_size=distance_block_size,
+                )
+                class_report["nearest_train_memorization"] = {
+                    "train_reference_count": int(train.shape[0]),
+                    "generated_to_train_nn": summarize_distances(gen_to_train_nn),
+                }
+        per_class[class_id] = class_report
+
+    macro_weights = {c: 1.0 / float(len(valid_class_ids)) for c in valid_class_ids}
+    aggregate: Dict[str, Any] = {
+        "valid_class_ids": [int(c) for c in valid_class_ids],
+        "coverage_k": int(coverage_k),
+        "distance": "euclidean",
+        "counts": {
+            "real_reference": int(sum(real_counts.values())),
+            "generated": int(sum(gen_counts.values())),
+        },
+        "macro": {
+            "diversity": {
+                "real_mean_pairwise_distance": _weighted_mean_from_per_class(
+                    per_class, ("diversity", "real_mean_pairwise_distance"), macro_weights
+                ),
+                "generated_mean_pairwise_distance": _weighted_mean_from_per_class(
+                    per_class, ("diversity", "generated_mean_pairwise_distance"), macro_weights
+                ),
+                "generated_over_real": _weighted_mean_from_per_class(
+                    per_class, ("diversity", "generated_over_real"), macro_weights
+                ),
+                "abs_gap": _weighted_mean_from_per_class(
+                    per_class, ("diversity", "abs_gap"), macro_weights
+                ),
+            },
+            "coverage": {
+                "value": _weighted_mean_from_per_class(per_class, ("coverage", "value"), macro_weights),
+                "mean_real_radius": _weighted_mean_from_per_class(
+                    per_class, ("coverage", "mean_real_radius"), macro_weights
+                ),
+                "mean_real_to_generated_nn": _weighted_mean_from_per_class(
+                    per_class, ("coverage", "real_to_generated_nn", "mean"), macro_weights
+                ),
+            },
+        },
+        "weighted": {
+            "by_real_reference": {
+                "coverage": {
+                    "value": _weighted_mean_from_per_class(per_class, ("coverage", "value"), real_weights),
+                    "mean_real_radius": _weighted_mean_from_per_class(
+                        per_class, ("coverage", "mean_real_radius"), real_weights
+                    ),
+                    "mean_real_to_generated_nn": _weighted_mean_from_per_class(
+                        per_class, ("coverage", "real_to_generated_nn", "mean"), real_weights
+                    ),
+                },
+            },
+            "by_generated_count": {
+                "diversity": {
+                    "real_mean_pairwise_distance": _weighted_mean_from_per_class(
+                        per_class, ("diversity", "real_mean_pairwise_distance"), gen_weights
+                    ),
+                    "generated_mean_pairwise_distance": _weighted_mean_from_per_class(
+                        per_class, ("diversity", "generated_mean_pairwise_distance"), gen_weights
+                    ),
+                    "generated_over_real": _weighted_mean_from_per_class(
+                        per_class, ("diversity", "generated_over_real"), gen_weights
+                    ),
+                    "abs_gap": _weighted_mean_from_per_class(
+                        per_class, ("diversity", "abs_gap"), gen_weights
+                    ),
+                },
+            },
+        },
+        "per_class": {str(c): per_class[c] for c in valid_class_ids},
+    }
+
+    has_memorization = any("nearest_train_memorization" in node for node in per_class.values())
+    if has_memorization:
+        aggregate["macro"]["nearest_train_memorization"] = {
+            "mean_generated_to_train_nn": _weighted_mean_from_per_class(
+                per_class,
+                ("nearest_train_memorization", "generated_to_train_nn", "mean"),
+                macro_weights,
+            ),
+            "q01_generated_to_train_nn": _weighted_mean_from_per_class(
+                per_class,
+                ("nearest_train_memorization", "generated_to_train_nn", "q01"),
+                macro_weights,
+            ),
+            "min_generated_to_train_nn": _weighted_mean_from_per_class(
+                per_class,
+                ("nearest_train_memorization", "generated_to_train_nn", "min"),
+                macro_weights,
+            ),
+        }
+        aggregate["weighted"]["by_generated_count"]["nearest_train_memorization"] = {
+            "mean_generated_to_train_nn": _weighted_mean_from_per_class(
+                per_class,
+                ("nearest_train_memorization", "generated_to_train_nn", "mean"),
+                gen_weights,
+            ),
+            "q01_generated_to_train_nn": _weighted_mean_from_per_class(
+                per_class,
+                ("nearest_train_memorization", "generated_to_train_nn", "q01"),
+                gen_weights,
+            ),
+            "min_generated_to_train_nn": _weighted_mean_from_per_class(
+                per_class,
+                ("nearest_train_memorization", "generated_to_train_nn", "min"),
+                gen_weights,
+            ),
+        }
+    return aggregate
+
+
 def _bootstrap_ci_blocks(
     *,
     class_caches: Dict[int, ClassMetricCache],
@@ -1781,6 +2290,58 @@ class TCEvaluator:
                 f"got {evaluator_fd_null_reps}"
             )
         evaluator_fd_null_seed = int(evaluator_fd_cfg.get("null_reference_seed", ev["seed"]))
+        distributional_cfg = dict(evaluator_fd_cfg.get("distributional", {}))
+        distributional_enabled, distributional_enable_mode = _resolve_auto_bool(
+            distributional_cfg.get("enabled", "auto"),
+            auto_value=bool(evaluator_fd_enabled),
+            field_name="evaluation.evaluator_feature_metric.distributional.enabled",
+        )
+        distributional_feature_space = str(
+            distributional_cfg.get("feature_space", "evaluator_embedding")
+        ).strip().lower()
+        if distributional_feature_space not in {"evaluator_embedding"}:
+            raise ValueError(
+                "evaluation.evaluator_feature_metric.distributional.feature_space currently "
+                f"supports only 'evaluator_embedding', got {distributional_feature_space!r}."
+            )
+        distributional_coverage_k = int(distributional_cfg.get("coverage_k", 3))
+        if distributional_coverage_k <= 0:
+            raise ValueError(
+                "evaluation.evaluator_feature_metric.distributional.coverage_k must be > 0, "
+                f"got {distributional_coverage_k}"
+            )
+        distributional_distance_block_size = int(distributional_cfg.get("distance_block_size", 256))
+        if distributional_distance_block_size <= 0:
+            raise ValueError(
+                "evaluation.evaluator_feature_metric.distributional.distance_block_size must be > 0, "
+                f"got {distributional_distance_block_size}"
+            )
+        memorization_train_split = str(
+            distributional_cfg.get("memorization_train_split", "train")
+        ).strip().lower()
+        if memorization_train_split != "train":
+            raise ValueError(
+                "evaluation.evaluator_feature_metric.distributional.memorization_train_split "
+                f"must be 'train', got {memorization_train_split!r}."
+            )
+        raw_train_limit = distributional_cfg.get("memorization_train_limit_per_class", None)
+        memorization_train_limit_per_class = None if raw_train_limit is None else int(raw_train_limit)
+        if memorization_train_limit_per_class is not None and memorization_train_limit_per_class <= 0:
+            raise ValueError(
+                "evaluation.evaluator_feature_metric.distributional."
+                "memorization_train_limit_per_class must be null or > 0, "
+                f"got {memorization_train_limit_per_class}"
+            )
+        memorization_train_seed = int(
+            distributional_cfg.get("memorization_train_seed", ev["real_seed"])
+        )
+        memorization_pairs_per_class = int(distributional_cfg.get("memorization_pairs_per_class", 3))
+        if memorization_pairs_per_class < 0:
+            raise ValueError(
+                "evaluation.evaluator_feature_metric.distributional."
+                "memorization_pairs_per_class must be >= 0, "
+                f"got {memorization_pairs_per_class}"
+            )
         negative_controls_cfg = dict(evaluator_fd_cfg.get("negative_controls", {}))
         negative_controls_enabled, negative_controls_enable_mode = _resolve_auto_bool(
             negative_controls_cfg.get("enabled", "auto"),
@@ -1835,8 +2396,29 @@ class TCEvaluator:
                 "seed": int(negative_controls_seed),
             },
         }
+        distributional_metric_report: Dict[str, Any] = {
+            "enabled": False,
+            "enable_mode": str(distributional_enable_mode),
+            "configured_enabled": distributional_cfg.get("enabled", "auto"),
+            "feature_space": distributional_feature_space,
+            "metrics": ["diversity", "coverage", "nearest_train_memorization"],
+            "coverage_definition": (
+                "A real reference sample is covered when its nearest generated sample is within "
+                "the sample's kth-nearest-neighbor radius among same-class real references."
+            ),
+            "memorization_definition": (
+                "Nearest-neighbor distance from each generated sample to same-class training samples."
+            ),
+            "coverage_k": int(distributional_coverage_k),
+            "distance": "euclidean",
+            "distance_block_size": int(distributional_distance_block_size),
+            "memorization_train_split": memorization_train_split,
+            "memorization_train_limit_per_class": memorization_train_limit_per_class,
+            "memorization_train_seed": int(memorization_train_seed),
+            "memorization_pairs_per_class": int(memorization_pairs_per_class),
+        }
         feature_extractor: EvaluatorEmbeddingExtractor | None = None
-        if evaluator_fd_enabled:
+        if evaluator_fd_enabled or distributional_enabled:
             try:
                 feature_extractor = EvaluatorEmbeddingExtractor.from_run(
                     run_name=str(evaluator_fd_cfg.get("run_name", "evaluator_cat4plus_mild_rebalanced_s035")),
@@ -1847,8 +2429,12 @@ class TCEvaluator:
                     embedding_layer=str(evaluator_fd_cfg.get("embedding_layer", "embedding_silu")),
                 )
             except Exception as exc:
-                if evaluator_fd_enable_mode == "auto":
+                if evaluator_fd_enable_mode == "auto" and distributional_enable_mode == "auto":
                     evaluator_feature_metric_report["reason"] = (
+                        "auto-disabled because the evaluator feature extractor could not be loaded: "
+                        f"{exc}"
+                    )
+                    distributional_metric_report["reason"] = (
                         "auto-disabled because the evaluator feature extractor could not be loaded: "
                         f"{exc}"
                     )
@@ -1857,11 +2443,24 @@ class TCEvaluator:
                     raise
 
         if feature_extractor is not None:
-            evaluator_feature_metric_report["enabled"] = True
-            evaluator_feature_metric_report["extractor"] = feature_extractor.metadata()
-            evaluator_feature_metric_report["input_preprocessing"] = (
-                "clip to evaluator BT range, normalize to [-1, 1]"
-            )
+            if evaluator_fd_enabled:
+                evaluator_feature_metric_report["enabled"] = True
+                evaluator_feature_metric_report["extractor"] = feature_extractor.metadata()
+                evaluator_feature_metric_report["input_preprocessing"] = (
+                    "clip to evaluator BT range, normalize to [-1, 1]"
+                )
+            if distributional_enabled:
+                distributional_metric_report["enabled"] = True
+                distributional_metric_report["extractor"] = feature_extractor.metadata()
+                distributional_metric_report["input_preprocessing"] = (
+                    "clip to evaluator BT range, normalize to [-1, 1]"
+                )
+            if not evaluator_fd_enabled:
+                evaluator_feature_metric_report["reason"] = (
+                    "disabled by configuration"
+                    if evaluator_fd_enable_mode != "auto"
+                    else "auto-disabled; default policy only enables this metric for cached-bank full-test evals"
+                )
         elif "reason" not in evaluator_feature_metric_report:
             evaluator_feature_metric_report["reason"] = (
                 (
@@ -1873,8 +2472,18 @@ class TCEvaluator:
                 if not evaluator_fd_enabled
                 else "evaluator feature extractor unavailable"
             )
+        if not distributional_enabled:
+            distributional_metric_report["reason"] = (
+                (
+                    "auto-disabled because evaluator_feature_metric is not enabled"
+                    if distributional_enable_mode == "auto"
+                    else "disabled by configuration"
+                )
+            )
+        elif feature_extractor is None:
+            distributional_metric_report["reason"] = "evaluator feature extractor unavailable"
         negative_controls_report = evaluator_feature_metric_report["negative_controls"]
-        if feature_extractor is not None and negative_controls_enabled and negative_control_names:
+        if feature_extractor is not None and evaluator_fd_enabled and negative_controls_enabled and negative_control_names:
             negative_controls_report["enabled"] = True
             negative_controls_report["source"] = "corrupted_real_test_images"
         elif not negative_controls_enabled:
@@ -1905,7 +2514,10 @@ class TCEvaluator:
             if c in real_paths_by_class and c in candidate_generated_class_ids
         ]
         negative_controls_active = bool(
-            feature_extractor is not None and negative_controls_enabled and negative_control_names
+            feature_extractor is not None
+            and evaluator_fd_enabled
+            and negative_controls_enabled
+            and negative_control_names
         )
         summary_tasks_per_class = 2 + int(feature_extractor is not None) + int(negative_controls_active)
         summary_total_tasks = summary_tasks_per_class * len(valid_class_ids)
@@ -2293,9 +2905,102 @@ class TCEvaluator:
                 "enabled, but no overlapping real/generated embeddings were available"
             )
 
+        distributional_summary: Dict[str, Any] | None = None
+        train_paths_by_class: Dict[int, list[str]] | None = None
+        train_embeddings_by_class: Dict[int, np.ndarray] | None = None
+        if (
+            feature_extractor is not None
+            and distributional_enabled
+            and real_evaluator_embeddings
+            and gen_evaluator_embeddings
+        ):
+            try:
+                train_paths_by_class, _ = _select_real_by_class(
+                    cfg,
+                    n_per_class=(
+                        int(memorization_train_limit_per_class)
+                        if memorization_train_limit_per_class is not None
+                        else 1
+                    ),
+                    seed=int(memorization_train_seed),
+                    split=memorization_train_split,
+                    use_all=memorization_train_limit_per_class is None,
+                )
+                train_paths_by_class = {
+                    int(c): list(paths)
+                    for c, paths in train_paths_by_class.items()
+                    if int(c) in gen_evaluator_embeddings and paths
+                }
+                if train_paths_by_class:
+                    if show_progress:
+                        train_mode = (
+                            "all available train samples/class"
+                            if memorization_train_limit_per_class is None
+                            else f"up to {memorization_train_limit_per_class} train samples/class"
+                        )
+                        print(f"[eval] Encoding nearest-train references for memorization ({train_mode}).")
+                    train_embeddings_by_class = _encode_real_paths_by_class(
+                        backend=real_backend,
+                        paths_by_class=train_paths_by_class,
+                        feature_extractor=feature_extractor,
+                        bt_min_k=bt_min_k,
+                        bt_max_k=bt_max_k,
+                        load_batch_size=int(evaluator_fd_cfg.get("batch_size", 32)),
+                        show_progress=show_progress,
+                        progress_desc="Eval: train reference embeddings",
+                    )
+                    distributional_metric_report["memorization_train_counts_by_class"] = {
+                        str(c): int(arr.shape[0])
+                        for c, arr in sorted(train_embeddings_by_class.items())
+                    }
+                else:
+                    distributional_metric_report["memorization_reason"] = (
+                        "no train-reference paths overlap generated classes"
+                    )
+            except Exception as exc:
+                if distributional_enable_mode == "auto":
+                    distributional_metric_report["memorization_reason"] = (
+                        f"nearest-train memorization skipped because train references could not be loaded: {exc}"
+                    )
+                    train_embeddings_by_class = None
+                else:
+                    raise
+
+            distributional_summary = _compute_embedding_distributional_metrics(
+                real_embeddings_by_class=real_evaluator_embeddings,
+                gen_embeddings_by_class=gen_evaluator_embeddings,
+                train_embeddings_by_class=train_embeddings_by_class,
+                coverage_k=int(distributional_coverage_k),
+                distance_block_size=int(distributional_distance_block_size),
+            )
+            distributional_metric_report.update(distributional_summary)
+        elif distributional_enabled and feature_extractor is not None:
+            distributional_metric_report["reason"] = (
+                "enabled, but no overlapping real/generated embeddings were available"
+            )
+
         aggregate_primary_raw = _compute_aggregate_primary_raw(class_scalars)
         if evaluator_fd_summary is not None:
             aggregate_primary_raw["evaluator_fd"] = float(evaluator_fd_summary["value"])
+        if distributional_summary is not None:
+            dist_macro = distributional_summary.get("macro", {})
+            if isinstance(dist_macro, dict):
+                coverage_node = dist_macro.get("coverage", {})
+                diversity_node = dist_macro.get("diversity", {})
+                memorization_node = dist_macro.get("nearest_train_memorization", {})
+                if isinstance(coverage_node, dict) and coverage_node.get("value") is not None:
+                    aggregate_primary_raw["evaluator_embedding_coverage"] = float(coverage_node["value"])
+                if isinstance(diversity_node, dict) and diversity_node.get("generated_over_real") is not None:
+                    aggregate_primary_raw["evaluator_embedding_diversity_ratio"] = float(
+                        diversity_node["generated_over_real"]
+                    )
+                if (
+                    isinstance(memorization_node, dict)
+                    and memorization_node.get("q01_generated_to_train_nn") is not None
+                ):
+                    aggregate_primary_raw["nearest_train_q01_distance"] = float(
+                        memorization_node["q01_generated_to_train_nn"]
+                    )
         macro = _compute_macro_metrics(class_scalars)
         if show_progress and bootstrap_reps > 0:
             bootstrap_stage_idx, stage_total = stage_lookup["bootstrap"]
@@ -2362,6 +3067,17 @@ class TCEvaluator:
                     "path": radial_artifact_path.relative_to(eval_root).as_posix(),
                     **radial_manifest,
                 }
+            psd_artifact_path = artifacts_root / "paper_ready" / "radial_psd_profile.npz"
+            psd_manifest = _write_paper_ready_psd_profile_npz(
+                psd_artifact_path,
+                class_caches=class_caches,
+            )
+            if psd_manifest:
+                paper_ready_manifest["psd_radial"] = {
+                    "storage": "sidecar_npz",
+                    "path": psd_artifact_path.relative_to(eval_root).as_posix(),
+                    **psd_manifest,
+                }
             dav_artifact_path = artifacts_root / "paper_ready" / "dav.npz"
             dav_manifest = _write_paper_ready_dav_npz(
                 dav_artifact_path,
@@ -2387,6 +3103,26 @@ class TCEvaluator:
                     "storage": "sidecar_npz",
                     "path": cold_artifact_path.relative_to(eval_root).as_posix(),
                     **cold_manifest,
+                }
+            memorization_pairs_path = artifacts_root / "paper_ready" / "memorization_pairs.npz"
+            memorization_pairs_manifest = _write_paper_ready_memorization_pairs_npz(
+                memorization_pairs_path,
+                generated_bank=generated_bank,
+                train_paths_by_class=train_paths_by_class,
+                train_embeddings_by_class=train_embeddings_by_class,
+                gen_embeddings_by_class=gen_evaluator_embeddings,
+                backend=real_backend,
+                bt_min_k=bt_min_k,
+                bt_max_k=bt_max_k,
+                pairs_per_class=int(memorization_pairs_per_class),
+                distance_block_size=int(distributional_distance_block_size),
+                feature_space=distributional_feature_space,
+            )
+            if memorization_pairs_manifest:
+                paper_ready_manifest["memorization_pairs"] = {
+                    "storage": "sidecar_npz",
+                    "path": memorization_pairs_path.relative_to(eval_root).as_posix(),
+                    **memorization_pairs_manifest,
                 }
 
         report = {
@@ -2428,6 +3164,7 @@ class TCEvaluator:
             "aggregate_primary_raw": aggregate_primary_raw,
             "aggregate_primary_raw_ci": aggregate_primary_raw_ci,
             "evaluator_feature_metric": evaluator_feature_metric_report,
+            "distributional_feature_metric": distributional_metric_report,
             "macro": macro,
             "macro_ci": macro_ci,
             "per_class": per_class_metrics,
