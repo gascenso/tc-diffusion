@@ -29,13 +29,17 @@ DEFAULT_CLASS_LABELS = {
 }
 FIGURE_PIXEL = "pixel_plausibility"
 FIGURE_RADIAL = "radial_bt_profile"
+FIGURE_PSD = "psd_radial"
 FIGURE_DAV = "dav"
 FIGURE_COLD = "cold_cloud_fraction"
-ALL_FIGURES = (FIGURE_PIXEL, FIGURE_RADIAL, FIGURE_DAV, FIGURE_COLD)
+FIGURE_MEMORIZATION = "memorization_pairs"
+DEFAULT_FIGURES = (FIGURE_PIXEL, FIGURE_RADIAL, FIGURE_PSD, FIGURE_DAV, FIGURE_COLD)
+ALL_FIGURES = (*DEFAULT_FIGURES, FIGURE_MEMORIZATION)
 
 REAL_COLOR = "#111827"
 MODEL_COLORS = ["#b65f2a", "#1f6f78", "#7b516d"]
 MODEL_LINESTYLES = ["solid", (0, (6.0, 2.2)), (0, (2.5, 1.5))]
+BT_CMAP = "gist_ncar"
 
 
 @dataclass
@@ -123,6 +127,35 @@ class RadialClassInference:
 
 
 @dataclass
+class PSDPanel:
+    class_id: int
+    label: str
+    frequency: np.ndarray
+    real_profile: np.ndarray
+    gen_profile: np.ndarray
+    l2: float
+    real_profiles: np.ndarray | None = None
+    gen_profiles: np.ndarray | None = None
+
+
+@dataclass
+class PSDModelInference:
+    gen_profile_low: np.ndarray | None = None
+    gen_profile_high: np.ndarray | None = None
+    l2_ci: tuple[float, float] | None = None
+    l2_null_q95: float | None = None
+    l2_pvalue: float | None = None
+
+
+@dataclass
+class PSDClassInference:
+    real_profile_low: np.ndarray | None = None
+    real_profile_high: np.ndarray | None = None
+    model: Dict[int, PSDModelInference] = field(default_factory=dict)
+    supports_image_level_stats: bool = False
+
+
+@dataclass
 class DAVPanel:
     class_id: int
     label: str
@@ -179,13 +212,26 @@ class ColdCloudClassInference:
     supports_image_level_stats: bool = False
 
 
+@dataclass
+class MemorizationPair:
+    class_id: int
+    label: str
+    rank_within_class: int
+    distance: float
+    generated_index: int
+    train_index: int
+    train_rel_path: str
+    generated_bt: np.ndarray
+    train_bt: np.ndarray
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate paper-ready evaluation figures from one to three saved evaluation reports. "
             "The script reads saved metrics.json summaries plus any linked sidecar artifacts; "
-            "evaluation itself should be run ahead of time. By default, all available paper-ready "
-            "figures are emitted as separate files."
+            "evaluation itself should be run ahead of time. By default, the standard quantitative "
+            "paper-ready figures are emitted as separate files; qualitative memorization pairs are opt-in."
         )
     )
     parser.add_argument(
@@ -194,11 +240,13 @@ def parse_args() -> argparse.Namespace:
         choices=list(ALL_FIGURES),
         default=None,
         help=(
-            "Optional single-figure mode. If omitted, the script renders every available paper-ready plot. "
+            "Optional single-figure mode. If omitted, the script renders the standard quantitative plots. "
             f"{FIGURE_PIXEL!r} reproduces the BT histogram plot; "
             f"{FIGURE_RADIAL!r} renders the azimuthally averaged radial BT profiles; "
+            f"{FIGURE_PSD!r} renders the radially averaged power spectral density profiles; "
             f"{FIGURE_DAV!r} renders the deviation-angle-variance distributions; "
-            f"{FIGURE_COLD!r} renders the cold-cloud-fraction distributions."
+            f"{FIGURE_COLD!r} renders the cold-cloud-fraction distributions; "
+            f"{FIGURE_MEMORIZATION!r} renders qualitative closest generated/train pairs."
         ),
     )
     parser.add_argument(
@@ -325,6 +373,18 @@ def _ensure_2d_array(value: Any, *, field_name: str) -> np.ndarray:
         raise ValueError(f"Field {field_name!r} could not be converted to a numeric array.") from exc
     if arr.ndim != 2:
         raise ValueError(f"Field {field_name!r} must be a 2D array, got shape {arr.shape}.")
+    return arr
+
+
+def _ensure_3d_array(value: Any, *, field_name: str) -> np.ndarray:
+    if value is None:
+        raise ValueError(f"Missing required array field: {field_name}")
+    try:
+        arr = np.asarray(value, dtype=np.float64)
+    except Exception as exc:
+        raise ValueError(f"Field {field_name!r} could not be converted to a numeric array.") from exc
+    if arr.ndim != 3:
+        raise ValueError(f"Field {field_name!r} must be a 3D array, got shape {arr.shape}.")
     return arr
 
 
@@ -1067,6 +1127,189 @@ def _load_radial_report(repo_root: Path, spec: InputSpec) -> LoadedReport:
     )
 
 
+def _build_psd_panel(
+    *,
+    class_id: int,
+    label: str,
+    frequency: np.ndarray,
+    real_profile: np.ndarray,
+    gen_profile: np.ndarray,
+    l2: float | None = None,
+    real_profiles: np.ndarray | None = None,
+    gen_profiles: np.ndarray | None = None,
+) -> PSDPanel:
+    frequency = _ensure_1d_array(frequency, field_name=f"per_class.{class_id}.frequency_normalized")
+    real_profile = _ensure_1d_array(real_profile, field_name=f"per_class.{class_id}.real_psd_profile")
+    gen_profile = _ensure_1d_array(gen_profile, field_name=f"per_class.{class_id}.gen_psd_profile")
+    if frequency.size != real_profile.size or frequency.size != gen_profile.size:
+        raise ValueError(
+            f"PSD profile dimensions are inconsistent for class {class_id}: "
+            f"len(frequency)={frequency.size}, len(real)={real_profile.size}, len(gen)={gen_profile.size}."
+        )
+    if l2 is None:
+        l2 = float(np.mean(np.square(real_profile - gen_profile)))
+    return PSDPanel(
+        class_id=class_id,
+        label=label,
+        frequency=frequency,
+        real_profile=np.asarray(real_profile, dtype=np.float64),
+        gen_profile=np.asarray(gen_profile, dtype=np.float64),
+        l2=float(l2),
+        real_profiles=None if real_profiles is None else np.asarray(real_profiles, dtype=np.float64),
+        gen_profiles=None if gen_profiles is None else np.asarray(gen_profiles, dtype=np.float64),
+    )
+
+
+def _load_psd_panels_from_npz_artifact(
+    *,
+    metrics_path: Path,
+    manifest: Dict[str, Any],
+) -> Dict[int, PSDPanel]:
+    raw_path = manifest.get("path")
+    if not raw_path:
+        raise ValueError(f"PSD artifact manifest in {metrics_path} is missing a path.")
+    artifact_path = _resolve_artifact_path(metrics_path, str(raw_path))
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"PSD artifact not found for {metrics_path}: {artifact_path}")
+
+    with np.load(artifact_path, allow_pickle=False) as data:
+        class_ids = _ensure_1d_array(data["class_ids"], field_name="class_ids").astype(int)
+        frequency = _ensure_1d_array(data["frequency_normalized"], field_name="frequency_normalized")
+        real_mean_rows = _ensure_2d_array(data["real_mean_psd_log10"], field_name="real_mean_psd_log10")
+        gen_mean_rows = _ensure_2d_array(data["gen_mean_psd_log10"], field_name="gen_mean_psd_log10")
+        class_labels_arr = (
+            _ensure_1d_string_array(data["class_labels"], field_name="class_labels")
+            if "class_labels" in data.files
+            else np.asarray([], dtype=str)
+        )
+        l2_rows = (
+            _ensure_1d_array(data["psd_l2"], field_name="psd_l2")
+            if "psd_l2" in data.files
+            else None
+        )
+        real_profiles_flat = (
+            _ensure_2d_array(data["real_psd_profiles_flat"], field_name="real_psd_profiles_flat")
+            if "real_psd_profiles_flat" in data.files
+            else None
+        )
+        gen_profiles_flat = (
+            _ensure_2d_array(data["gen_psd_profiles_flat"], field_name="gen_psd_profiles_flat")
+            if "gen_psd_profiles_flat" in data.files
+            else None
+        )
+        real_class_offsets = (
+            _ensure_offsets_array(data["real_class_offsets"], field_name="real_class_offsets")
+            if "real_class_offsets" in data.files
+            else None
+        )
+        gen_class_offsets = (
+            _ensure_offsets_array(data["gen_class_offsets"], field_name="gen_class_offsets")
+            if "gen_class_offsets" in data.files
+            else None
+        )
+
+    n_classes = class_ids.size
+    if real_mean_rows.shape != gen_mean_rows.shape or real_mean_rows.shape[0] != n_classes:
+        raise ValueError(
+            f"Artifact {artifact_path} has inconsistent PSD profile dimensions: "
+            f"class_ids={n_classes}, real={real_mean_rows.shape}, gen={gen_mean_rows.shape}."
+        )
+    if real_mean_rows.shape[1] != frequency.size:
+        raise ValueError(
+            f"Artifact {artifact_path} has profile width {real_mean_rows.shape[1]} "
+            f"for frequency size {frequency.size}."
+        )
+    if class_labels_arr.size not in {0, n_classes}:
+        raise ValueError(f"Artifact {artifact_path} has {class_labels_arr.size} labels for {n_classes} classes.")
+    if l2_rows is not None and l2_rows.size != n_classes:
+        raise ValueError(f"Artifact {artifact_path} has {l2_rows.size} PSD L2 values for {n_classes} classes.")
+    if real_profiles_flat is not None:
+        if real_class_offsets is None:
+            raise ValueError(f"Artifact {artifact_path} includes real_psd_profiles_flat without offsets.")
+        if real_profiles_flat.shape[1] != frequency.size:
+            raise ValueError(
+                f"Artifact {artifact_path} real_psd_profiles_flat has width {real_profiles_flat.shape[1]}, "
+                f"expected {frequency.size}."
+            )
+        if real_class_offsets.size != n_classes + 1 or int(real_class_offsets[-1]) != int(real_profiles_flat.shape[0]):
+            raise ValueError(f"Artifact {artifact_path} has inconsistent real PSD offsets.")
+    if gen_profiles_flat is not None:
+        if gen_class_offsets is None:
+            raise ValueError(f"Artifact {artifact_path} includes gen_psd_profiles_flat without offsets.")
+        if gen_profiles_flat.shape[1] != frequency.size:
+            raise ValueError(
+                f"Artifact {artifact_path} gen_psd_profiles_flat has width {gen_profiles_flat.shape[1]}, "
+                f"expected {frequency.size}."
+            )
+        if gen_class_offsets.size != n_classes + 1 or int(gen_class_offsets[-1]) != int(gen_profiles_flat.shape[0]):
+            raise ValueError(f"Artifact {artifact_path} has inconsistent generated PSD offsets.")
+
+    manifest_labels = manifest.get("class_labels", {})
+    if not isinstance(manifest_labels, dict):
+        manifest_labels = {}
+
+    panels: Dict[int, PSDPanel] = {}
+    for idx, class_id in enumerate(class_ids.tolist()):
+        label = str(
+            manifest_labels.get(str(class_id))
+            or (class_labels_arr[idx] if class_labels_arr.size else "")
+            or _default_label(class_id)
+        )
+        real_profiles = None
+        gen_profiles = None
+        if real_profiles_flat is not None and real_class_offsets is not None:
+            start = int(real_class_offsets[idx])
+            stop = int(real_class_offsets[idx + 1])
+            real_profiles = real_profiles_flat[start:stop]
+        if gen_profiles_flat is not None and gen_class_offsets is not None:
+            start = int(gen_class_offsets[idx])
+            stop = int(gen_class_offsets[idx + 1])
+            gen_profiles = gen_profiles_flat[start:stop]
+        panels[class_id] = _build_psd_panel(
+            class_id=class_id,
+            label=label,
+            frequency=frequency,
+            real_profile=real_mean_rows[idx],
+            gen_profile=gen_mean_rows[idx],
+            l2=float(l2_rows[idx]) if l2_rows is not None else None,
+            real_profiles=real_profiles,
+            gen_profiles=gen_profiles,
+        )
+    return panels
+
+
+def _load_psd_report(repo_root: Path, spec: InputSpec) -> LoadedReport:
+    metrics_path = _resolve_metrics_path(repo_root, spec.run_name, spec.eval_ref)
+    report = _load_json(metrics_path)
+    paper_ready = report.get("paper_ready", {})
+    psd_ref = paper_ready.get("psd_radial") if isinstance(paper_ready, dict) else None
+
+    if not (isinstance(psd_ref, dict) and "path" in psd_ref):
+        raise ValueError(
+            "The metrics JSON does not contain saved radial PSD profile curves for paper-ready plotting. "
+            "Re-run eval with the updated code so it writes paper_ready.psd_radial."
+        )
+    panels = _load_psd_panels_from_npz_artifact(metrics_path=metrics_path, manifest=psd_ref)
+
+    class_ids = sorted(panels.keys())
+    expected_class_ids = list(range(6))
+    if class_ids != expected_class_ids:
+        raise ValueError(f"Expected classes 0..5 in {metrics_path}, found {class_ids}.")
+
+    split = str(report.get("split") or _infer_split_from_eval_ref(spec.eval_ref)).strip().lower()
+    return LoadedReport(
+        figure_kind=FIGURE_PSD,
+        run_name=spec.run_name,
+        label=spec.label,
+        eval_ref=spec.eval_ref,
+        split=split,
+        tag=str(report.get("tag", Path(spec.eval_ref).name)),
+        n_per_class=int(report.get("n_per_class", -1)),
+        metrics_path=metrics_path,
+        panels=panels,
+    )
+
+
 def _build_dav_panel(
     *,
     class_id: int,
@@ -1320,15 +1563,142 @@ def _load_cold_cloud_report(repo_root: Path, spec: InputSpec) -> LoadedReport:
     )
 
 
+def _load_memorization_pairs_from_npz_artifact(
+    *,
+    metrics_path: Path,
+    manifest: Dict[str, Any],
+) -> Dict[int, list[MemorizationPair]]:
+    raw_path = manifest.get("path")
+    if not raw_path:
+        raise ValueError(f"Memorization-pairs artifact manifest in {metrics_path} is missing a path.")
+    artifact_path = _resolve_artifact_path(metrics_path, str(raw_path))
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"Memorization-pairs artifact not found for {metrics_path}: {artifact_path}")
+
+    with np.load(artifact_path, allow_pickle=False) as data:
+        class_ids = _ensure_1d_array(data["class_ids"], field_name="class_ids").astype(int)
+        class_labels_arr = (
+            _ensure_1d_string_array(data["class_labels"], field_name="class_labels")
+            if "class_labels" in data.files
+            else np.asarray([], dtype=str)
+        )
+        class_offsets = _ensure_offsets_array(data["class_offsets"], field_name="class_offsets")
+        pair_class_ids = _ensure_1d_array(data["pair_class_ids"], field_name="pair_class_ids").astype(int)
+        ranks = _ensure_1d_array(data["rank_within_class"], field_name="rank_within_class").astype(int)
+        distances = _ensure_1d_array(data["nearest_train_distance"], field_name="nearest_train_distance")
+        generated_indices = _ensure_1d_array(data["generated_index"], field_name="generated_index").astype(int)
+        train_indices = _ensure_1d_array(data["train_index"], field_name="train_index").astype(int)
+        train_rel_paths = _ensure_1d_string_array(data["train_rel_path"], field_name="train_rel_path")
+        generated_bt = _ensure_3d_array(data["generated_bt_k"], field_name="generated_bt_k")
+        train_bt = _ensure_3d_array(data["train_bt_k"], field_name="train_bt_k")
+
+    n_classes = class_ids.size
+    n_pairs = distances.size
+    if class_offsets.size != n_classes + 1 or int(class_offsets[-1]) != n_pairs:
+        raise ValueError(f"Artifact {artifact_path} has inconsistent class offsets for {n_pairs} pairs.")
+    if class_labels_arr.size not in {0, n_classes}:
+        raise ValueError(f"Artifact {artifact_path} has {class_labels_arr.size} labels for {n_classes} classes.")
+    for name, arr in {
+        "pair_class_ids": pair_class_ids,
+        "rank_within_class": ranks,
+        "generated_index": generated_indices,
+        "train_index": train_indices,
+        "train_rel_path": train_rel_paths,
+    }.items():
+        if arr.size != n_pairs:
+            raise ValueError(f"Artifact {artifact_path} field {name!r} has {arr.size} rows, expected {n_pairs}.")
+    if generated_bt.shape[0] != n_pairs or train_bt.shape[0] != n_pairs:
+        raise ValueError(
+            f"Artifact {artifact_path} has image rows generated={generated_bt.shape[0]}, "
+            f"train={train_bt.shape[0]}, expected {n_pairs}."
+        )
+    if generated_bt.shape[1:] != train_bt.shape[1:]:
+        raise ValueError(
+            f"Artifact {artifact_path} generated/train image shapes differ: "
+            f"{generated_bt.shape[1:]} vs {train_bt.shape[1:]}."
+        )
+
+    manifest_labels = manifest.get("class_labels", {})
+    if not isinstance(manifest_labels, dict):
+        manifest_labels = {}
+
+    panels: Dict[int, list[MemorizationPair]] = {}
+    for class_pos, class_id in enumerate(class_ids.tolist()):
+        label = str(
+            manifest_labels.get(str(class_id))
+            or (class_labels_arr[class_pos] if class_labels_arr.size else "")
+            or _default_label(class_id)
+        )
+        start = int(class_offsets[class_pos])
+        stop = int(class_offsets[class_pos + 1])
+        pairs = []
+        for row in range(start, stop):
+            if int(pair_class_ids[row]) != int(class_id):
+                raise ValueError(
+                    f"Artifact {artifact_path} pair row {row} belongs to class {pair_class_ids[row]}, "
+                    f"expected {class_id} from class_offsets."
+                )
+            pairs.append(
+                MemorizationPair(
+                    class_id=int(class_id),
+                    label=label,
+                    rank_within_class=int(ranks[row]),
+                    distance=float(distances[row]),
+                    generated_index=int(generated_indices[row]),
+                    train_index=int(train_indices[row]),
+                    train_rel_path=str(train_rel_paths[row]),
+                    generated_bt=np.asarray(generated_bt[row], dtype=np.float32),
+                    train_bt=np.asarray(train_bt[row], dtype=np.float32),
+                )
+            )
+        panels[int(class_id)] = sorted(pairs, key=lambda p: (p.rank_within_class, p.distance))
+    return panels
+
+
+def _load_memorization_pairs_report(repo_root: Path, spec: InputSpec) -> LoadedReport:
+    metrics_path = _resolve_metrics_path(repo_root, spec.run_name, spec.eval_ref)
+    report = _load_json(metrics_path)
+    paper_ready = report.get("paper_ready", {})
+    pair_ref = paper_ready.get("memorization_pairs") if isinstance(paper_ready, dict) else None
+    if not isinstance(pair_ref, dict) or "path" not in pair_ref:
+        raise ValueError(
+            "The metrics JSON does not contain saved nearest-train memorization pairs for paper-ready plotting. "
+            "Re-run eval with evaluator/distributional metrics enabled so it writes paper_ready.memorization_pairs."
+        )
+
+    panels = _load_memorization_pairs_from_npz_artifact(metrics_path=metrics_path, manifest=pair_ref)
+    class_ids = sorted(panels.keys())
+    expected_class_ids = list(range(6))
+    if class_ids != expected_class_ids:
+        raise ValueError(f"Expected classes 0..5 in {metrics_path}, found {class_ids}.")
+
+    split = str(report.get("split") or _infer_split_from_eval_ref(spec.eval_ref)).strip().lower()
+    return LoadedReport(
+        figure_kind=FIGURE_MEMORIZATION,
+        run_name=spec.run_name,
+        label=spec.label,
+        eval_ref=spec.eval_ref,
+        split=split,
+        tag=str(report.get("tag", Path(spec.eval_ref).name)),
+        n_per_class=int(report.get("n_per_class", -1)),
+        metrics_path=metrics_path,
+        panels=panels,
+    )
+
+
 def _load_report(repo_root: Path, spec: InputSpec, *, figure_kind: str) -> LoadedReport:
     if figure_kind == FIGURE_PIXEL:
         return _load_pixel_report(repo_root, spec)
     if figure_kind == FIGURE_RADIAL:
         return _load_radial_report(repo_root, spec)
+    if figure_kind == FIGURE_PSD:
+        return _load_psd_report(repo_root, spec)
     if figure_kind == FIGURE_DAV:
         return _load_dav_report(repo_root, spec)
     if figure_kind == FIGURE_COLD:
         return _load_cold_cloud_report(repo_root, spec)
+    if figure_kind == FIGURE_MEMORIZATION:
+        return _load_memorization_pairs_report(repo_root, spec)
     raise ValueError(f"Unsupported figure kind: {figure_kind}")
 
 
@@ -1397,6 +1767,44 @@ def _validate_radial_reports(reports: list[LoadedReport]) -> None:
             if not np.allclose(ref_panel.real_profile, other_panel.real_profile, atol=1e-12, rtol=0.0):
                 raise ValueError(
                     "Real reference radial profiles differ across reports. "
+                    "Re-run eval with the same split, n_per_class, and real-data seed before plotting together."
+                )
+
+
+def _validate_psd_reports(reports: list[LoadedReport]) -> None:
+    if not reports:
+        raise ValueError("No reports were loaded.")
+
+    ref = reports[0]
+    class_ids = sorted(ref.panels.keys())
+    for other in reports[1:]:
+        if other.split != ref.split:
+            raise ValueError(
+                "All plotted reports must use the same split. "
+                f"Found {ref.run_name!r} on {ref.split!r} and {other.run_name!r} on {other.split!r}."
+            )
+        if other.n_per_class != ref.n_per_class:
+            raise ValueError(
+                "All plotted reports must use the same n_per_class for a fair comparison. "
+                f"Found {ref.run_name!r}={ref.n_per_class} and {other.run_name!r}={other.n_per_class}."
+            )
+        if sorted(other.panels.keys()) != class_ids:
+            raise ValueError("All plotted reports must contain the same class panels.")
+
+        for class_id in class_ids:
+            ref_panel = ref.panels[class_id]
+            other_panel = other.panels[class_id]
+            if ref_panel.frequency.shape != other_panel.frequency.shape or not np.allclose(
+                ref_panel.frequency,
+                other_panel.frequency,
+            ):
+                raise ValueError(
+                    f"Normalized PSD frequency coordinates differ for class {class_id} between "
+                    f"{ref.run_name!r} and {other.run_name!r}."
+                )
+            if not np.allclose(ref_panel.real_profile, other_panel.real_profile, atol=1e-12, rtol=0.0):
+                raise ValueError(
+                    "Real reference PSD profiles differ across reports. "
                     "Re-run eval with the same split, n_per_class, and real-data seed before plotting together."
                 )
 
@@ -1477,6 +1885,32 @@ def _validate_cold_cloud_reports(reports: list[LoadedReport]) -> None:
                 )
 
 
+def _validate_memorization_pair_reports(reports: list[LoadedReport]) -> None:
+    if not reports:
+        raise ValueError("No reports were loaded.")
+
+    ref = reports[0]
+    class_ids = sorted(ref.panels.keys())
+    for other in reports[1:]:
+        if other.split != ref.split:
+            raise ValueError(
+                "All plotted reports must use the same split. "
+                f"Found {ref.run_name!r} on {ref.split!r} and {other.run_name!r} on {other.split!r}."
+            )
+        if other.n_per_class != ref.n_per_class:
+            raise ValueError(
+                "All plotted reports must use the same n_per_class for a fair comparison. "
+                f"Found {ref.run_name!r}={ref.n_per_class} and {other.run_name!r}={other.n_per_class}."
+            )
+        if sorted(other.panels.keys()) != class_ids:
+            raise ValueError("All plotted reports must contain the same class panels.")
+
+    for report in reports:
+        empty = [class_id for class_id in class_ids if not report.panels[class_id]]
+        if empty:
+            raise ValueError(f"Report {report.metrics_path} has no memorization pairs for classes: {empty}.")
+
+
 def _validate_reports(reports: list[LoadedReport], *, figure_kind: str) -> None:
     if figure_kind == FIGURE_PIXEL:
         _validate_pixel_reports(reports)
@@ -1484,11 +1918,17 @@ def _validate_reports(reports: list[LoadedReport], *, figure_kind: str) -> None:
     if figure_kind == FIGURE_RADIAL:
         _validate_radial_reports(reports)
         return
+    if figure_kind == FIGURE_PSD:
+        _validate_psd_reports(reports)
+        return
     if figure_kind == FIGURE_DAV:
         _validate_dav_reports(reports)
         return
     if figure_kind == FIGURE_COLD:
         _validate_cold_cloud_reports(reports)
+        return
+    if figure_kind == FIGURE_MEMORIZATION:
+        _validate_memorization_pair_reports(reports)
         return
     raise ValueError(f"Unsupported figure kind: {figure_kind}")
 
@@ -1505,10 +1945,14 @@ def _default_output_filename(reports: list[LoadedReport], *, figure_kind: str) -
         stem = "paper_ready_pixel_plausibility"
     elif figure_kind == FIGURE_RADIAL:
         stem = "paper_ready_radial_bt_profile"
+    elif figure_kind == FIGURE_PSD:
+        stem = "paper_ready_radial_psd_profile"
     elif figure_kind == FIGURE_DAV:
         stem = "paper_ready_dav"
     elif figure_kind == FIGURE_COLD:
         stem = "paper_ready_cold_cloud_fraction"
+    elif figure_kind == FIGURE_MEMORIZATION:
+        stem = "paper_ready_memorization_pairs"
     else:
         raise ValueError(f"Unsupported figure kind: {figure_kind}")
     return f"{stem}_{split_slug}_{model_slug}.png"
@@ -1999,6 +2443,12 @@ def _profile_mae(real_profiles: np.ndarray, gen_profiles: np.ndarray) -> np.ndar
     return np.mean(np.abs(real_arr - gen_arr), axis=1)
 
 
+def _profile_l2(real_profiles: np.ndarray, gen_profiles: np.ndarray) -> np.ndarray:
+    real_arr = np.asarray(real_profiles, dtype=np.float64)
+    gen_arr = np.asarray(gen_profiles, dtype=np.float64)
+    return np.mean(np.square(real_arr - gen_arr), axis=1)
+
+
 def _bootstrap_profile_mae_distribution(
     real_profile_rows: np.ndarray | None,
     gen_profile_rows: np.ndarray | None,
@@ -2039,6 +2489,46 @@ def _bootstrap_profile_mae_distribution(
     return np.concatenate(mae_batches)
 
 
+def _bootstrap_profile_l2_distribution(
+    real_profile_rows: np.ndarray | None,
+    gen_profile_rows: np.ndarray | None,
+    *,
+    reps: int,
+    seed: int,
+) -> np.ndarray | None:
+    if real_profile_rows is None or gen_profile_rows is None:
+        return None
+
+    real_rows = np.asarray(real_profile_rows, dtype=np.float64)
+    gen_rows = np.asarray(gen_profile_rows, dtype=np.float64)
+    if real_rows.ndim != 2 or gen_rows.ndim != 2:
+        return None
+    if real_rows.shape[0] < 2 or gen_rows.shape[0] < 2 or reps <= 0:
+        return None
+
+    l2_batches = []
+    gen_iter = _iter_bootstrap_profile_means(
+        gen_rows,
+        sample_size=gen_rows.shape[0],
+        reps=reps,
+        seed=seed + 1,
+    )
+    for real_means, gen_means in zip(
+        _iter_bootstrap_profile_means(
+            real_rows,
+            sample_size=real_rows.shape[0],
+            reps=reps,
+            seed=seed,
+        ),
+        gen_iter,
+    ):
+        l2_batches.append(_profile_l2(real_means, gen_means))
+
+    if not l2_batches:
+        return None
+    return np.concatenate(l2_batches)
+
+
 def _bootstrap_real_profile_null(
     real_profile_rows: np.ndarray | None,
     *,
@@ -2074,6 +2564,43 @@ def _bootstrap_real_profile_null(
     if not mae_batches:
         return None
     return np.concatenate(mae_batches)
+
+
+def _bootstrap_real_profile_l2_null(
+    real_profile_rows: np.ndarray | None,
+    *,
+    other_sample_size: int,
+    reps: int,
+    seed: int,
+) -> np.ndarray | None:
+    if real_profile_rows is None:
+        return None
+
+    real_rows = np.asarray(real_profile_rows, dtype=np.float64)
+    if real_rows.ndim != 2 or real_rows.shape[0] < 2 or other_sample_size <= 0 or reps <= 0:
+        return None
+
+    l2_batches = []
+    other_iter = _iter_bootstrap_profile_means(
+        real_rows,
+        sample_size=int(other_sample_size),
+        reps=reps,
+        seed=seed + 1,
+    )
+    for left_means, right_means in zip(
+        _iter_bootstrap_profile_means(
+            real_rows,
+            sample_size=real_rows.shape[0],
+            reps=reps,
+            seed=seed,
+        ),
+        other_iter,
+    ):
+        l2_batches.append(_profile_l2(left_means, right_means))
+
+    if not l2_batches:
+        return None
+    return np.concatenate(l2_batches)
 
 
 def _compute_radial_class_inference(
@@ -2126,6 +2653,60 @@ def _compute_radial_class_inference(
         if null_mae is not None and null_mae.size:
             model_stats.mae_null_q95 = float(np.quantile(null_mae, 0.95))
             model_stats.mae_pvalue = _empirical_pvalue(panel.mae_k, null_mae)
+        out.model[report_idx] = model_stats
+    return out
+
+
+def _compute_psd_class_inference(
+    reports: list[LoadedReport],
+    class_id: int,
+    *,
+    bootstrap_reps: int,
+    null_reps: int,
+    ci_level: float,
+    seed: int,
+) -> PSDClassInference:
+    ref_panel = reports[0].panels[class_id]
+    if ref_panel.real_profiles is None:
+        return PSDClassInference()
+
+    out = PSDClassInference(supports_image_level_stats=True)
+    out.real_profile_low, out.real_profile_high = _bootstrap_profile_band(
+        ref_panel.real_profiles,
+        reps=bootstrap_reps,
+        ci_level=ci_level,
+        seed=seed + 101 * class_id,
+    )
+
+    null_l2 = None
+    if reports and reports[0].panels[class_id].gen_profiles is not None:
+        null_l2 = _bootstrap_real_profile_l2_null(
+            ref_panel.real_profiles,
+            other_sample_size=int(reports[0].panels[class_id].gen_profiles.shape[0]),
+            reps=null_reps,
+            seed=seed + 1000 + 101 * class_id,
+        )
+
+    for report_idx, report in enumerate(reports):
+        panel = report.panels[class_id]
+        model_stats = PSDModelInference()
+        model_stats.gen_profile_low, model_stats.gen_profile_high = _bootstrap_profile_band(
+            panel.gen_profiles,
+            reps=bootstrap_reps,
+            ci_level=ci_level,
+            seed=seed + 2000 + 211 * class_id + report_idx,
+        )
+        l2_dist = _bootstrap_profile_l2_distribution(
+            ref_panel.real_profiles,
+            panel.gen_profiles,
+            reps=bootstrap_reps,
+            seed=seed + 3000 + 211 * class_id + report_idx,
+        )
+        if l2_dist is not None and l2_dist.size:
+            model_stats.l2_ci = _quantile_interval(l2_dist, ci_level)
+        if null_l2 is not None and null_l2.size:
+            model_stats.l2_null_q95 = float(np.quantile(null_l2, 0.95))
+            model_stats.l2_pvalue = _empirical_pvalue(panel.l2, null_l2)
         out.model[report_idx] = model_stats
     return out
 
@@ -2386,6 +2967,60 @@ def _draw_radial_metrics_text(
             )
         else:
             lines.append((f"{label}  MAE {panel.mae_k:.2f} K", MODEL_COLORS[idx]))
+
+    text = "\n".join(line for line, _ in lines)
+    ax.text(
+        0.03,
+        0.965,
+        text,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=7.7,
+        linespacing=1.38,
+        color="#111827",
+        bbox={
+            "boxstyle": "round,pad=0.34,rounding_size=0.06",
+            "facecolor": (1.0, 1.0, 1.0, 0.86),
+            "edgecolor": (1.0, 1.0, 1.0, 0.0),
+        },
+        zorder=8,
+    )
+
+    for idx, (_, color) in enumerate(lines):
+        y = 0.946 - idx * 0.084
+        ax.plot(
+            [0.038, 0.055],
+            [y - 0.012, y - 0.012],
+            transform=ax.transAxes,
+            color=color,
+            linewidth=2.2,
+            solid_capstyle="round",
+            zorder=9,
+        )
+
+
+def _draw_psd_metrics_text(
+    ax,
+    reports: list[LoadedReport],
+    inference: PSDClassInference,
+    class_id: int,
+) -> None:
+    lines = []
+    for idx, report in enumerate(reports):
+        panel = report.panels[class_id]
+        stats = inference.model.get(idx)
+        label = _truncate_label(report.label, max_len=14)
+        if stats is not None and stats.l2_ci is not None:
+            lines.append(
+                (
+                    f"{label}  L2 {panel.l2:.3f} [{stats.l2_ci[0]:.3f}, {stats.l2_ci[1]:.3f}], "
+                    f"p{_format_pvalue(stats.l2_pvalue)}",
+                    MODEL_COLORS[idx],
+                )
+            )
+        else:
+            lines.append((f"{label}  L2 {panel.l2:.3f}", MODEL_COLORS[idx]))
 
     text = "\n".join(line for line, _ in lines)
     ax.text(
@@ -2875,6 +3510,182 @@ def _plot_radial_reports(
     plt.close(fig)
 
 
+def _plot_psd_reports(
+    reports: list[LoadedReport],
+    out_path: Path,
+    *,
+    bootstrap_reps: int,
+    null_reps: int,
+    ci_level: float,
+    stats_seed: int,
+) -> None:
+    _validate_reports(reports, figure_kind=FIGURE_PSD)
+    _configure_style()
+
+    ref = reports[0]
+    class_ids = sorted(ref.panels.keys())
+    inference_by_class = {
+        class_id: _compute_psd_class_inference(
+            reports,
+            class_id,
+            bootstrap_reps=int(bootstrap_reps),
+            null_reps=int(null_reps),
+            ci_level=float(ci_level),
+            seed=int(stats_seed),
+        )
+        for class_id in class_ids
+    }
+
+    x_min = min(float(ref.panels[c].frequency[0]) for c in class_ids)
+    x_max = max(float(ref.panels[c].frequency[-1]) for c in class_ids)
+    display_cache: Dict[tuple[int, int, str], tuple[np.ndarray, np.ndarray]] = {}
+    y_min = float("inf")
+    y_max = float("-inf")
+
+    for class_id in class_ids:
+        panel = ref.panels[class_id]
+        display_cache[(0, class_id, "real")] = _display_profile_curve(panel.frequency, panel.real_profile)
+        y_vals = display_cache[(0, class_id, "real")][1]
+        y_min = min(y_min, float(np.min(y_vals)))
+        y_max = max(y_max, float(np.max(y_vals)))
+        inference = inference_by_class[class_id]
+        if inference.real_profile_low is not None and inference.real_profile_high is not None:
+            y_min = min(y_min, float(np.min(inference.real_profile_low)), float(np.min(inference.real_profile_high)))
+            y_max = max(y_max, float(np.max(inference.real_profile_low)), float(np.max(inference.real_profile_high)))
+        for report_idx, report in enumerate(reports):
+            curve = _display_profile_curve(report.panels[class_id].frequency, report.panels[class_id].gen_profile)
+            display_cache[(report_idx, class_id, "gen")] = curve
+            y_min = min(y_min, float(np.min(curve[1])))
+            y_max = max(y_max, float(np.max(curve[1])))
+            model_inference = inference.model.get(report_idx)
+            if model_inference is not None:
+                if model_inference.gen_profile_low is not None:
+                    y_min = min(y_min, float(np.min(model_inference.gen_profile_low)))
+                    y_max = max(y_max, float(np.max(model_inference.gen_profile_low)))
+                if model_inference.gen_profile_high is not None:
+                    y_min = min(y_min, float(np.min(model_inference.gen_profile_high)))
+                    y_max = max(y_max, float(np.max(model_inference.gen_profile_high)))
+
+    if not np.isfinite(y_min) or not np.isfinite(y_max):
+        y_min, y_max = 0.0, 1.0
+    pad = max(0.05, 0.06 * (y_max - y_min))
+    y_lo = y_min - pad
+    y_hi = y_max + pad
+
+    fig, axes = plt.subplots(2, 3, figsize=(14.4, 8.0), sharex=True, sharey=True)
+    flat_axes = axes.ravel()
+    panel_letters = "ABCDEF"
+
+    for panel_idx, (ax, class_id) in enumerate(zip(flat_axes, class_ids)):
+        panel = ref.panels[class_id]
+        inference = inference_by_class[class_id]
+        x_real, y_real = display_cache[(0, class_id, "real")]
+        if inference.real_profile_low is not None and inference.real_profile_high is not None:
+            low_x, low_y = _display_profile_curve(panel.frequency, inference.real_profile_low)
+            high_x, high_y = _display_profile_curve(panel.frequency, inference.real_profile_high)
+            ax.fill_between(
+                low_x,
+                low_y,
+                high_y,
+                color="#cbd5e1",
+                alpha=0.42,
+                zorder=1,
+                linewidth=0.0,
+            )
+        ax.plot(
+            x_real,
+            y_real,
+            color=REAL_COLOR,
+            linewidth=2.6,
+            solid_capstyle="round",
+            label="Real",
+            zorder=5,
+        )
+
+        for idx, report in enumerate(reports):
+            x_gen, y_gen = display_cache[(idx, class_id, "gen")]
+            model_inference = inference.model.get(idx)
+            if (
+                model_inference is not None
+                and model_inference.gen_profile_low is not None
+                and model_inference.gen_profile_high is not None
+            ):
+                low_x, low_y = _display_profile_curve(report.panels[class_id].frequency, model_inference.gen_profile_low)
+                high_x, high_y = _display_profile_curve(report.panels[class_id].frequency, model_inference.gen_profile_high)
+                ax.fill_between(
+                    low_x,
+                    low_y,
+                    high_y,
+                    color=MODEL_COLORS[idx],
+                    alpha=0.10,
+                    zorder=3 + idx,
+                    linewidth=0.0,
+                )
+            ax.plot(
+                x_gen,
+                y_gen,
+                color=MODEL_COLORS[idx],
+                linewidth=2.2,
+                linestyle=MODEL_LINESTYLES[idx],
+                solid_capstyle="round",
+                label=report.label,
+                zorder=6 + idx,
+            )
+
+        ax.set_title(f"{panel_letters[panel_idx]}   {panel.label}", loc="left", pad=8.5)
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_lo, y_hi)
+        ax.set_xticks(np.linspace(0.0, 1.0, 5))
+        ax.grid(axis="y", color="#cbd5e1", linewidth=0.75, alpha=0.42)
+        ax.tick_params(length=3.2, width=0.8, color="#6b7280")
+        ax.margins(x=0.0)
+        _draw_psd_metrics_text(ax, reports, inference, class_id)
+
+    legend_handles = [Line2D([0], [0], color=REAL_COLOR, lw=2.8, label="Real")]
+    for idx, report in enumerate(reports):
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=MODEL_COLORS[idx],
+                lw=2.15,
+                linestyle=MODEL_LINESTYLES[idx],
+                label=report.label,
+            )
+        )
+
+    fig.legend(
+        handles=legend_handles,
+        labels=[handle.get_label() for handle in legend_handles],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.986),
+        ncol=min(4, len(legend_handles)),
+        frameon=False,
+        handlelength=2.7,
+        columnspacing=1.6,
+    )
+    fig.supxlabel("Normalized radial frequency", y=0.055)
+    fig.supylabel("Radial PSD log10 power", x=0.04)
+    fig.text(
+        0.5,
+        0.017,
+        (
+            f"Shaded bands: {int(round(ci_level * 100))}% image-level bootstrap intervals for real and "
+            "generated mean radial PSD profiles. Reported p-values compare observed PSD L2 against a "
+            "matched real-vs-real null."
+        ),
+        ha="center",
+        va="bottom",
+        fontsize=8.8,
+        color="#4b5563",
+    )
+    fig.tight_layout(rect=(0.04, 0.07, 0.995, 0.93))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _plot_dav_reports(
     reports: list[LoadedReport],
     out_path: Path,
@@ -3257,13 +4068,145 @@ def _plot_cold_cloud_reports(
     plt.close(fig)
 
 
+def _resolve_image_limits(images: list[np.ndarray]) -> tuple[float, float]:
+    finite = []
+    for image in images:
+        arr = np.asarray(image, dtype=np.float64).reshape(-1)
+        arr = arr[np.isfinite(arr)]
+        if arr.size:
+            finite.append(arr)
+    if not finite:
+        return 0.0, 1.0
+    values = np.concatenate(finite, axis=0)
+    vmin = float(np.min(values))
+    vmax = float(np.max(values))
+    if vmax <= vmin:
+        pad = max(0.5, abs(vmin) * 0.01)
+        return vmin - pad, vmax + pad
+    return vmin, vmax
+
+
+def _plot_memorization_pair_reports(
+    reports: list[LoadedReport],
+    out_path: Path,
+) -> None:
+    _validate_reports(reports, figure_kind=FIGURE_MEMORIZATION)
+    _configure_style()
+
+    ref = reports[0]
+    class_ids = sorted(ref.panels.keys())
+    n_models = len(reports)
+    nrows = len(class_ids)
+    ncols = 2 * n_models
+    displayed_pairs: Dict[tuple[int, int], MemorizationPair] = {}
+    displayed_images = []
+
+    for report_idx, report in enumerate(reports):
+        for class_id in class_ids:
+            pair = sorted(report.panels[class_id], key=lambda p: (p.rank_within_class, p.distance))[0]
+            displayed_pairs[(report_idx, class_id)] = pair
+            displayed_images.extend([pair.generated_bt, pair.train_bt])
+
+    vmin, vmax = _resolve_image_limits(displayed_images)
+    fig_width = max(8.6, 2.15 * ncols + 1.2)
+    fig_height = max(10.2, 1.92 * nrows + 1.8)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_width, fig_height), squeeze=False)
+    im_plot = None
+
+    for row_idx, class_id in enumerate(class_ids):
+        for report_idx, report in enumerate(reports):
+            pair = displayed_pairs[(report_idx, class_id)]
+            gen_ax = axes[row_idx, 2 * report_idx]
+            train_ax = axes[row_idx, 2 * report_idx + 1]
+            for ax in (gen_ax, train_ax):
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_linewidth(0.6)
+                    spine.set_edgecolor("#e5e7eb")
+
+            im_plot = gen_ax.imshow(
+                pair.generated_bt,
+                origin="lower",
+                cmap=BT_CMAP,
+                vmin=vmin,
+                vmax=vmax,
+            )
+            train_ax.imshow(
+                pair.train_bt,
+                origin="lower",
+                cmap=BT_CMAP,
+                vmin=vmin,
+                vmax=vmax,
+            )
+
+            if row_idx == 0:
+                gen_ax.set_title(f"{_truncate_label(report.label, 18)}\nGenerated", fontsize=10.2, pad=7.0)
+                train_ax.set_title("Nearest train", fontsize=10.2, pad=7.0)
+            gen_ax.text(
+                -0.08,
+                0.5,
+                f"{pair.label}\nd={pair.distance:.3f}",
+                transform=gen_ax.transAxes,
+                ha="right",
+                va="center",
+                fontsize=8.2,
+                color="#111827",
+                linespacing=1.35,
+            )
+            train_ax.text(
+                0.02,
+                0.02,
+                f"g#{pair.generated_index}  t#{pair.train_index}",
+                transform=train_ax.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=6.8,
+                color="#111827",
+                bbox={
+                    "boxstyle": "round,pad=0.18,rounding_size=0.04",
+                    "facecolor": (1.0, 1.0, 1.0, 0.75),
+                    "edgecolor": (1.0, 1.0, 1.0, 0.0),
+                },
+            )
+
+    if im_plot is not None:
+        cbar = fig.colorbar(
+            im_plot,
+            ax=axes.ravel().tolist(),
+            fraction=0.014,
+            pad=0.012,
+        )
+        cbar.set_label("Brightness temperature [K]")
+
+    fig.text(
+        0.5,
+        0.018,
+        (
+            "Each row shows the generated sample with the smallest same-class nearest-train distance in the "
+            "evaluation feature space, paired with its nearest training image. Lower distances indicate higher "
+            "memorization risk; this figure is qualitative context for the scalar nearest-train metric."
+        ),
+        ha="center",
+        va="bottom",
+        fontsize=8.8,
+        color="#4b5563",
+        wrap=True,
+    )
+    fig.tight_layout(rect=(0.045, 0.055, 0.97, 0.98), w_pad=0.08, h_pad=0.35)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _resolve_figure_kinds(args: argparse.Namespace) -> list[str]:
     if args.plot_only and args.figure and args.plot_only != args.figure:
         raise ValueError("Use either --plot_only or --figure, not both.")
     figure_kind = args.plot_only or args.figure
     if figure_kind is not None:
         return [str(figure_kind)]
-    return list(ALL_FIGURES)
+    return list(DEFAULT_FIGURES)
 
 
 def _figure_label(figure_kind: str) -> str:
@@ -3271,10 +4214,14 @@ def _figure_label(figure_kind: str) -> str:
         return "pixel plausibility"
     if figure_kind == FIGURE_RADIAL:
         return "radial BT profile"
+    if figure_kind == FIGURE_PSD:
+        return "radial PSD profile"
     if figure_kind == FIGURE_DAV:
         return "DAV"
     if figure_kind == FIGURE_COLD:
         return "cold-cloud fraction"
+    if figure_kind == FIGURE_MEMORIZATION:
+        return "nearest-train memorization pairs"
     raise ValueError(f"Unsupported figure kind: {figure_kind}")
 
 
@@ -3283,10 +4230,14 @@ def _missing_stats_field(figure_kind: str) -> str:
         return "histogram"
     if figure_kind == FIGURE_RADIAL:
         return "radial-profile"
+    if figure_kind == FIGURE_PSD:
+        return "radial-PSD-profile"
     if figure_kind == FIGURE_DAV:
         return "DAV"
     if figure_kind == FIGURE_COLD:
         return "cold-cloud-fraction"
+    if figure_kind == FIGURE_MEMORIZATION:
+        return "memorization-pair"
     raise ValueError(f"Unsupported figure kind: {figure_kind}")
 
 
@@ -3295,10 +4246,14 @@ def _report_missing_image_level_stats(reports: list[LoadedReport], *, figure_kin
         return any(report.panels[0].real_hist_counts is None for report in reports)
     if figure_kind == FIGURE_RADIAL:
         return any(report.panels[0].real_profiles is None for report in reports)
+    if figure_kind == FIGURE_PSD:
+        return any(report.panels[0].real_profiles is None for report in reports)
     if figure_kind == FIGURE_DAV:
         return any(report.panels[0].real_values.size < 2 for report in reports)
     if figure_kind == FIGURE_COLD:
         return any(report.panels[0].real_values.size < 2 for report in reports)
+    if figure_kind == FIGURE_MEMORIZATION:
+        return False
     raise ValueError(f"Unsupported figure kind: {figure_kind}")
 
 
@@ -3351,6 +4306,15 @@ def main() -> None:
                 ci_level=float(args.ci_level),
                 stats_seed=int(args.stats_seed),
             )
+        elif figure_kind == FIGURE_PSD:
+            _plot_psd_reports(
+                reports,
+                output_path,
+                bootstrap_reps=int(args.bootstrap_reps),
+                null_reps=int(args.null_reps),
+                ci_level=float(args.ci_level),
+                stats_seed=int(args.stats_seed),
+            )
         elif figure_kind == FIGURE_DAV:
             _plot_dav_reports(
                 reports,
@@ -3370,6 +4334,11 @@ def main() -> None:
                 null_reps=int(args.null_reps),
                 ci_level=float(args.ci_level),
                 stats_seed=int(args.stats_seed),
+            )
+        elif figure_kind == FIGURE_MEMORIZATION:
+            _plot_memorization_pair_reports(
+                reports,
+                output_path,
             )
         else:
             raise ValueError(f"Unsupported figure kind: {figure_kind}")
