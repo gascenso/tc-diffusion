@@ -46,7 +46,7 @@ from tc_diffusion.sample_bank import (
 )
 
 
-ANCHOR_SCHEMA = "tc_diffusion.metric_normalization_ranges.v1"
+ANCHOR_SCHEMA = "tc_diffusion.metric_normalization_ranges.v2"
 RANGE_DIRECTIONS = {
     "pixel_hist_w1": "lower",
     "dav_abs_gap_deg2": "lower",
@@ -57,6 +57,7 @@ RANGE_DIRECTIONS = {
     "evaluator_fd": "lower",
     "evaluator_embedding_diversity_closeness": "higher",
     "evaluator_embedding_coverage": "higher",
+    "evaluator_embedding_precision": "higher",
     "nearest_train_q01_distance": "higher",
 }
 
@@ -141,7 +142,7 @@ def parse_args() -> argparse.Namespace:
         dest="include_evaluator_features",
         action="store_true",
         default=True,
-        help="Include evaluator-FD, diversity, coverage, and memorization anchors.",
+        help="Include evaluator-FD, diversity, coverage, precision, and memorization anchors.",
     )
     parser.add_argument(
         "--skip-evaluator-features",
@@ -496,6 +497,7 @@ def main() -> None:
         good_values.setdefault("evaluator_embedding_diversity_ratio", 1.0)
         good_values.setdefault("evaluator_embedding_diversity_closeness", 1.0)
         good_values.setdefault("evaluator_embedding_coverage", 1.0)
+        good_values.setdefault("evaluator_embedding_precision", 1.0)
 
         if memorization_train_split == "train":
             train_paths_by_class, _ = _select_real_by_class(
@@ -623,7 +625,7 @@ def main() -> None:
         "good_reference": {
             "description": (
                 "Finite-sample real-vs-real reference for unbounded physical distances; "
-                "ideal bounded references for diversity/coverage when needed."
+                "ideal bounded references for diversity/coverage/precision when needed."
             ),
             "values": good_values,
             "physical_real_vs_real": good_reference,

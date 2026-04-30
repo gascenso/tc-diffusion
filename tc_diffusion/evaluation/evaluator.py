@@ -25,6 +25,7 @@ from .metrics import (
     mean_pairwise_distance,
     nearest_neighbor_distances,
     nearest_neighbor_distances_and_indices,
+    precision_from_real_radii,
     psd_radial_batch,
     radial_profile_batch,
     rbf_mmd2,
@@ -54,7 +55,7 @@ PRIMARY_RAW_AGG_KEYS = (
     "gen_exceedance_rate_total",
 )
 
-REPORT_SCHEMA_VERSION = 12
+REPORT_SCHEMA_VERSION = 13
 PAPER_READY_PIXEL_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.pixel_plausibility.v2"
 PAPER_READY_RADIAL_BT_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_bt_profile.v1"
 PAPER_READY_PSD_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_psd_profile.v1"
@@ -2057,6 +2058,9 @@ def _add_distributional_values_to_aggregate(
     memorization_node = dist_macro.get("nearest_train_memorization", {})
     if isinstance(coverage_node, dict) and coverage_node.get("value") is not None:
         aggregate["evaluator_embedding_coverage"] = float(coverage_node["value"])
+    precision_node = dist_macro.get("precision", {})
+    if isinstance(precision_node, dict) and precision_node.get("value") is not None:
+        aggregate["evaluator_embedding_precision"] = float(precision_node["value"])
     if isinstance(diversity_node, dict) and diversity_node.get("generated_over_real") is not None:
         ratio = float(diversity_node["generated_over_real"])
         aggregate["evaluator_embedding_diversity_ratio"] = ratio
@@ -2462,6 +2466,12 @@ def _compute_embedding_distributional_metrics(
             k=coverage_k,
             block_size=distance_block_size,
         )
+        precision = precision_from_real_radii(
+            generated=gen,
+            real=real,
+            real_radii=real_radii,
+            block_size=distance_block_size,
+        )
         class_report: Dict[str, Any] = {
             "counts": {
                 "real_reference": int(real.shape[0]),
@@ -2477,6 +2487,7 @@ def _compute_embedding_distributional_metrics(
                 real_to_gen_nn=real_to_gen_nn,
                 real_radii=real_radii,
             ),
+            "precision": precision,
         }
 
         if train_embeddings_by_class is not None and class_id in train_embeddings_by_class:
@@ -2526,6 +2537,15 @@ def _compute_embedding_distributional_metrics(
                     per_class, ("coverage", "real_to_generated_nn", "mean"), macro_weights
                 ),
             },
+            "precision": {
+                "value": _weighted_mean_from_per_class(per_class, ("precision", "value"), macro_weights),
+                "mean_real_radius": _weighted_mean_from_per_class(
+                    per_class, ("precision", "mean_real_radius"), macro_weights
+                ),
+                "mean_generated_to_real_nn": _weighted_mean_from_per_class(
+                    per_class, ("precision", "generated_to_real_nn", "mean"), macro_weights
+                ),
+            },
         },
         "weighted": {
             "by_real_reference": {
@@ -2540,6 +2560,15 @@ def _compute_embedding_distributional_metrics(
                 },
             },
             "by_generated_count": {
+                "precision": {
+                    "value": _weighted_mean_from_per_class(per_class, ("precision", "value"), gen_weights),
+                    "mean_real_radius": _weighted_mean_from_per_class(
+                        per_class, ("precision", "mean_real_radius"), gen_weights
+                    ),
+                    "mean_generated_to_real_nn": _weighted_mean_from_per_class(
+                        per_class, ("precision", "generated_to_real_nn", "mean"), gen_weights
+                    ),
+                },
                 "diversity": {
                     "real_mean_pairwise_distance": _weighted_mean_from_per_class(
                         per_class, ("diversity", "real_mean_pairwise_distance"), gen_weights
@@ -2948,10 +2977,14 @@ class TCEvaluator:
             "enable_mode": str(distributional_enable_mode),
             "configured_enabled": distributional_cfg.get("enabled", "auto"),
             "feature_space": distributional_feature_space,
-            "metrics": ["diversity", "coverage", "nearest_train_memorization"],
+            "metrics": ["diversity", "coverage", "precision", "nearest_train_memorization"],
             "coverage_definition": (
                 "A real reference sample is covered when its nearest generated sample is within "
                 "the sample's kth-nearest-neighbor radius among same-class real references."
+            ),
+            "precision_definition": (
+                "A generated sample is precise when it lies within at least one same-class real "
+                "reference sample's kth-nearest-neighbor radius among real references."
             ),
             "memorization_definition": (
                 "Nearest-neighbor distance from each generated sample to same-class training samples."
@@ -3631,6 +3664,7 @@ class TCEvaluator:
                 good_values.setdefault("evaluator_embedding_diversity_ratio", 1.0)
                 good_values.setdefault("evaluator_embedding_diversity_closeness", 1.0)
                 good_values.setdefault("evaluator_embedding_coverage", 1.0)
+                good_values.setdefault("evaluator_embedding_precision", 1.0)
 
             real_to_train_reference = _compute_real_to_train_memorization_reference(
                 real_embeddings_by_class=real_evaluator_embeddings,
@@ -3725,7 +3759,7 @@ class TCEvaluator:
                     "good_reference": {
                         "description": (
                             "Finite-sample real-vs-real reference for unbounded physical distances; "
-                            "ideal bounded references for diversity/coverage when needed."
+                            "ideal bounded references for diversity/coverage/precision when needed."
                         ),
                         "values": good_values,
                         "physical_real_vs_real": good_reference,

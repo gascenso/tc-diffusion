@@ -299,6 +299,70 @@ def coverage_from_real_radii(
     }
 
 
+def precision_from_real_radii(
+    *,
+    generated: np.ndarray,
+    real: np.ndarray,
+    real_radii: np.ndarray,
+    block_size: int = 256,
+) -> Dict[str, float]:
+    """
+    Fraction of generated samples that fall inside the same-class real manifold.
+
+    The real manifold is represented as the union of balls centered on real
+    embeddings, with each ball radius set by that real sample's local kNN
+    radius. This mirrors the precision side of kNN precision/recall metrics.
+    """
+    gen = np.asarray(generated, dtype=np.float64)
+    ref = np.asarray(real, dtype=np.float64)
+    radii = np.asarray(real_radii, dtype=np.float64).reshape(-1)
+    if gen.ndim != 2 or ref.ndim != 2:
+        raise ValueError(f"Expected rank-2 feature matrices, got {gen.shape} and {ref.shape}.")
+    if gen.shape[0] == 0:
+        raise ValueError("Cannot compute precision from an empty generated set.")
+    if ref.shape[0] == 0:
+        raise ValueError("Cannot compute precision without real reference samples.")
+    if gen.shape[1] != ref.shape[1]:
+        raise ValueError(f"Feature dimensions differ: {gen.shape[1]} vs {ref.shape[1]}.")
+    if radii.shape[0] != ref.shape[0]:
+        raise ValueError(
+            f"real_radii must have one entry per real reference row, got {radii.shape[0]} "
+            f"for {ref.shape[0]} references."
+        )
+
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}.")
+
+    precise = np.zeros((gen.shape[0],), dtype=bool)
+    nn_d2 = np.full((gen.shape[0],), np.inf, dtype=np.float64)
+    radii2 = radii * radii
+    for i0 in range(0, gen.shape[0], block_size):
+        i1 = min(i0 + block_size, gen.shape[0])
+        gi = gen[i0:i1]
+        block_precise = np.zeros((i1 - i0,), dtype=bool)
+        block_nn_d2 = np.full((i1 - i0,), np.inf, dtype=np.float64)
+        for j0 in range(0, ref.shape[0], block_size):
+            j1 = min(j0 + block_size, ref.shape[0])
+            d2 = pairwise_squared_distances_block(gi, ref[j0:j1])
+            block_nn_d2 = np.minimum(block_nn_d2, np.min(d2, axis=1))
+            block_precise |= np.any(d2 <= radii2[j0:j1][None, :], axis=1)
+        precise[i0:i1] = block_precise
+        nn_d2[i0:i1] = block_nn_d2
+
+    nn = np.sqrt(nn_d2).astype(np.float32)
+    return {
+        "value": float(np.mean(precise)),
+        "precise_count": int(np.sum(precise)),
+        "generated_count": int(gen.shape[0]),
+        "real_reference_count": int(ref.shape[0]),
+        "mean_real_radius": float(np.mean(radii)),
+        "median_real_radius": float(np.median(radii)),
+        "generated_to_real_nn": summarize_distances(nn),
+        "real_radius": summarize_distances(radii),
+    }
+
+
 @dataclass
 class PolarBinner:
     """
