@@ -54,7 +54,7 @@ PRIMARY_RAW_AGG_KEYS = (
     "gen_exceedance_rate_total",
 )
 
-REPORT_SCHEMA_VERSION = 11
+REPORT_SCHEMA_VERSION = 12
 PAPER_READY_PIXEL_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.pixel_plausibility.v2"
 PAPER_READY_RADIAL_BT_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_bt_profile.v1"
 PAPER_READY_PSD_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_psd_profile.v1"
@@ -63,6 +63,13 @@ PAPER_READY_COLD_CLOUD_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.cold_cloud_fr
 PAPER_READY_MEMORIZATION_PAIRS_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.memorization_pairs.v1"
 PER_CLASS_METRICS_CSV_SCHEMA = "tc_diffusion.per_class_metrics.v1"
 EVALUATOR_FD_NEGATIVE_CONTROL_NAMES = ("gaussian_blur", "pixel_shuffle")
+METRIC_NORMALIZATION_CONTROL_NAMES = (
+    "gaussian_blur",
+    "pixel_shuffle",
+    "bt_warm_shift",
+    "center_jitter",
+    "mode_collapse",
+)
 
 
 @dataclass
@@ -92,6 +99,7 @@ class ClassMetricCache:
     real_features: np.ndarray
     gen_raw_features: np.ndarray
     gen_post_features: np.ndarray
+    feature_scaler: tuple[np.ndarray, np.ndarray]
     feature_gamma_raw: float
     feature_gamma_post: float
     real_pixel_mean: np.ndarray
@@ -167,6 +175,19 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     negative_controls_cfg.setdefault("gaussian_blur_kernel_size", 25)
     evaluator_fd_cfg["negative_controls"] = negative_controls_cfg
     ev["evaluator_feature_metric"] = evaluator_fd_cfg
+
+    normalization_cfg = dict(ev.get("metric_normalization", {}))
+    normalization_cfg.setdefault("enabled", False)
+    normalization_cfg.setdefault("controls", list(METRIC_NORMALIZATION_CONTROL_NAMES))
+    normalization_cfg.setdefault("seed", int(ev.get("seed", 123)))
+    normalization_cfg.setdefault("match_generated_counts", True)
+    normalization_cfg.setdefault("real_reference_reps", 200)
+    normalization_cfg.setdefault("bad_anchor_aggregation", "mean")
+    normalization_cfg.setdefault("gaussian_blur_sigma_px", 6.0)
+    normalization_cfg.setdefault("gaussian_blur_kernel_size", 25)
+    normalization_cfg.setdefault("bt_warm_shift_k", 15.0)
+    normalization_cfg.setdefault("center_jitter_max_px", 24)
+    ev["metric_normalization"] = normalization_cfg
     return ev
 
 
@@ -655,6 +676,7 @@ def _build_class_metric_cache(
         real_features=real_features,
         gen_raw_features=gen_raw_features,
         gen_post_features=gen_post_features,
+        feature_scaler=feat_scaler,
         feature_gamma_raw=feature_gamma_raw,
         feature_gamma_post=feature_gamma_post,
         real_pixel_mean=real_k.mean(axis=(1, 2)).astype(np.float32),
@@ -664,6 +686,104 @@ def _build_class_metric_cache(
         gen_raw_exceed_above=gen_raw_exceed_above,
         gen_raw_exceed_total=gen_raw_exceed_total,
         pixel_stats_real=summary_stats(real_k.reshape(-1)),
+        pixel_stats_gen_raw=summary_stats(gen_k_raw.reshape(-1)),
+        pixel_stats_gen_post=summary_stats(gen_k_post.reshape(-1)),
+        gen_exceedance_rate={
+            "below_bt_min": float(gen_raw_exceed_below.mean()),
+            "above_bt_max": float(gen_raw_exceed_above.mean()),
+            "total": float(gen_raw_exceed_total.mean()),
+            "raw_min": float(np.min(gen_k_raw)),
+            "raw_max": float(np.max(gen_k_raw)),
+        },
+    )
+
+
+def _build_class_metric_cache_from_real_cache(
+    *,
+    real_cache: ClassMetricCache,
+    gen_k_raw: np.ndarray,
+    binner: PolarBinner,
+    dav_computer: DAVComputer,
+    psd_bins: int,
+    bt_min_k: float,
+    bt_max_k: float,
+) -> ClassMetricCache:
+    bins = np.asarray(real_cache.bins, dtype=np.float64)
+    gen_k_raw = np.asarray(gen_k_raw, dtype=np.float32)
+    gen_k_post = np.clip(gen_k_raw, bt_min_k, bt_max_k)
+
+    gen_raw_hist_counts = _hist_counts_batch(gen_k_raw, bins)
+    gen_post_hist_counts = _hist_counts_batch(gen_k_post, bins)
+
+    gen_raw_mean_profiles, gen_raw_azstd_profiles = radial_profile_batch(gen_k_raw, binner)
+    gen_post_mean_profiles, gen_post_azstd_profiles = radial_profile_batch(gen_k_post, binner)
+
+    gen_raw_psd_profiles = psd_radial_batch(gen_k_raw, psd_bins)
+    gen_post_psd_profiles = psd_radial_batch(gen_k_post, psd_bins)
+
+    gen_raw_cold = cold_cloud_fraction(gen_k_raw, threshold_k=200.0)
+    gen_post_cold = cold_cloud_fraction(gen_k_post, threshold_k=200.0)
+
+    gen_raw_dav = dav_computer.batch(gen_k_raw)
+    gen_post_dav = dav_computer.batch(gen_k_post)
+
+    gen_raw_eye = eye_contrast_proxy(gen_raw_mean_profiles)
+    gen_post_eye = eye_contrast_proxy(gen_post_mean_profiles)
+
+    gen_raw_features, _ = flatten_features_for_diversity(
+        gen_raw_mean_profiles,
+        gen_raw_psd_profiles,
+        scaler=real_cache.feature_scaler,
+    )
+    gen_post_features, _ = flatten_features_for_diversity(
+        gen_post_mean_profiles,
+        gen_post_psd_profiles,
+        scaler=real_cache.feature_scaler,
+    )
+
+    feature_gamma_raw = _median_heuristic_gamma(real_cache.real_features, gen_raw_features)
+    feature_gamma_post = _median_heuristic_gamma(real_cache.real_features, gen_post_features)
+
+    gen_raw_exceed_below = np.mean(gen_k_raw < bt_min_k, axis=(1, 2)).astype(np.float32)
+    gen_raw_exceed_above = np.mean(gen_k_raw > bt_max_k, axis=(1, 2)).astype(np.float32)
+    gen_raw_exceed_total = gen_raw_exceed_below + gen_raw_exceed_above
+
+    return ClassMetricCache(
+        bins=bins,
+        real_hist_counts=real_cache.real_hist_counts,
+        gen_raw_hist_counts=gen_raw_hist_counts,
+        gen_post_hist_counts=gen_post_hist_counts,
+        real_mean_profiles=real_cache.real_mean_profiles,
+        real_azstd_profiles=real_cache.real_azstd_profiles,
+        gen_raw_mean_profiles=gen_raw_mean_profiles,
+        gen_raw_azstd_profiles=gen_raw_azstd_profiles,
+        gen_post_mean_profiles=gen_post_mean_profiles,
+        gen_post_azstd_profiles=gen_post_azstd_profiles,
+        real_psd_profiles=real_cache.real_psd_profiles,
+        gen_raw_psd_profiles=gen_raw_psd_profiles,
+        gen_post_psd_profiles=gen_post_psd_profiles,
+        real_cold=real_cache.real_cold,
+        gen_raw_cold=gen_raw_cold,
+        gen_post_cold=gen_post_cold,
+        real_dav=real_cache.real_dav,
+        gen_raw_dav=gen_raw_dav,
+        gen_post_dav=gen_post_dav,
+        real_eye=real_cache.real_eye,
+        gen_raw_eye=gen_raw_eye,
+        gen_post_eye=gen_post_eye,
+        real_features=real_cache.real_features,
+        gen_raw_features=gen_raw_features,
+        gen_post_features=gen_post_features,
+        feature_scaler=real_cache.feature_scaler,
+        feature_gamma_raw=feature_gamma_raw,
+        feature_gamma_post=feature_gamma_post,
+        real_pixel_mean=real_cache.real_pixel_mean,
+        gen_raw_pixel_mean=gen_k_raw.mean(axis=(1, 2)).astype(np.float32),
+        gen_post_pixel_mean=gen_k_post.mean(axis=(1, 2)).astype(np.float32),
+        gen_raw_exceed_below=gen_raw_exceed_below,
+        gen_raw_exceed_above=gen_raw_exceed_above,
+        gen_raw_exceed_total=gen_raw_exceed_total,
+        pixel_stats_real=real_cache.pixel_stats_real,
         pixel_stats_gen_raw=summary_stats(gen_k_raw.reshape(-1)),
         pixel_stats_gen_post=summary_stats(gen_k_post.reshape(-1)),
         gen_exceedance_rate={
@@ -1491,6 +1611,50 @@ def _parse_evaluator_fd_negative_control_names(raw: Any) -> list[str]:
     return out
 
 
+def _parse_metric_normalization_control_names(raw: Any) -> list[str]:
+    aliases = {
+        "gaussian_blur": "gaussian_blur",
+        "blur": "gaussian_blur",
+        "gaussian": "gaussian_blur",
+        "pixel_shuffle": "pixel_shuffle",
+        "shuffle": "pixel_shuffle",
+        "pixel_shuffled_real": "pixel_shuffle",
+        "bt_warm_shift": "bt_warm_shift",
+        "warm_shift": "bt_warm_shift",
+        "temperature_shift": "bt_warm_shift",
+        "center_jitter": "center_jitter",
+        "jitter": "center_jitter",
+        "mode_collapse": "mode_collapse",
+        "collapse": "mode_collapse",
+    }
+    if raw is None:
+        items: list[str] = []
+    elif isinstance(raw, str):
+        items = [part.strip() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple)):
+        items = [str(part).strip() for part in raw if str(part).strip()]
+    else:
+        raise ValueError(
+            "evaluation.metric_normalization.controls must be a string or list of strings, "
+            f"got {type(raw).__name__}."
+        )
+
+    out: list[str] = []
+    seen = set()
+    for item in items:
+        key = str(item).strip().lower()
+        if key not in aliases:
+            raise ValueError(
+                "Unsupported metric-normalization control "
+                f"{item!r}; expected one of {sorted(METRIC_NORMALIZATION_CONTROL_NAMES)}."
+            )
+        name = aliases[key]
+        if name not in seen:
+            out.append(name)
+            seen.add(name)
+    return out
+
+
 def _sample_real_images_for_negative_control(
     real_k: np.ndarray,
     *,
@@ -1613,6 +1777,344 @@ def _apply_shared_pixel_shuffle_bt_k(
         )
     shuffled = flat[:, perm]
     return np.asarray(shuffled.reshape(arr.shape), dtype=np.float32)
+
+
+def _apply_bt_warm_shift_bt_k(
+    bt_k: np.ndarray,
+    *,
+    shift_k: float,
+) -> np.ndarray:
+    arr = np.asarray(bt_k, dtype=np.float32)
+    return np.asarray(arr + float(shift_k), dtype=np.float32)
+
+
+def _apply_center_jitter_bt_k(
+    bt_k: np.ndarray,
+    *,
+    max_shift_px: int,
+    seed: int,
+) -> np.ndarray:
+    arr = np.asarray(bt_k, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim != 3:
+        raise ValueError(
+            "Expected BT array shaped [N,H,W] or [H,W] for center-jitter control, "
+            f"got {arr.shape}."
+        )
+
+    max_shift = int(max(0, max_shift_px))
+    if max_shift == 0:
+        return np.asarray(arr, dtype=np.float32).copy()
+
+    rng = np.random.default_rng(int(seed))
+    out = np.empty_like(arr, dtype=np.float32)
+    h, w = int(arr.shape[1]), int(arr.shape[2])
+    for i in range(arr.shape[0]):
+        dy = int(rng.integers(-max_shift, max_shift + 1))
+        dx = int(rng.integers(-max_shift, max_shift + 1))
+        if dy == 0 and dx == 0:
+            dy = max_shift
+        padded = np.pad(arr[i], ((max_shift, max_shift), (max_shift, max_shift)), mode="edge")
+        y0 = max_shift - dy
+        x0 = max_shift - dx
+        out[i] = padded[y0:y0 + h, x0:x0 + w]
+    return out
+
+
+def _apply_mode_collapse_bt_k(
+    bt_k: np.ndarray,
+    *,
+    seed: int,
+) -> np.ndarray:
+    arr = np.asarray(bt_k, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim != 3:
+        raise ValueError(
+            "Expected BT array shaped [N,H,W] or [H,W] for mode-collapse control, "
+            f"got {arr.shape}."
+        )
+    if arr.shape[0] <= 0:
+        raise ValueError("Cannot build mode-collapse control from an empty image set.")
+    rng = np.random.default_rng(int(seed))
+    idx = int(rng.integers(arr.shape[0]))
+    return np.repeat(arr[idx:idx + 1], arr.shape[0], axis=0).astype(np.float32, copy=False)
+
+
+def _build_metric_normalization_control_bt_k(
+    control_name: str,
+    source_k: np.ndarray,
+    *,
+    seed: int,
+    gaussian_sigma_px: float,
+    gaussian_kernel_size: int,
+    bt_warm_shift_k: float,
+    center_jitter_max_px: int,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    name = str(control_name)
+    if name == "gaussian_blur":
+        return _apply_gaussian_blur_bt_k(
+            source_k,
+            sigma_px=gaussian_sigma_px,
+            kernel_size=gaussian_kernel_size,
+        ), {
+            "name": "gaussian_blur",
+            "sigma_px": float(gaussian_sigma_px),
+            "kernel_size": int(gaussian_kernel_size),
+        }
+    if name == "pixel_shuffle":
+        permutation = _build_shared_pixel_shuffle_permutation(
+            image_shape=(int(source_k.shape[1]), int(source_k.shape[2])),
+            seed=int(seed),
+        )
+        return _apply_shared_pixel_shuffle_bt_k(source_k, permutation=permutation), {
+            "name": "pixel_shuffle",
+            "permutation": "shared_flattened_pixel_permutation",
+            "seed": int(seed),
+        }
+    if name == "bt_warm_shift":
+        return _apply_bt_warm_shift_bt_k(source_k, shift_k=bt_warm_shift_k), {
+            "name": "bt_warm_shift",
+            "shift_k": float(bt_warm_shift_k),
+        }
+    if name == "center_jitter":
+        return _apply_center_jitter_bt_k(
+            source_k,
+            max_shift_px=int(center_jitter_max_px),
+            seed=int(seed),
+        ), {
+            "name": "center_jitter",
+            "max_shift_px": int(center_jitter_max_px),
+            "seed": int(seed),
+            "padding": "edge",
+        }
+    if name == "mode_collapse":
+        return _apply_mode_collapse_bt_k(source_k, seed=int(seed)), {
+            "name": "mode_collapse",
+            "selection": "one sampled same-class real image repeated to generated count",
+            "seed": int(seed),
+        }
+    raise ValueError(f"Unsupported metric-normalization control: {control_name!r}")
+
+
+def _diversity_closeness_from_ratio(ratio: float | None) -> float | None:
+    if ratio is None:
+        return None
+    ratio = float(ratio)
+    if ratio <= 0.0 or not np.isfinite(ratio):
+        return 0.0
+    return float(np.exp(-abs(np.log(ratio))))
+
+
+def _class_radial_profile_mae(cache: ClassMetricCache) -> float:
+    real_mean = np.asarray(cache.real_mean_profiles, dtype=np.float64).mean(axis=0)
+    gen_mean = np.asarray(cache.gen_raw_mean_profiles, dtype=np.float64).mean(axis=0)
+    return float(np.mean(np.abs(real_mean - gen_mean)))
+
+
+def _compute_class_normalization_scalar_summary(cache: ClassMetricCache) -> Dict[str, float]:
+    rh = _hist_density_from_counts(cache.real_hist_counts)
+    gh = _hist_density_from_counts(cache.gen_raw_hist_counts)
+
+    real_psd = np.asarray(cache.real_psd_profiles, dtype=np.float64)
+    gen_psd = np.asarray(cache.gen_raw_psd_profiles, dtype=np.float64)
+    real_cold = np.asarray(cache.real_cold, dtype=np.float64)
+    gen_cold = np.asarray(cache.gen_raw_cold, dtype=np.float64)
+    real_dav = np.asarray(cache.real_dav, dtype=np.float64)
+    gen_dav = np.asarray(cache.gen_raw_dav, dtype=np.float64)
+    real_eye = np.asarray(cache.real_eye, dtype=np.float64)
+    gen_eye = np.asarray(cache.gen_raw_eye, dtype=np.float64)
+
+    return {
+        "pixel_hist_js": float(js_divergence(rh, gh)),
+        "pixel_hist_w1": float(wasserstein1_from_hist(rh, gh, bin_edges=cache.bins)),
+        "cold_cloud_fraction_200K_abs_gap": float(abs(real_cold.mean() - gen_cold.mean())),
+        "dav_abs_gap_deg2": float(abs(real_dav.mean() - gen_dav.mean())),
+        "eye_contrast_proxy_abs_gap": float(abs(real_eye.mean() - gen_eye.mean())),
+        "psd_l2": float(((real_psd.mean(axis=0) - gen_psd.mean(axis=0)) ** 2).mean()),
+        "radial_profile_mae_k": _class_radial_profile_mae(cache),
+        "gen_exceedance_rate_total": float(cache.gen_raw_exceed_total.mean()),
+    }
+
+
+def _compute_control_aggregate_primary_raw(class_caches: Dict[int, ClassMetricCache]) -> Dict[str, float]:
+    if not class_caches:
+        return {}
+    class_scalars = [
+        _compute_class_normalization_scalar_summary(cache)
+        for _c, cache in sorted(class_caches.items())
+    ]
+    keys = sorted({key for scalars in class_scalars for key in scalars.keys()})
+    return {
+        key: float(np.mean([scalars[key] for scalars in class_scalars if key in scalars]))
+        for key in keys
+    }
+
+
+def _compute_real_vs_real_class_summary(
+    cache: ClassMetricCache,
+    *,
+    left_idx: np.ndarray,
+    right_idx: np.ndarray,
+) -> Dict[str, float]:
+    left_hist = _select_rows(cache.real_hist_counts, left_idx)
+    right_hist = _select_rows(cache.real_hist_counts, right_idx)
+    left_mass = _hist_density_from_counts(left_hist)
+    right_mass = _hist_density_from_counts(right_hist)
+
+    left_radial = _select_rows(cache.real_mean_profiles, left_idx)
+    right_radial = _select_rows(cache.real_mean_profiles, right_idx)
+    left_psd = _select_rows(cache.real_psd_profiles, left_idx)
+    right_psd = _select_rows(cache.real_psd_profiles, right_idx)
+    left_cold = _select_rows(cache.real_cold, left_idx)
+    right_cold = _select_rows(cache.real_cold, right_idx)
+    left_dav = _select_rows(cache.real_dav, left_idx)
+    right_dav = _select_rows(cache.real_dav, right_idx)
+    left_eye = _select_rows(cache.real_eye, left_idx)
+    right_eye = _select_rows(cache.real_eye, right_idx)
+
+    return {
+        "pixel_hist_js": float(js_divergence(left_mass, right_mass)),
+        "pixel_hist_w1": float(wasserstein1_from_hist(left_mass, right_mass, bin_edges=cache.bins)),
+        "cold_cloud_fraction_200K_abs_gap": float(abs(left_cold.mean() - right_cold.mean())),
+        "dav_abs_gap_deg2": float(abs(left_dav.mean() - right_dav.mean())),
+        "eye_contrast_proxy_abs_gap": float(abs(left_eye.mean() - right_eye.mean())),
+        "psd_l2": float(((left_psd.mean(axis=0) - right_psd.mean(axis=0)) ** 2).mean()),
+        "radial_profile_mae_k": float(
+            np.mean(np.abs(left_radial.mean(axis=0) - right_radial.mean(axis=0)))
+        ),
+        "gen_exceedance_rate_total": 0.0,
+    }
+
+
+def _compute_real_vs_real_primary_reference(
+    *,
+    class_caches: Dict[int, ClassMetricCache],
+    reps: int,
+    seed: int,
+) -> Dict[str, Any]:
+    reps = int(reps)
+    if reps <= 0 or not class_caches:
+        return {"enabled": False, "reason": "real_reference_reps <= 0 or no class caches"}
+
+    rng = np.random.default_rng(int(seed))
+    samples_by_key: Dict[str, list[float]] = {}
+    class_ids = sorted(int(c) for c in class_caches.keys())
+    for _ in range(reps):
+        per_class: Dict[int, Dict[str, float]] = {}
+        for class_id in class_ids:
+            cache = class_caches[class_id]
+            real_n = int(cache.real_hist_counts.shape[0])
+            other_n = int(cache.gen_raw_hist_counts.shape[0])
+            if real_n <= 0 or other_n <= 0:
+                continue
+            left_idx = rng.integers(real_n, size=real_n)
+            right_idx = rng.integers(real_n, size=other_n)
+            per_class[class_id] = _compute_real_vs_real_class_summary(
+                cache,
+                left_idx=left_idx,
+                right_idx=right_idx,
+            )
+        if not per_class:
+            continue
+        keys = sorted({key for vals in per_class.values() for key in vals.keys()})
+        for key in keys:
+            values = [vals[key] for vals in per_class.values() if key in vals]
+            if values:
+                samples_by_key.setdefault(key, []).append(float(np.mean(values)))
+
+    if not samples_by_key:
+        return {"enabled": False, "reason": "no valid real-vs-real samples"}
+
+    summary = {
+        key: _summarize_numeric_distribution(np.asarray(values, dtype=np.float64))
+        for key, values in sorted(samples_by_key.items())
+    }
+    values = {key: float(node["q50"]) for key, node in summary.items()}
+    return {
+        "enabled": True,
+        "variant": "matched_count_bootstrap_real_vs_real",
+        "draw_mode": "with_replacement",
+        "reps": int(reps),
+        "seed": int(seed),
+        "values": values,
+        "summary": summary,
+    }
+
+
+def _add_distributional_values_to_aggregate(
+    aggregate: Dict[str, float],
+    distributional_summary: Dict[str, Any] | None,
+) -> None:
+    if not isinstance(distributional_summary, dict):
+        return
+    dist_macro = distributional_summary.get("macro", {})
+    if not isinstance(dist_macro, dict):
+        return
+    coverage_node = dist_macro.get("coverage", {})
+    diversity_node = dist_macro.get("diversity", {})
+    memorization_node = dist_macro.get("nearest_train_memorization", {})
+    if isinstance(coverage_node, dict) and coverage_node.get("value") is not None:
+        aggregate["evaluator_embedding_coverage"] = float(coverage_node["value"])
+    if isinstance(diversity_node, dict) and diversity_node.get("generated_over_real") is not None:
+        ratio = float(diversity_node["generated_over_real"])
+        aggregate["evaluator_embedding_diversity_ratio"] = ratio
+        closeness = _diversity_closeness_from_ratio(ratio)
+        if closeness is not None:
+            aggregate["evaluator_embedding_diversity_closeness"] = float(closeness)
+    if (
+        isinstance(memorization_node, dict)
+        and memorization_node.get("q01_generated_to_train_nn") is not None
+    ):
+        aggregate["nearest_train_q01_distance"] = float(
+            memorization_node["q01_generated_to_train_nn"]
+        )
+
+
+def _compute_real_to_train_memorization_reference(
+    *,
+    real_embeddings_by_class: Dict[int, np.ndarray],
+    train_embeddings_by_class: Dict[int, np.ndarray] | None,
+    distance_block_size: int,
+) -> Dict[str, Any] | None:
+    if train_embeddings_by_class is None:
+        return None
+    per_class: Dict[int, Dict[str, Any]] = {}
+    for class_id, real in sorted(real_embeddings_by_class.items()):
+        if class_id not in train_embeddings_by_class:
+            continue
+        train = np.asarray(train_embeddings_by_class[class_id], dtype=np.float32)
+        real = np.asarray(real, dtype=np.float32)
+        if real.shape[0] <= 0 or train.shape[0] <= 0:
+            continue
+        distances = nearest_neighbor_distances(real, train, block_size=int(distance_block_size))
+        per_class[int(class_id)] = {
+            "real_reference_count": int(real.shape[0]),
+            "train_reference_count": int(train.shape[0]),
+            "real_to_train_nn": summarize_distances(distances),
+        }
+    if not per_class:
+        return None
+
+    macro_weights = {c: 1.0 / float(len(per_class)) for c in per_class}
+    macro = {
+        "mean_real_to_train_nn": _weighted_mean_from_per_class(
+            per_class, ("real_to_train_nn", "mean"), macro_weights
+        ),
+        "q01_real_to_train_nn": _weighted_mean_from_per_class(
+            per_class, ("real_to_train_nn", "q01"), macro_weights
+        ),
+        "min_real_to_train_nn": _weighted_mean_from_per_class(
+            per_class, ("real_to_train_nn", "min"), macro_weights
+        ),
+    }
+    return {
+        "variant": "heldout_real_to_same_class_train_nearest_neighbor",
+        "distance": "euclidean",
+        "macro": macro,
+        "per_class": {str(c): per_class[c] for c in sorted(per_class)},
+    }
 
 
 def _compute_evaluator_fd(
@@ -2372,6 +2874,51 @@ class TCEvaluator:
                 f"must be a positive odd integer, got {negative_controls_blur_kernel_size}"
             )
 
+        metric_norm_cfg = dict(ev.get("metric_normalization", {}))
+        metric_norm_enabled, metric_norm_enable_mode = _resolve_auto_bool(
+            metric_norm_cfg.get("enabled", "auto"),
+            auto_value=bool(split == "test" and full_test and using_cached_generations),
+            field_name="evaluation.metric_normalization.enabled",
+        )
+        metric_norm_control_names = _parse_metric_normalization_control_names(
+            metric_norm_cfg.get("controls", list(METRIC_NORMALIZATION_CONTROL_NAMES))
+        )
+        metric_norm_seed = int(metric_norm_cfg.get("seed", ev["seed"]))
+        metric_norm_match_generated_counts = bool(metric_norm_cfg.get("match_generated_counts", True))
+        metric_norm_reference_reps = int(metric_norm_cfg.get("real_reference_reps", 200))
+        if metric_norm_reference_reps < 0:
+            raise ValueError(
+                "evaluation.metric_normalization.real_reference_reps must be >= 0, "
+                f"got {metric_norm_reference_reps}"
+            )
+        metric_norm_bad_anchor_aggregation = str(
+            metric_norm_cfg.get("bad_anchor_aggregation", "mean")
+        ).strip().lower()
+        if metric_norm_bad_anchor_aggregation != "mean":
+            raise ValueError(
+                "evaluation.metric_normalization.bad_anchor_aggregation currently supports only "
+                f"'mean', got {metric_norm_bad_anchor_aggregation!r}."
+            )
+        metric_norm_blur_sigma = float(metric_norm_cfg.get("gaussian_blur_sigma_px", 6.0))
+        metric_norm_blur_kernel_size = int(metric_norm_cfg.get("gaussian_blur_kernel_size", 25))
+        metric_norm_bt_warm_shift_k = float(metric_norm_cfg.get("bt_warm_shift_k", 15.0))
+        metric_norm_center_jitter_max_px = int(metric_norm_cfg.get("center_jitter_max_px", 24))
+        if metric_norm_blur_sigma <= 0.0:
+            raise ValueError(
+                "evaluation.metric_normalization.gaussian_blur_sigma_px must be > 0, "
+                f"got {metric_norm_blur_sigma}"
+            )
+        if metric_norm_blur_kernel_size <= 0 or (metric_norm_blur_kernel_size % 2) != 1:
+            raise ValueError(
+                "evaluation.metric_normalization.gaussian_blur_kernel_size must be a positive odd integer, "
+                f"got {metric_norm_blur_kernel_size}"
+            )
+        if metric_norm_center_jitter_max_px < 0:
+            raise ValueError(
+                "evaluation.metric_normalization.center_jitter_max_px must be >= 0, "
+                f"got {metric_norm_center_jitter_max_px}"
+            )
+
         tf.random.set_seed(ev["seed"])
         np.random.seed(ev["seed"])
 
@@ -2417,6 +2964,29 @@ class TCEvaluator:
             "memorization_train_seed": int(memorization_train_seed),
             "memorization_pairs_per_class": int(memorization_pairs_per_class),
         }
+        metric_normalization_report: Dict[str, Any] = {
+            "enabled": bool(metric_norm_enabled),
+            "enable_mode": str(metric_norm_enable_mode),
+            "configured_enabled": metric_norm_cfg.get("enabled", "auto"),
+            "schema": "tc_diffusion.metric_normalization.v1",
+            "controls_requested": list(metric_norm_control_names),
+            "source": "corrupted_real_reference_images",
+            "match_generated_counts": bool(metric_norm_match_generated_counts),
+            "seed": int(metric_norm_seed),
+            "real_reference_reps": int(metric_norm_reference_reps),
+            "bad_anchor_aggregation": str(metric_norm_bad_anchor_aggregation),
+        }
+        if not metric_norm_enabled:
+            metric_normalization_report["reason"] = (
+                (
+                    "auto-disabled; default policy only enables normalization controls for cached-bank "
+                    "full-test evals"
+                    if metric_norm_enable_mode == "auto"
+                    else "disabled by configuration"
+                )
+            )
+        elif not metric_norm_control_names:
+            metric_normalization_report["reason"] = "no metric-normalization controls requested"
         feature_extractor: EvaluatorEmbeddingExtractor | None = None
         if evaluator_fd_enabled or distributional_enabled:
             try:
@@ -2519,7 +3089,13 @@ class TCEvaluator:
             and negative_controls_enabled
             and negative_control_names
         )
-        summary_tasks_per_class = 2 + int(feature_extractor is not None) + int(negative_controls_active)
+        metric_norm_controls_active = bool(metric_norm_enabled and metric_norm_control_names)
+        summary_tasks_per_class = (
+            2
+            + int(feature_extractor is not None)
+            + int(negative_controls_active)
+            + len(metric_norm_control_names) * int(metric_norm_controls_active)
+        )
         summary_total_tasks = summary_tasks_per_class * len(valid_class_ids)
         stage_names = []
         if not using_cached_generations:
@@ -2698,6 +3274,14 @@ class TCEvaluator:
             name: {} for name in negative_control_names
         } if negative_controls_active else {}
         negative_control_source_sampling_by_class: Dict[int, Dict[str, Any]] = {}
+        metric_control_caches: Dict[str, Dict[int, ClassMetricCache]] = {
+            name: {} for name in metric_norm_control_names
+        } if metric_norm_controls_active else {}
+        metric_control_evaluator_embeddings: Dict[str, Dict[int, np.ndarray]] = {
+            name: {} for name in metric_norm_control_names
+        } if metric_norm_controls_active and feature_extractor is not None else {}
+        metric_control_source_sampling_by_class: Dict[int, Dict[str, Any]] = {}
+        metric_control_transformations: Dict[str, Dict[str, Any]] = {}
         pixel_shuffle_permutation: np.ndarray | None = None
         summary_pbar = None
         if show_progress and valid_class_ids:
@@ -2750,6 +3334,45 @@ class TCEvaluator:
                 bt_min_k=bt_min_k,
                 bt_max_k=bt_max_k,
             )
+            if metric_norm_controls_active:
+                draw_n = (
+                    int(gen_k_raw.shape[0])
+                    if metric_norm_match_generated_counts
+                    else int(real_k.shape[0])
+                )
+                class_rng = np.random.default_rng(int(metric_norm_seed + 104729 * (c + 1)))
+                control_source_k, source_meta = _sample_real_images_for_negative_control(
+                    real_k,
+                    draw_n=draw_n,
+                    rng=class_rng,
+                )
+                metric_control_source_sampling_by_class[c] = source_meta
+                for control_idx, control_name in enumerate(metric_norm_control_names):
+                    control_seed = int(metric_norm_seed + 1009 * (control_idx + 1) + 104729 * (c + 1))
+                    control_k, transformation = _build_metric_normalization_control_bt_k(
+                        control_name,
+                        control_source_k,
+                        seed=control_seed,
+                        gaussian_sigma_px=metric_norm_blur_sigma,
+                        gaussian_kernel_size=metric_norm_blur_kernel_size,
+                        bt_warm_shift_k=metric_norm_bt_warm_shift_k,
+                        center_jitter_max_px=metric_norm_center_jitter_max_px,
+                    )
+                    metric_control_transformations.setdefault(control_name, transformation)
+                    metric_control_caches[control_name][c] = _build_class_metric_cache_from_real_cache(
+                        real_cache=cache,
+                        gen_k_raw=control_k,
+                        binner=binner,
+                        dav_computer=dav_computer,
+                        psd_bins=int(ev["psd_bins"]),
+                        bt_min_k=bt_min_k,
+                        bt_max_k=bt_max_k,
+                    )
+                    if feature_extractor is not None and control_name in metric_control_evaluator_embeddings:
+                        metric_control_evaluator_embeddings[control_name][c] = feature_extractor.encode_bt_k(control_k)
+                    if summary_pbar is not None:
+                        summary_pbar.set_postfix_str(f"norm {control_name} class {c}", refresh=False)
+                        summary_pbar.update(1)
             if feature_extractor is not None:
                 real_evaluator_embeddings[c] = feature_extractor.encode_bt_k(real_k)
                 gen_evaluator_embeddings[c] = feature_extractor.encode_bt_k(gen_k_raw)
@@ -2873,6 +3496,7 @@ class TCEvaluator:
             summary_pbar.close()
 
         evaluator_fd_summary: Dict[str, Any] | None = None
+        evaluator_fd_real_vs_real_reference: Dict[str, Any] | None = None
         if feature_extractor is not None and real_evaluator_embeddings and gen_evaluator_embeddings:
             evaluator_fd_summary = _compute_evaluator_fd(
                 real_embeddings_by_class=real_evaluator_embeddings,
@@ -2881,7 +3505,7 @@ class TCEvaluator:
             )
             evaluator_feature_metric_report.update(evaluator_fd_summary)
             if evaluator_fd_null_reps > 0:
-                evaluator_feature_metric_report["real_vs_real_reference"] = _compute_evaluator_fd_real_vs_real_reference(
+                evaluator_fd_real_vs_real_reference = _compute_evaluator_fd_real_vs_real_reference(
                     real_embeddings_by_class=real_evaluator_embeddings,
                     generated_counts_by_class={
                         int(c): int(arr.shape[0]) for c, arr in gen_evaluator_embeddings.items()
@@ -2891,6 +3515,7 @@ class TCEvaluator:
                     seed=evaluator_fd_null_seed,
                     observed_value=float(evaluator_fd_summary["value"]),
                 )
+                evaluator_feature_metric_report["real_vs_real_reference"] = evaluator_fd_real_vs_real_reference
             if negative_controls_active and negative_control_embeddings:
                 negative_controls_report["controls"] = _compute_evaluator_fd_negative_controls(
                     real_embeddings_by_class=real_evaluator_embeddings,
@@ -2980,27 +3605,146 @@ class TCEvaluator:
             )
 
         aggregate_primary_raw = _compute_aggregate_primary_raw(class_scalars)
+        if class_caches:
+            aggregate_primary_raw["radial_profile_mae_k"] = float(
+                np.mean([_class_radial_profile_mae(cache) for cache in class_caches.values()])
+            )
         if evaluator_fd_summary is not None:
             aggregate_primary_raw["evaluator_fd"] = float(evaluator_fd_summary["value"])
         if distributional_summary is not None:
-            dist_macro = distributional_summary.get("macro", {})
-            if isinstance(dist_macro, dict):
-                coverage_node = dist_macro.get("coverage", {})
-                diversity_node = dist_macro.get("diversity", {})
-                memorization_node = dist_macro.get("nearest_train_memorization", {})
-                if isinstance(coverage_node, dict) and coverage_node.get("value") is not None:
-                    aggregate_primary_raw["evaluator_embedding_coverage"] = float(coverage_node["value"])
-                if isinstance(diversity_node, dict) and diversity_node.get("generated_over_real") is not None:
-                    aggregate_primary_raw["evaluator_embedding_diversity_ratio"] = float(
-                        diversity_node["generated_over_real"]
+            _add_distributional_values_to_aggregate(aggregate_primary_raw, distributional_summary)
+
+        if metric_norm_enabled and class_caches:
+            good_reference = _compute_real_vs_real_primary_reference(
+                class_caches=class_caches,
+                reps=int(metric_norm_reference_reps),
+                seed=int(metric_norm_seed),
+            )
+            good_values = dict(good_reference.get("values", {})) if isinstance(good_reference, dict) else {}
+            if evaluator_fd_summary is not None:
+                if isinstance(evaluator_fd_real_vs_real_reference, dict):
+                    fd_summary = evaluator_fd_real_vs_real_reference.get("summary", {})
+                    if isinstance(fd_summary, dict) and fd_summary.get("q50") is not None:
+                        good_values["evaluator_fd"] = float(fd_summary["q50"])
+                good_values.setdefault("evaluator_fd", 0.0)
+            if distributional_summary is not None:
+                good_values.setdefault("evaluator_embedding_diversity_ratio", 1.0)
+                good_values.setdefault("evaluator_embedding_diversity_closeness", 1.0)
+                good_values.setdefault("evaluator_embedding_coverage", 1.0)
+
+            real_to_train_reference = _compute_real_to_train_memorization_reference(
+                real_embeddings_by_class=real_evaluator_embeddings,
+                train_embeddings_by_class=train_embeddings_by_class,
+                distance_block_size=int(distributional_distance_block_size),
+            )
+            if isinstance(real_to_train_reference, dict):
+                real_to_train_macro = real_to_train_reference.get("macro", {})
+                if isinstance(real_to_train_macro, dict) and real_to_train_macro.get("q01_real_to_train_nn") is not None:
+                    good_values["nearest_train_q01_distance"] = float(real_to_train_macro["q01_real_to_train_nn"])
+
+            controls_out: Dict[str, Any] = {}
+            control_descriptions = {
+                "gaussian_blur": "Real reference images degraded by Gaussian blur.",
+                "pixel_shuffle": "Real reference images with per-image BT histograms preserved but spatial layout shuffled.",
+                "bt_warm_shift": "Real reference images shifted warmer by a fixed Kelvin offset.",
+                "center_jitter": "Real reference images translated away from the assumed storm center.",
+                "mode_collapse": "A single same-class real reference image repeated to the generated count.",
+                "train_copy": "Exact same-class train embeddings used as generated samples for memorization-risk anchoring.",
+            }
+            for control_name in metric_norm_control_names:
+                control_caches = metric_control_caches.get(control_name, {})
+                if not control_caches:
+                    continue
+                control_aggregate = _compute_control_aggregate_primary_raw(control_caches)
+                control_node: Dict[str, Any] = {
+                    "description": control_descriptions.get(control_name, ""),
+                    "source": "corrupted_real_reference_images",
+                    "transformation": metric_control_transformations.get(control_name, {"name": control_name}),
+                    "aggregate_primary_raw": control_aggregate,
+                    "valid_class_ids": [int(c) for c in sorted(control_caches.keys())],
+                }
+                control_embeddings = metric_control_evaluator_embeddings.get(control_name, {})
+                if evaluator_fd_summary is not None and real_evaluator_embeddings and control_embeddings:
+                    control_fd = _compute_evaluator_fd(
+                        real_embeddings_by_class=real_evaluator_embeddings,
+                        gen_embeddings_by_class=control_embeddings,
+                        covariance_eps=evaluator_fd_covariance_eps,
                     )
-                if (
-                    isinstance(memorization_node, dict)
-                    and memorization_node.get("q01_generated_to_train_nn") is not None
-                ):
-                    aggregate_primary_raw["nearest_train_q01_distance"] = float(
-                        memorization_node["q01_generated_to_train_nn"]
+                    control_node["evaluator_fd"] = control_fd
+                    control_aggregate["evaluator_fd"] = float(control_fd["value"])
+                if distributional_summary is not None and real_evaluator_embeddings and control_embeddings:
+                    control_distributional = _compute_embedding_distributional_metrics(
+                        real_embeddings_by_class=real_evaluator_embeddings,
+                        gen_embeddings_by_class=control_embeddings,
+                        train_embeddings_by_class=None,
+                        coverage_k=int(distributional_coverage_k),
+                        distance_block_size=int(distributional_distance_block_size),
                     )
+                    control_node["distributional_feature_metric"] = control_distributional
+                    _add_distributional_values_to_aggregate(control_aggregate, control_distributional)
+                controls_out[control_name] = control_node
+
+            if train_embeddings_by_class is not None:
+                controls_out["train_copy"] = {
+                    "description": control_descriptions["train_copy"],
+                    "source": "same_class_train_embeddings",
+                    "applies_to": ["nearest_train_q01_distance"],
+                    "aggregate_primary_raw": {"nearest_train_q01_distance": 0.0},
+                }
+
+            bad_values: Dict[str, float] = {}
+            control_aggregates = {
+                name: node.get("aggregate_primary_raw", {})
+                for name, node in controls_out.items()
+                if isinstance(node, dict)
+            }
+            keys = sorted({
+                key
+                for aggregate in control_aggregates.values()
+                if isinstance(aggregate, dict)
+                for key in aggregate.keys()
+            })
+            for key in keys:
+                if key == "nearest_train_q01_distance" and "train_copy" in control_aggregates:
+                    bad_values[key] = 0.0
+                    continue
+                values = [
+                    float(aggregate[key])
+                    for name, aggregate in control_aggregates.items()
+                    if name != "train_copy"
+                    and isinstance(aggregate, dict)
+                    and aggregate.get(key) is not None
+                    and np.isfinite(float(aggregate[key]))
+                ]
+                if values:
+                    bad_values[key] = float(np.mean(values))
+
+            metric_normalization_report.update(
+                {
+                    "enabled": True,
+                    "good_reference": {
+                        "description": (
+                            "Finite-sample real-vs-real reference for unbounded physical distances; "
+                            "ideal bounded references for diversity/coverage when needed."
+                        ),
+                        "values": good_values,
+                        "physical_real_vs_real": good_reference,
+                        "evaluator_fd_real_vs_real": evaluator_fd_real_vs_real_reference,
+                        "real_to_train_memorization": real_to_train_reference,
+                    },
+                    "negative_controls": {
+                        "controls": controls_out,
+                        "source_sampling_by_class": {
+                            str(c): dict(meta)
+                            for c, meta in sorted(metric_control_source_sampling_by_class.items())
+                        },
+                    },
+                    "bad_anchor": {
+                        "aggregation": str(metric_norm_bad_anchor_aggregation),
+                        "values": bad_values,
+                    },
+                }
+            )
         macro = _compute_macro_metrics(class_scalars)
         if show_progress and bootstrap_reps > 0:
             bootstrap_stage_idx, stage_total = stage_lookup["bootstrap"]
@@ -3165,6 +3909,7 @@ class TCEvaluator:
             "aggregate_primary_raw_ci": aggregate_primary_raw_ci,
             "evaluator_feature_metric": evaluator_feature_metric_report,
             "distributional_feature_metric": distributional_metric_report,
+            "metric_normalization": metric_normalization_report,
             "macro": macro,
             "macro_ci": macro_ci,
             "per_class": per_class_metrics,

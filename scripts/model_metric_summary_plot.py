@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import matplotlib
 
@@ -54,6 +59,23 @@ METRICS = [
     MetricSpec("memorization_q01", "Train NN q01", "memorization", "higher_relative", "{:.3f}", radar=False),
 ]
 
+NORMALIZATION_ANCHOR_KEYS = {
+    "hist_w1_k": "pixel_hist_w1",
+    "dav_gap_deg2": "dav_abs_gap_deg2",
+    "radial_mae_k": "radial_profile_mae_k",
+    "cold_gap_pct": "cold_cloud_fraction_200K_abs_gap",
+    "psd_l2": "psd_l2",
+    "eye_gap_k": "eye_contrast_proxy_abs_gap",
+    "evaluator_fd": "evaluator_fd",
+    "diversity_closeness": "evaluator_embedding_diversity_closeness",
+    "coverage": "evaluator_embedding_coverage",
+    "memorization_q01": "nearest_train_q01_distance",
+}
+
+NORMALIZATION_ANCHOR_SCALES = {
+    "cold_gap_pct": 100.0,
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -83,6 +105,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="TC Diffusion Model Metric Summary",
         help="Figure title.",
+    )
+    parser.add_argument(
+        "--normalization-anchors",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON artifact from scripts/compute_metric_normalization_anchors.py. "
+            "When provided, spider scores are normalized against this fixed good/bad range."
+        ),
     )
     return parser.parse_args()
 
@@ -168,6 +199,20 @@ def _load_json(path: Path) -> Dict[str, Any]:
     return payload
 
 
+def _load_normalization_anchor_report(path: Path) -> Dict[str, Any]:
+    payload = _load_json(path)
+    norm = payload.get("metric_normalization", payload)
+    if not isinstance(norm, dict):
+        raise ValueError(f"Expected {path} to contain a metric_normalization object.")
+    good = _nested_get(norm, ("good_reference", "values"), {})
+    bad = _nested_get(norm, ("bad_anchor", "values"), {})
+    if not isinstance(good, dict) or not isinstance(bad, dict):
+        raise ValueError(
+            f"{path} is missing good_reference.values or bad_anchor.values."
+        )
+    return norm
+
+
 def _nested_get(node: Dict[str, Any], path: tuple[str, ...], default: Any = None) -> Any:
     cur: Any = node
     for key in path:
@@ -245,10 +290,15 @@ def _extract_metrics(metrics_path: Path) -> tuple[Dict[str, float], Dict[str, An
         )
         raise ValueError(" ".join(hint_parts))
 
+    radial_mae = (
+        float(agg["radial_profile_mae_k"])
+        if "radial_profile_mae_k" in agg
+        else _load_radial_mae(metrics_path, report)
+    )
     values = {
         "hist_w1_k": float(agg["pixel_hist_w1"]),
         "dav_gap_deg2": float(agg["dav_abs_gap_deg2"]),
-        "radial_mae_k": _load_radial_mae(metrics_path, report),
+        "radial_mae_k": radial_mae,
         "cold_gap_pct": 100.0 * float(agg["cold_cloud_fraction_200K_abs_gap"]),
         "psd_l2": float(agg["psd_l2"]),
         "eye_gap_k": float(agg["eye_contrast_proxy_abs_gap"]),
@@ -262,6 +312,7 @@ def _extract_metrics(metrics_path: Path) -> tuple[Dict[str, float], Dict[str, An
     meta = {
         "metrics_path": str(metrics_path),
         "fd_bad_anchor": _fd_bad_anchor(report),
+        "metric_normalization": report.get("metric_normalization", {}),
         "diversity_ratio": float(agg["evaluator_embedding_diversity_ratio"]),
         "memorization_mean": _nested_get(
             dist,
@@ -271,15 +322,76 @@ def _extract_metrics(metrics_path: Path) -> tuple[Dict[str, float], Dict[str, An
     return values, meta
 
 
+def _normalization_anchor_value(
+    norm: Dict[str, Any],
+    spec: MetricSpec,
+    *,
+    kind: str,
+) -> float | None:
+    anchor_key = NORMALIZATION_ANCHOR_KEYS.get(spec.key)
+    if not anchor_key:
+        return None
+    if not isinstance(norm, dict) or norm.get("enabled", True) is False:
+        return None
+    if kind == "good":
+        values = _nested_get(norm, ("good_reference", "values"), {})
+    elif kind == "bad":
+        values = _nested_get(norm, ("bad_anchor", "values"), {})
+    else:
+        raise ValueError(f"Unsupported normalization anchor kind: {kind!r}")
+    if not isinstance(values, dict) or values.get(anchor_key) is None:
+        return None
+    value = float(values[anchor_key])
+    scale = float(NORMALIZATION_ANCHOR_SCALES.get(spec.key, 1.0))
+    return value * scale
+
+
+def _shared_normalization_anchors(
+    spec: MetricSpec,
+    meta_by_label: Dict[str, Dict[str, Any]],
+    external_normalization: Dict[str, Any] | None = None,
+) -> tuple[float, float] | None:
+    if external_normalization is not None:
+        good = _normalization_anchor_value(external_normalization, spec, kind="good")
+        bad = _normalization_anchor_value(external_normalization, spec, kind="bad")
+        if good is not None and bad is not None and np.isfinite(good) and np.isfinite(bad):
+            return float(good), float(bad)
+        return None
+
+    good_values = []
+    bad_values = []
+    for meta in meta_by_label.values():
+        norm = meta.get("metric_normalization")
+        if not isinstance(norm, dict):
+            continue
+        good = _normalization_anchor_value(norm, spec, kind="good")
+        bad = _normalization_anchor_value(norm, spec, kind="bad")
+        if good is not None and bad is not None and np.isfinite(good) and np.isfinite(bad):
+            good_values.append(float(good))
+            bad_values.append(float(bad))
+    if not good_values or not bad_values:
+        return None
+    return float(np.mean(good_values)), float(np.mean(bad_values))
+
+
 def _score_metric(
     *,
     spec: MetricSpec,
     value: float,
     all_values: np.ndarray,
     fd_bad_anchor: float | None,
+    normalization_anchors: tuple[float, float] | None = None,
 ) -> float:
     value = float(value)
     all_values = np.asarray(all_values, dtype=np.float64)
+    if normalization_anchors is not None:
+        good, bad = normalization_anchors
+        if np.isfinite(good) and np.isfinite(bad) and abs(float(bad) - float(good)) > 1.0e-12:
+            if spec.direction.startswith("lower") and bad > good:
+                return float(np.clip((bad - value) / (bad - good), 0.0, 1.0))
+            if spec.direction.startswith("higher") and good > bad:
+                return float(np.clip((value - bad) / (good - bad), 0.0, 1.0))
+
     if spec.direction == "higher":
         if spec.key in {"coverage", "diversity_closeness"}:
             return float(np.clip(value, 0.0, 1.0))
@@ -302,6 +414,7 @@ def _score_metric(
 def _build_score_matrix(
     values_by_label: Dict[str, Dict[str, float]],
     meta_by_label: Dict[str, Dict[str, Any]],
+    external_normalization: Dict[str, Any] | None = None,
 ) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {label: {} for label in values_by_label}
     for spec in METRICS:
@@ -318,12 +431,18 @@ def _build_score_matrix(
             ]
             if anchors:
                 shared_fd_anchor = float(np.mean(anchors))
+        shared_normalization_anchors = _shared_normalization_anchors(
+            spec,
+            meta_by_label,
+            external_normalization=external_normalization,
+        )
         for label in values_by_label:
             out[label][spec.key] = _score_metric(
                 spec=spec,
                 value=values_by_label[label][spec.key],
                 all_values=all_values,
                 fd_bad_anchor=shared_fd_anchor,
+                normalization_anchors=shared_normalization_anchors,
             )
     return out
 
@@ -341,6 +460,7 @@ def _plot_summary(
     meta_by_label: Dict[str, Dict[str, Any]],
     output_path: Path,
     title: str,
+    normalization_note: str,
 ) -> None:
     labels = list(values_by_label.keys())
     cmap = plt.get_cmap("tab20")
@@ -466,9 +586,8 @@ def _plot_summary(
         0.01,
         0.01,
         (
-            "Normalization: lower-is-better metrics use best/value unless an empirical FD bad-control anchor is "
-            "available; coverage and diversity-match are already bounded in [0,1]; train NN q01 is relative "
-            "and should be read as memorization-risk context, not model quality."
+            f"Normalization: {normalization_note} "
+            "Train NN q01 remains memorization-risk context, not model quality."
         ),
         ha="left",
         va="bottom",
@@ -497,7 +616,32 @@ def main() -> None:
         values_by_label[spec.label] = values
         meta_by_label[spec.label] = meta
 
-    scores_by_label = _build_score_matrix(values_by_label, meta_by_label)
+    external_normalization = None
+    normalization_note = (
+        "scores use per-report metrics.json anchors when available; older reports fall back to "
+        "relative plotted-model scaling."
+    )
+    if args.normalization_anchors:
+        anchor_path = Path(args.normalization_anchors)
+        if not anchor_path.is_absolute():
+            anchor_path = repo / anchor_path
+        if not anchor_path.exists():
+            raise FileNotFoundError(f"Normalization anchor file not found: {anchor_path}")
+        external_normalization = _load_normalization_anchor_report(anchor_path)
+        try:
+            anchor_label = str(anchor_path.relative_to(repo))
+        except ValueError:
+            anchor_label = str(anchor_path)
+        normalization_note = (
+            f"scores use fixed ranges from {anchor_label}; unavailable metrics fall back to "
+            "relative plotted-model scaling."
+        )
+
+    scores_by_label = _build_score_matrix(
+        values_by_label,
+        meta_by_label,
+        external_normalization=external_normalization,
+    )
     output_path = Path(args.output) if args.output else repo / "outputs" / "paper_ready" / "model_metric_summary.png"
     if not output_path.is_absolute():
         output_path = repo / output_path
@@ -507,6 +651,7 @@ def main() -> None:
         meta_by_label=meta_by_label,
         output_path=output_path,
         title=str(args.title),
+        normalization_note=normalization_note,
     )
     print(f"Wrote model metric summary figure to: {output_path}")
 

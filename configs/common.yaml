@@ -187,3 +187,14 @@ evaluation:
       match_generated_counts: true
       gaussian_blur_sigma_px: 6.0
       gaussian_blur_kernel_size: 25
+  metric_normalization:
+    enabled: false  # prefer scripts/compute_metric_normalization_anchors.py for reusable spider-plot anchors
+    controls: ["gaussian_blur", "pixel_shuffle", "bt_warm_shift", "center_jitter", "mode_collapse"]
+    seed: 123
+    match_generated_counts: true
+    real_reference_reps: 200
+    bad_anchor_aggregation: "mean"
+    gaussian_blur_sigma_px: 6.0
+    gaussian_blur_kernel_size: 25
+    bt_warm_shift_k: 15.0
+    center_jitter_max_px: 24
