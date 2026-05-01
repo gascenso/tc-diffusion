@@ -16,6 +16,16 @@ _VALID_TIMESTEP_SCHEDULES = ("linear", "leading", "trailing")
 _ZERO_TERMINAL_SNR_SUFFIX = "_rescaled_zero_terminal_snr"
 
 
+@tf.custom_gradient
+def _real_to_complex_no_warning(x):
+    y = tf.complex(x, tf.zeros_like(x))
+
+    def grad(dy):
+        return tf.math.real(dy)
+
+    return y, grad
+
+
 def _resolve_beta_schedule_spec(
     name: str,
     *,
@@ -176,6 +186,9 @@ class Diffusion:
                 float(self.sampling_guidance_cfg["radial_weight"]) > 0.0
                 or float(self.sampling_guidance_cfg["dav_weight"]) > 0.0
                 or float(self.sampling_guidance_cfg["hist_weight"]) > 0.0
+                or float(self.sampling_guidance_cfg["cold_weight"]) > 0.0
+                or float(self.sampling_guidance_cfg["eye_weight"]) > 0.0
+                or float(self.sampling_guidance_cfg["psd_weight"]) > 0.0
             )
         )
         self._sampling_guidance_target_bank = None
@@ -357,6 +370,13 @@ class Diffusion:
                 dtype=np.float32,
             )
             self.sg_hist_thresholds_k = tf.constant(hist_edges_k[1:-1], dtype=tf.float32)
+            psd_bin_index, psd_bin_counts = self._build_frequency_radial_bin_lookup(
+                image_size=image_size,
+                psd_bins=int(sg_cfg["psd_bins"]),
+            )
+            self.sg_psd_bins = int(sg_cfg["psd_bins"])
+            self.sg_psd_bin_index = tf.constant(psd_bin_index, dtype=tf.int32)
+            self.sg_psd_bin_counts = tf.constant(psd_bin_counts, dtype=tf.float32)
 
     def _default_wind_from_ss_tensor(self, ss_cat):
         ss_cat = tf.cast(ss_cat, tf.int32)
@@ -473,6 +493,18 @@ class Diffusion:
         radial_bin_counts = np.bincount(radial_bin_index, minlength=radial_bins).astype(np.float32)
         radial_bin_counts = np.maximum(radial_bin_counts, 1.0)
         return radial_bin_index, radial_bin_counts
+
+    def _build_frequency_radial_bin_lookup(self, image_size: int, psd_bins: int):
+        yy, xx = np.mgrid[0:image_size, 0:image_size]
+        cy = (image_size - 1) / 2.0
+        cx = (image_size - 1) / 2.0
+        radius = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+        radius_norm = radius / np.maximum(np.max(radius), 1e-12)
+        psd_bin_index = np.floor(radius_norm * int(psd_bins)).astype(np.int32)
+        psd_bin_index = np.clip(psd_bin_index, 0, int(psd_bins) - 1).reshape(-1)
+        psd_bin_counts = np.bincount(psd_bin_index, minlength=int(psd_bins)).astype(np.float32)
+        psd_bin_counts = np.maximum(psd_bin_counts, 1.0)
+        return psd_bin_index, psd_bin_counts
 
     def _build_dav_lookup(self, image_size: int, pixel_size_km: float, radius_km: float):
         yy, xx = np.mgrid[0:image_size, 0:image_size]
@@ -682,6 +714,46 @@ class Diffusion:
         softness = tf.cast(self.sampling_guidance_cfg["hist_softness_k"], tf.float32)
         return tf.reduce_mean(tf.nn.sigmoid((thresholds - flat) / softness), axis=1)
 
+    def _sg_soft_cold_cloud_fraction(self, x_bt_k):
+        x_bt_k = tf.cast(x_bt_k, tf.float32)
+        field = tf.reduce_mean(x_bt_k, axis=-1)
+        threshold = tf.cast(self.sampling_guidance_cfg["cold_threshold_k"], tf.float32)
+        softness = tf.cast(self.sampling_guidance_cfg["cold_softness_k"], tf.float32)
+        return tf.reduce_mean(tf.nn.sigmoid((threshold - field) / softness), axis=[1, 2])
+
+    def _sg_eye_contrast_from_radial(self, radial_profile_k):
+        radial_profile_k = tf.cast(radial_profile_k, tf.float32)
+        radial_bins = int(self.sg_radial_bins)
+        inner_frac = float(self.sampling_guidance_cfg["eye_inner_frac"])
+        ring_frac = float(self.sampling_guidance_cfg["eye_ring_frac"])
+        inner_bins = max(1, int(radial_bins * inner_frac))
+        ring_center = int(radial_bins * ring_frac)
+        ring_window = max(2, int(radial_bins * 0.05))
+        lo = max(inner_bins, ring_center - ring_window)
+        lo = min(lo, max(radial_bins - 1, 0))
+        hi = min(radial_bins, max(lo + 1, ring_center + ring_window))
+        eye_mean = tf.reduce_mean(radial_profile_k[:, :inner_bins], axis=1)
+        ring_mean = tf.reduce_mean(radial_profile_k[:, lo:hi], axis=1)
+        return eye_mean - ring_mean
+
+    def _sg_psd_profile_bt_k(self, x_bt_k):
+        x_bt_k = tf.cast(x_bt_k, tf.float32)
+        field = tf.reduce_mean(x_bt_k, axis=-1)
+        field = field - tf.reduce_mean(field, axis=[1, 2], keepdims=True)
+        fft = tf.signal.fft2d(_real_to_complex_no_warning(field))
+        power = tf.math.real(fft * tf.math.conj(fft))
+        power = tf.signal.fftshift(power, axes=(1, 2))
+        flat = tf.reshape(power, [tf.shape(power)[0], -1])
+        flat_t = tf.transpose(flat, [1, 0])
+        psd_sum = tf.math.unsorted_segment_sum(
+            flat_t,
+            self.sg_psd_bin_index,
+            self.sg_psd_bins,
+        )
+        psd_mean = psd_sum / tf.reshape(self.sg_psd_bin_counts, [-1, 1])
+        psd_mean = tf.transpose(psd_mean, [1, 0])
+        return tf.math.log(psd_mean + 1e-12) / tf.math.log(tf.constant(10.0, tf.float32))
+
     def _sampling_guidance_band_penalty(self, current, target_mean, target_std, sigma_floor):
         current = tf.cast(current, tf.float32)
         target_mean = tf.cast(target_mean, tf.float32)
@@ -692,6 +764,33 @@ class Diffusion:
         excess = tf.nn.relu(tf.abs(current - target_mean) - band_width * scale)
         standardized_excess = excess / (scale + 1e-6)
         return self._charbonnier(standardized_excess)
+
+    def _sampling_guidance_pull_penalty(self, current, target, target_std, sigma_floor):
+        current = tf.cast(current, tf.float32)
+        target = tf.cast(target, tf.float32)
+        target_std = tf.cast(target_std, tf.float32)
+        sigma_floor = tf.cast(sigma_floor, tf.float32)
+        scale = tf.maximum(target_std, sigma_floor)
+        standardized_gap = (current - target) / (scale + 1e-6)
+        return self._charbonnier(standardized_gap)
+
+    def _sampling_guidance_feature_penalty(self, current, targets, name: str, sigma_floor):
+        penalty = self._sampling_guidance_band_penalty(
+            current,
+            targets[f"{name}_mean"],
+            targets[f"{name}_std"],
+            sigma_floor=sigma_floor,
+        )
+        pull_weight = float(self.sampling_guidance_cfg["target_pull_weight"])
+        if pull_weight > 0.0:
+            pull_penalty = self._sampling_guidance_pull_penalty(
+                current,
+                targets[f"{name}_target"],
+                targets[f"{name}_std"],
+                sigma_floor=sigma_floor,
+            )
+            penalty = penalty + tf.cast(pull_weight, tf.float32) * pull_penalty
+        return penalty
 
     def _hist_cdf_loss_per_sample(self, x0_true, x0_hat):
         cdf_true = self._soft_bt_cdf(self._denorm_bt_k(x0_true))
@@ -800,48 +899,60 @@ class Diffusion:
         k = min(int(self.sampling_guidance_cfg["neighbor_k"]), num_refs)
         distances = np.abs(wind_kt_np[:, None] - class_targets.wind_kt[None, :])
         nn_idx = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
+        row_idx = np.arange(ss_cat_np.shape[0], dtype=np.int64)
+        target_mode = str(self.sampling_guidance_cfg["target_mode"])
+        if target_mode == "neighbor_mean":
+            prototype_idx = None
+        elif target_mode == "nearest":
+            nearest_rank = np.argmin(distances[row_idx[:, None], nn_idx], axis=1)
+            prototype_idx = nn_idx[row_idx, nearest_rank]
+        else:
+            random_rank = np.random.randint(0, k, size=ss_cat_np.shape[0])
+            prototype_idx = nn_idx[row_idx, random_rank]
 
         targets = {
             "class_id": class_id,
             "neighbor_k": k,
+            "target_mode": target_mode,
         }
+        def add_feature_targets(name: str, values: np.ndarray) -> None:
+            neighbors = values[nn_idx]
+            mean = neighbors.mean(axis=1).astype(np.float32, copy=False)
+            std = neighbors.std(axis=1).astype(np.float32, copy=False)
+            if prototype_idx is None:
+                target = mean
+            else:
+                target = values[prototype_idx].astype(np.float32, copy=False)
+            targets[f"{name}_mean"] = tf.constant(mean)
+            targets[f"{name}_std"] = tf.constant(std)
+            targets[f"{name}_target"] = tf.constant(target)
+
         if float(self.sampling_guidance_cfg["radial_weight"]) > 0.0:
-            radial_neighbors = class_targets.radial_profiles_k[nn_idx]
-            targets["radial_mean"] = tf.constant(
-                radial_neighbors.mean(axis=1).astype(np.float32, copy=False)
-            )
-            targets["radial_std"] = tf.constant(
-                radial_neighbors.std(axis=1).astype(np.float32, copy=False)
-            )
+            add_feature_targets("radial", class_targets.radial_profiles_k)
         if float(self.sampling_guidance_cfg["dav_weight"]) > 0.0:
-            dav_neighbors = class_targets.dav_deg2[nn_idx]
-            targets["dav_mean"] = tf.constant(
-                dav_neighbors.mean(axis=1).astype(np.float32, copy=False)
-            )
-            targets["dav_std"] = tf.constant(
-                dav_neighbors.std(axis=1).astype(np.float32, copy=False)
-            )
+            add_feature_targets("dav", class_targets.dav_deg2)
         if float(self.sampling_guidance_cfg["hist_weight"]) > 0.0:
-            hist_neighbors = class_targets.hist_cdf[nn_idx]
-            targets["hist_mean"] = tf.constant(
-                hist_neighbors.mean(axis=1).astype(np.float32, copy=False)
-            )
-            targets["hist_std"] = tf.constant(
-                hist_neighbors.std(axis=1).astype(np.float32, copy=False)
-            )
+            add_feature_targets("hist", class_targets.hist_cdf)
+        if float(self.sampling_guidance_cfg["cold_weight"]) > 0.0:
+            add_feature_targets("cold", class_targets.cold_fraction)
+        if float(self.sampling_guidance_cfg["eye_weight"]) > 0.0:
+            add_feature_targets("eye", class_targets.eye_contrast_k)
+        if float(self.sampling_guidance_cfg["psd_weight"]) > 0.0:
+            add_feature_targets("psd", class_targets.psd_profiles_log10)
         return targets
 
     def _sampling_guidance_energy_per_sample(self, x0_pred, targets):
         x0_pred = tf.cast(x0_pred, tf.float32)
         x_bt_k = self._denorm_bt_k(x0_pred)
         loss = tf.zeros([tf.shape(x0_pred)[0]], dtype=tf.float32)
+        radial_cur = None
 
         if float(self.sampling_guidance_cfg["radial_weight"]) > 0.0:
             radial_cur = self._sg_radial_mean_profile_bt_k(x_bt_k)
-            radial_penalty = self._sampling_guidance_band_penalty(
+            radial_penalty = self._sampling_guidance_feature_penalty(
                 radial_cur,
-                targets["radial_mean"],
-                targets["radial_std"],
+                targets,
+                "radial",
                 sigma_floor=float(self.sampling_guidance_cfg["sigma_floor_radial_k"]),
             )
             loss = loss + tf.cast(
@@ -851,10 +962,10 @@ class Diffusion:
 
         if float(self.sampling_guidance_cfg["dav_weight"]) > 0.0:
             dav_cur = self._sg_dav_per_sample_bt_k(x_bt_k)
-            dav_penalty = self._sampling_guidance_band_penalty(
+            dav_penalty = self._sampling_guidance_feature_penalty(
                 dav_cur,
-                targets["dav_mean"],
-                targets["dav_std"],
+                targets,
+                "dav",
                 sigma_floor=float(self.sampling_guidance_cfg["sigma_floor_dav_deg2"]),
             )
             loss = loss + tf.cast(
@@ -864,10 +975,10 @@ class Diffusion:
 
         if float(self.sampling_guidance_cfg["hist_weight"]) > 0.0:
             hist_cur = self._sg_soft_bt_cdf(x_bt_k)
-            hist_penalty = self._sampling_guidance_band_penalty(
+            hist_penalty = self._sampling_guidance_feature_penalty(
                 hist_cur,
-                targets["hist_mean"],
-                targets["hist_std"],
+                targets,
+                "hist",
                 sigma_floor=float(self.sampling_guidance_cfg["sigma_floor_hist_cdf"]),
             )
             loss = loss + tf.cast(
@@ -875,28 +986,74 @@ class Diffusion:
                 tf.float32,
             ) * tf.reduce_mean(hist_penalty, axis=1)
 
+        if float(self.sampling_guidance_cfg["cold_weight"]) > 0.0:
+            cold_cur = self._sg_soft_cold_cloud_fraction(x_bt_k)
+            cold_penalty = self._sampling_guidance_feature_penalty(
+                cold_cur,
+                targets,
+                "cold",
+                sigma_floor=float(self.sampling_guidance_cfg["sigma_floor_cold_fraction"]),
+            )
+            loss = loss + tf.cast(
+                self.sampling_guidance_cfg["cold_weight"],
+                tf.float32,
+            ) * cold_penalty
+
+        if float(self.sampling_guidance_cfg["eye_weight"]) > 0.0:
+            if radial_cur is None:
+                radial_cur = self._sg_radial_mean_profile_bt_k(x_bt_k)
+            eye_cur = self._sg_eye_contrast_from_radial(radial_cur)
+            eye_penalty = self._sampling_guidance_feature_penalty(
+                eye_cur,
+                targets,
+                "eye",
+                sigma_floor=float(self.sampling_guidance_cfg["sigma_floor_eye_k"]),
+            )
+            loss = loss + tf.cast(
+                self.sampling_guidance_cfg["eye_weight"],
+                tf.float32,
+            ) * eye_penalty
+
+        if float(self.sampling_guidance_cfg["psd_weight"]) > 0.0:
+            psd_cur = self._sg_psd_profile_bt_k(x_bt_k)
+            psd_penalty = self._sampling_guidance_feature_penalty(
+                psd_cur,
+                targets,
+                "psd",
+                sigma_floor=float(self.sampling_guidance_cfg["sigma_floor_psd_log10"]),
+            )
+            loss = loss + tf.cast(
+                self.sampling_guidance_cfg["psd_weight"],
+                tf.float32,
+            ) * tf.reduce_mean(psd_penalty, axis=1)
+
         return loss
 
     def _apply_sampling_guidance_to_x0(self, x0_pred, targets, guidance_step_scale: float):
         if targets is None or float(guidance_step_scale) <= 0.0:
             return x0_pred
 
-        x0_pred_f32 = tf.cast(x0_pred, tf.float32)
-        with tf.GradientTape() as tape:
-            tape.watch(x0_pred_f32)
-            energy_per_sample = self._sampling_guidance_energy_per_sample(x0_pred_f32, targets)
-            energy = tf.reduce_mean(energy_per_sample)
+        x0_guided = tf.cast(x0_pred, tf.float32)
+        inner_steps = max(1, int(self.sampling_guidance_cfg["inner_steps"]))
+        per_inner_step = float(guidance_step_scale) / float(inner_steps)
+        for _ in range(inner_steps):
+            with tf.GradientTape() as tape:
+                tape.watch(x0_guided)
+                energy_per_sample = self._sampling_guidance_energy_per_sample(x0_guided, targets)
+                energy = tf.reduce_mean(energy_per_sample)
 
-        grad = tape.gradient(energy, x0_pred_f32)
-        if grad is None:
-            return x0_pred
+            grad = tape.gradient(energy, x0_guided)
+            if grad is None:
+                return x0_pred
 
-        grad = tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
-        grad_rms = tf.sqrt(tf.reduce_mean(tf.square(grad), axis=[1, 2, 3], keepdims=True) + 1e-8)
-        direction = grad / grad_rms
-        x0_guided = x0_pred_f32 - tf.cast(float(guidance_step_scale), tf.float32) * direction
-        if self.dynamic_threshold:
-            x0_guided, _ = self._dynamic_threshold_x0(x0_guided, p=self.dynamic_threshold_p)
+            grad = tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
+            grad_rms = tf.sqrt(
+                tf.reduce_mean(tf.square(grad), axis=[1, 2, 3], keepdims=True) + 1e-8
+            )
+            direction = grad / grad_rms
+            x0_guided = x0_guided - tf.cast(per_inner_step, tf.float32) * direction
+            if self.dynamic_threshold:
+                x0_guided, _ = self._dynamic_threshold_x0(x0_guided, p=self.dynamic_threshold_p)
         return tf.cast(x0_guided, x0_pred.dtype)
 
     def _sampling_guidance_step_scale(self, step_index: int, total_steps: int) -> float:
@@ -910,11 +1067,18 @@ class Diffusion:
         start_frac = float(self.sampling_guidance_cfg["guide_start_step_frac"])
         start_index = int(np.floor(total_steps * start_frac))
         start_index = min(max(start_index, 0), max(total_steps - 1, 0))
-        if step_index < start_index:
+        stop_frac = float(self.sampling_guidance_cfg["guide_stop_step_frac"])
+        stop_index = int(np.ceil(total_steps * stop_frac)) - 1
+        stop_index = min(max(stop_index, start_index), max(total_steps - 1, 0))
+        if step_index < start_index or step_index > stop_index:
             return 0.0
 
-        guided_steps = max(total_steps - start_index, 1)
-        ramp = float(step_index - start_index + 1) / float(guided_steps)
+        guided_steps = max(stop_index - start_index + 1, 1)
+        progress = float(step_index - start_index + 1) / float(guided_steps)
+        if str(self.sampling_guidance_cfg["schedule"]) == "cosine":
+            ramp = 0.5 - 0.5 * np.cos(np.pi * progress)
+        else:
+            ramp = progress
         return base_step_size * ramp
 
     def get_sampling_guidance_report(self) -> dict:

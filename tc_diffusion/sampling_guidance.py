@@ -17,9 +17,10 @@ from .data import (
     ss_class_midpoint_kt,
 )
 from .evaluation.metrics import DAVComputer, PolarBinner, radial_profile_batch
+from .evaluation.metrics import cold_cloud_fraction, eye_contrast_proxy, psd_radial_batch
 
 
-SAMPLING_GUIDANCE_BANK_SCHEMA = "tc_diffusion.sampling_guidance_bank.v1"
+SAMPLING_GUIDANCE_BANK_SCHEMA = "tc_diffusion.sampling_guidance_bank.v2"
 _DEFAULT_CACHE_ROOT = Path("outputs") / "sampling_guidance"
 
 
@@ -29,6 +30,9 @@ class SamplingGuidanceClassTargets:
     radial_profiles_k: np.ndarray
     dav_deg2: np.ndarray
     hist_cdf: np.ndarray
+    cold_fraction: np.ndarray
+    eye_contrast_k: np.ndarray
+    psd_profiles_log10: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,10 @@ class SamplingGuidanceTargetBank:
     hist_bins: int
     hist_softness_k: float
     hist_thresholds_k: np.ndarray
+    cold_threshold_k: float
+    eye_inner_frac: float
+    eye_ring_frac: float
+    psd_bins: int
     dav_radius_km: float
     pixel_size_km: float
     dav_center_region_size: int
@@ -65,17 +73,30 @@ def resolve_sampling_guidance_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "cache_path": raw.get("cache_path"),
         "build_batch_size": int(raw.get("build_batch_size", 16)),
         "neighbor_k": int(raw.get("neighbor_k", 64)),
+        "target_mode": str(raw.get("target_mode", "random_neighbor")).strip().lower(),
         "guide_start_step_frac": float(raw.get("guide_start_step_frac", 0.65)),
+        "guide_stop_step_frac": float(raw.get("guide_stop_step_frac", 1.0)),
+        "schedule": str(raw.get("schedule", "linear")).strip().lower(),
         "step_size": float(raw.get("step_size", 0.01)),
+        "inner_steps": int(raw.get("inner_steps", 1)),
         "band_width_sigma": float(raw.get("band_width_sigma", 1.0)),
+        "target_pull_weight": float(raw.get("target_pull_weight", 0.25)),
         "radial_weight": float(raw.get("radial_weight", phys_cfg.get("radial_weight", 1.0))),
         "dav_weight": float(raw.get("dav_weight", phys_cfg.get("dav_weight", 0.0))),
         "hist_weight": float(raw.get("hist_weight", phys_cfg.get("hist_weight", 0.0))),
+        "cold_weight": float(raw.get("cold_weight", 0.0)),
+        "eye_weight": float(raw.get("eye_weight", 0.0)),
+        "psd_weight": float(raw.get("psd_weight", 0.0)),
         "radial_bins": int(raw.get("radial_bins", phys_cfg.get("radial_bins", 64))),
         "hist_bins": int(raw.get("hist_bins", phys_cfg.get("hist_bins", 32))),
         "hist_softness_k": float(
             raw.get("hist_softness_k", phys_cfg.get("hist_softness_k", 2.5))
         ),
+        "cold_threshold_k": float(raw.get("cold_threshold_k", 200.0)),
+        "cold_softness_k": float(raw.get("cold_softness_k", 2.5)),
+        "eye_inner_frac": float(raw.get("eye_inner_frac", 0.12)),
+        "eye_ring_frac": float(raw.get("eye_ring_frac", 0.20)),
+        "psd_bins": int(raw.get("psd_bins", eval_cfg.get("psd_bins", 96))),
         "dav_radius_km": float(
             raw.get(
                 "dav_radius_km",
@@ -94,6 +115,9 @@ def resolve_sampling_guidance_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "sigma_floor_radial_k": float(raw.get("sigma_floor_radial_k", 2.0)),
         "sigma_floor_dav_deg2": float(raw.get("sigma_floor_dav_deg2", 100.0)),
         "sigma_floor_hist_cdf": float(raw.get("sigma_floor_hist_cdf", 0.02)),
+        "sigma_floor_cold_fraction": float(raw.get("sigma_floor_cold_fraction", 0.002)),
+        "sigma_floor_eye_k": float(raw.get("sigma_floor_eye_k", 1.0)),
+        "sigma_floor_psd_log10": float(raw.get("sigma_floor_psd_log10", 0.10)),
     }
     _validate_sampling_guidance_cfg(out)
     return out
@@ -103,7 +127,7 @@ def sampling_guidance_summary(cfg: Dict[str, Any]) -> Dict[str, Any]:
     sg_cfg = resolve_sampling_guidance_cfg(cfg)
     summary = {
         "enabled": bool(sg_cfg["enabled"]),
-        "method": "target_band_v1",
+        "method": "target_bank_v2",
         "target_split": str(sg_cfg["target_split"]),
         "cache_key": sampling_guidance_cache_key(cfg),
     }
@@ -113,21 +137,37 @@ def sampling_guidance_summary(cfg: Dict[str, Any]) -> Dict[str, Any]:
     summary.update(
         {
             "neighbor_k": int(sg_cfg["neighbor_k"]),
+            "target_mode": str(sg_cfg["target_mode"]),
             "guide_start_step_frac": float(sg_cfg["guide_start_step_frac"]),
+            "guide_stop_step_frac": float(sg_cfg["guide_stop_step_frac"]),
+            "schedule": str(sg_cfg["schedule"]),
             "step_size": float(sg_cfg["step_size"]),
+            "inner_steps": int(sg_cfg["inner_steps"]),
             "band_width_sigma": float(sg_cfg["band_width_sigma"]),
+            "target_pull_weight": float(sg_cfg["target_pull_weight"]),
             "radial_weight": float(sg_cfg["radial_weight"]),
             "dav_weight": float(sg_cfg["dav_weight"]),
             "hist_weight": float(sg_cfg["hist_weight"]),
+            "cold_weight": float(sg_cfg["cold_weight"]),
+            "eye_weight": float(sg_cfg["eye_weight"]),
+            "psd_weight": float(sg_cfg["psd_weight"]),
             "radial_bins": int(sg_cfg["radial_bins"]),
             "hist_bins": int(sg_cfg["hist_bins"]),
             "hist_softness_k": float(sg_cfg["hist_softness_k"]),
+            "cold_threshold_k": float(sg_cfg["cold_threshold_k"]),
+            "cold_softness_k": float(sg_cfg["cold_softness_k"]),
+            "eye_inner_frac": float(sg_cfg["eye_inner_frac"]),
+            "eye_ring_frac": float(sg_cfg["eye_ring_frac"]),
+            "psd_bins": int(sg_cfg["psd_bins"]),
             "dav_radius_km": float(sg_cfg["dav_radius_km"]),
             "pixel_size_km": float(sg_cfg["pixel_size_km"]),
             "dav_center_region_size": int(sg_cfg["dav_center_region_size"]),
             "sigma_floor_radial_k": float(sg_cfg["sigma_floor_radial_k"]),
             "sigma_floor_dav_deg2": float(sg_cfg["sigma_floor_dav_deg2"]),
             "sigma_floor_hist_cdf": float(sg_cfg["sigma_floor_hist_cdf"]),
+            "sigma_floor_cold_fraction": float(sg_cfg["sigma_floor_cold_fraction"]),
+            "sigma_floor_eye_k": float(sg_cfg["sigma_floor_eye_k"]),
+            "sigma_floor_psd_log10": float(sg_cfg["sigma_floor_psd_log10"]),
         }
     )
     return summary
@@ -145,6 +185,10 @@ def sampling_guidance_cache_key(cfg: Dict[str, Any]) -> str:
         "radial_bins": int(sg_cfg["radial_bins"]),
         "hist_bins": int(sg_cfg["hist_bins"]),
         "hist_softness_k": float(sg_cfg["hist_softness_k"]),
+        "cold_threshold_k": float(sg_cfg["cold_threshold_k"]),
+        "eye_inner_frac": float(sg_cfg["eye_inner_frac"]),
+        "eye_ring_frac": float(sg_cfg["eye_ring_frac"]),
+        "psd_bins": int(sg_cfg["psd_bins"]),
         "dav_radius_km": float(sg_cfg["dav_radius_km"]),
         "pixel_size_km": float(sg_cfg["pixel_size_km"]),
         "dav_center_region_size": int(sg_cfg["dav_center_region_size"]),
@@ -209,6 +253,18 @@ def load_sampling_guidance_target_bank(path: Path) -> SamplingGuidanceTargetBank
             ),
             dav_deg2=np.asarray(data[f"class_{class_id}_dav_deg2"], dtype=np.float32),
             hist_cdf=np.asarray(data[f"class_{class_id}_hist_cdf"], dtype=np.float32),
+            cold_fraction=np.asarray(
+                data[f"class_{class_id}_cold_fraction"],
+                dtype=np.float32,
+            ),
+            eye_contrast_k=np.asarray(
+                data[f"class_{class_id}_eye_contrast_k"],
+                dtype=np.float32,
+            ),
+            psd_profiles_log10=np.asarray(
+                data[f"class_{class_id}_psd_profiles_log10"],
+                dtype=np.float32,
+            ),
         )
 
     return SamplingGuidanceTargetBank(
@@ -223,6 +279,10 @@ def load_sampling_guidance_target_bank(path: Path) -> SamplingGuidanceTargetBank
         hist_bins=int(np.asarray(data["hist_bins"]).item()),
         hist_softness_k=float(np.asarray(data["hist_softness_k"]).item()),
         hist_thresholds_k=np.asarray(data["hist_thresholds_k"], dtype=np.float32),
+        cold_threshold_k=float(np.asarray(data["cold_threshold_k"]).item()),
+        eye_inner_frac=float(np.asarray(data["eye_inner_frac"]).item()),
+        eye_ring_frac=float(np.asarray(data["eye_ring_frac"]).item()),
+        psd_bins=int(np.asarray(data["psd_bins"]).item()),
         dav_radius_km=float(np.asarray(data["dav_radius_km"]).item()),
         pixel_size_km=float(np.asarray(data["pixel_size_km"]).item()),
         dav_center_region_size=int(np.asarray(data["dav_center_region_size"]).item()),
@@ -319,6 +379,9 @@ def build_sampling_guidance_target_bank(
             radial_rows = []
             dav_rows = []
             hist_rows = []
+            cold_rows = []
+            eye_rows = []
+            psd_rows = []
 
             for start in range(0, len(class_paths), build_batch_size):
                 batch_paths = class_paths[start : start + build_batch_size]
@@ -340,10 +403,26 @@ def build_sampling_guidance_target_bank(
                     thresholds_k=hist_thresholds_k,
                     softness_k=float(sg_cfg["hist_softness_k"]),
                 )
+                cold_values = cold_cloud_fraction(
+                    bt_batch,
+                    threshold_k=float(sg_cfg["cold_threshold_k"]),
+                )
+                eye_values = eye_contrast_proxy(
+                    mean_profiles,
+                    inner_frac=float(sg_cfg["eye_inner_frac"]),
+                    ring_frac=float(sg_cfg["eye_ring_frac"]),
+                )
+                psd_profiles = psd_radial_batch(
+                    bt_batch,
+                    psd_bins=int(sg_cfg["psd_bins"]),
+                )
 
                 radial_rows.append(mean_profiles.astype(np.float32, copy=False))
                 dav_rows.append(dav_values.astype(np.float32, copy=False))
                 hist_rows.append(hist_cdf.astype(np.float32, copy=False))
+                cold_rows.append(cold_values.astype(np.float32, copy=False))
+                eye_rows.append(eye_values.astype(np.float32, copy=False))
+                psd_rows.append(psd_profiles.astype(np.float32, copy=False))
 
                 if pbar is not None:
                     pbar.set_postfix_str(f"class {class_id}", refresh=False)
@@ -354,6 +433,9 @@ def build_sampling_guidance_target_bank(
                 radial_profiles_k=np.concatenate(radial_rows, axis=0),
                 dav_deg2=np.concatenate(dav_rows, axis=0),
                 hist_cdf=np.concatenate(hist_rows, axis=0),
+                cold_fraction=np.concatenate(cold_rows, axis=0),
+                eye_contrast_k=np.concatenate(eye_rows, axis=0),
+                psd_profiles_log10=np.concatenate(psd_rows, axis=0),
             )
     finally:
         if pbar is not None:
@@ -370,6 +452,10 @@ def build_sampling_guidance_target_bank(
         "hist_bins": np.asarray([hist_bins], dtype=np.int32),
         "hist_softness_k": np.asarray([float(sg_cfg["hist_softness_k"])], dtype=np.float32),
         "hist_thresholds_k": hist_thresholds_k.astype(np.float32, copy=False),
+        "cold_threshold_k": np.asarray([float(sg_cfg["cold_threshold_k"])], dtype=np.float32),
+        "eye_inner_frac": np.asarray([float(sg_cfg["eye_inner_frac"])], dtype=np.float32),
+        "eye_ring_frac": np.asarray([float(sg_cfg["eye_ring_frac"])], dtype=np.float32),
+        "psd_bins": np.asarray([int(sg_cfg["psd_bins"])], dtype=np.int32),
         "dav_radius_km": np.asarray([float(sg_cfg["dav_radius_km"])], dtype=np.float32),
         "pixel_size_km": np.asarray([float(sg_cfg["pixel_size_km"])], dtype=np.float32),
         "dav_center_region_size": np.asarray(
@@ -386,6 +472,18 @@ def build_sampling_guidance_target_bank(
         )
         save_payload[f"class_{class_id}_dav_deg2"] = target.dav_deg2.astype(np.float32, copy=False)
         save_payload[f"class_{class_id}_hist_cdf"] = target.hist_cdf.astype(np.float32, copy=False)
+        save_payload[f"class_{class_id}_cold_fraction"] = target.cold_fraction.astype(
+            np.float32,
+            copy=False,
+        )
+        save_payload[f"class_{class_id}_eye_contrast_k"] = target.eye_contrast_k.astype(
+            np.float32,
+            copy=False,
+        )
+        save_payload[f"class_{class_id}_psd_profiles_log10"] = target.psd_profiles_log10.astype(
+            np.float32,
+            copy=False,
+        )
 
     np.savez_compressed(out_path, **save_payload)
     return load_sampling_guidance_target_bank(out_path)
@@ -420,20 +518,50 @@ def _validate_sampling_guidance_cfg(sg_cfg: Dict[str, Any]) -> None:
             "sampling_guidance.neighbor_k must be > 0, "
             f"got {sg_cfg['neighbor_k']}."
         )
+    if str(sg_cfg["target_mode"]) not in {"neighbor_mean", "nearest", "random_neighbor"}:
+        raise ValueError(
+            "sampling_guidance.target_mode must be one of 'neighbor_mean', "
+            f"'nearest', or 'random_neighbor', got {sg_cfg['target_mode']!r}."
+        )
     if float(sg_cfg["guide_start_step_frac"]) < 0.0 or float(sg_cfg["guide_start_step_frac"]) > 1.0:
         raise ValueError(
             "sampling_guidance.guide_start_step_frac must be in [0, 1], "
             f"got {sg_cfg['guide_start_step_frac']}."
+        )
+    if float(sg_cfg["guide_stop_step_frac"]) < 0.0 or float(sg_cfg["guide_stop_step_frac"]) > 1.0:
+        raise ValueError(
+            "sampling_guidance.guide_stop_step_frac must be in [0, 1], "
+            f"got {sg_cfg['guide_stop_step_frac']}."
+        )
+    if float(sg_cfg["guide_stop_step_frac"]) < float(sg_cfg["guide_start_step_frac"]):
+        raise ValueError(
+            "sampling_guidance.guide_stop_step_frac must be >= guide_start_step_frac, "
+            f"got start={sg_cfg['guide_start_step_frac']} and stop={sg_cfg['guide_stop_step_frac']}."
+        )
+    if str(sg_cfg["schedule"]) not in {"linear", "cosine"}:
+        raise ValueError(
+            "sampling_guidance.schedule must be one of 'linear' or 'cosine', "
+            f"got {sg_cfg['schedule']!r}."
         )
     if float(sg_cfg["step_size"]) < 0.0:
         raise ValueError(
             "sampling_guidance.step_size must be >= 0, "
             f"got {sg_cfg['step_size']}."
         )
+    if int(sg_cfg["inner_steps"]) <= 0:
+        raise ValueError(
+            "sampling_guidance.inner_steps must be > 0, "
+            f"got {sg_cfg['inner_steps']}."
+        )
     if float(sg_cfg["band_width_sigma"]) < 0.0:
         raise ValueError(
             "sampling_guidance.band_width_sigma must be >= 0, "
             f"got {sg_cfg['band_width_sigma']}."
+        )
+    if float(sg_cfg["target_pull_weight"]) < 0.0:
+        raise ValueError(
+            "sampling_guidance.target_pull_weight must be >= 0, "
+            f"got {sg_cfg['target_pull_weight']}."
         )
     if int(sg_cfg["radial_bins"]) <= 0:
         raise ValueError(
@@ -449,6 +577,24 @@ def _validate_sampling_guidance_cfg(sg_cfg: Dict[str, Any]) -> None:
         raise ValueError(
             "sampling_guidance.hist_softness_k must be > 0, "
             f"got {sg_cfg['hist_softness_k']}."
+        )
+    if float(sg_cfg["cold_threshold_k"]) <= 0.0:
+        raise ValueError(
+            "sampling_guidance.cold_threshold_k must be > 0, "
+            f"got {sg_cfg['cold_threshold_k']}."
+        )
+    if float(sg_cfg["cold_softness_k"]) <= 0.0:
+        raise ValueError(
+            "sampling_guidance.cold_softness_k must be > 0, "
+            f"got {sg_cfg['cold_softness_k']}."
+        )
+    for key in ("eye_inner_frac", "eye_ring_frac"):
+        if float(sg_cfg[key]) <= 0.0 or float(sg_cfg[key]) >= 1.0:
+            raise ValueError(f"sampling_guidance.{key} must be in (0, 1), got {sg_cfg[key]}.")
+    if int(sg_cfg["psd_bins"]) <= 0:
+        raise ValueError(
+            "sampling_guidance.psd_bins must be > 0, "
+            f"got {sg_cfg['psd_bins']}."
         )
     if float(sg_cfg["dav_radius_km"]) <= 0.0:
         raise ValueError(
@@ -466,10 +612,24 @@ def _validate_sampling_guidance_cfg(sg_cfg: Dict[str, Any]) -> None:
             "sampling_guidance.dav_center_region_size must be a positive odd integer, "
             f"got {center_region_size}."
         )
-    for key in ("radial_weight", "dav_weight", "hist_weight"):
+    for key in (
+        "radial_weight",
+        "dav_weight",
+        "hist_weight",
+        "cold_weight",
+        "eye_weight",
+        "psd_weight",
+    ):
         if float(sg_cfg[key]) < 0.0:
             raise ValueError(f"sampling_guidance.{key} must be >= 0, got {sg_cfg[key]}.")
-    for key in ("sigma_floor_radial_k", "sigma_floor_dav_deg2", "sigma_floor_hist_cdf"):
+    for key in (
+        "sigma_floor_radial_k",
+        "sigma_floor_dav_deg2",
+        "sigma_floor_hist_cdf",
+        "sigma_floor_cold_fraction",
+        "sigma_floor_eye_k",
+        "sigma_floor_psd_log10",
+    ):
         if float(sg_cfg[key]) <= 0.0:
             raise ValueError(f"sampling_guidance.{key} must be > 0, got {sg_cfg[key]}.")
 
@@ -521,6 +681,26 @@ def _validate_loaded_bank_against_cfg(
         raise ValueError(
             f"Sampling-guidance bank hist_softness_k mismatch for {bank.path}: "
             f"expected {float(sg_cfg['hist_softness_k'])}, found {bank.hist_softness_k}."
+        )
+    if not np.isclose(float(bank.cold_threshold_k), float(sg_cfg["cold_threshold_k"])):
+        raise ValueError(
+            f"Sampling-guidance bank cold_threshold_k mismatch for {bank.path}: "
+            f"expected {float(sg_cfg['cold_threshold_k'])}, found {bank.cold_threshold_k}."
+        )
+    if not np.isclose(float(bank.eye_inner_frac), float(sg_cfg["eye_inner_frac"])):
+        raise ValueError(
+            f"Sampling-guidance bank eye_inner_frac mismatch for {bank.path}: "
+            f"expected {float(sg_cfg['eye_inner_frac'])}, found {bank.eye_inner_frac}."
+        )
+    if not np.isclose(float(bank.eye_ring_frac), float(sg_cfg["eye_ring_frac"])):
+        raise ValueError(
+            f"Sampling-guidance bank eye_ring_frac mismatch for {bank.path}: "
+            f"expected {float(sg_cfg['eye_ring_frac'])}, found {bank.eye_ring_frac}."
+        )
+    if int(bank.psd_bins) != int(sg_cfg["psd_bins"]):
+        raise ValueError(
+            f"Sampling-guidance bank psd_bins mismatch for {bank.path}: "
+            f"expected {int(sg_cfg['psd_bins'])}, found {bank.psd_bins}."
         )
     if not np.isclose(float(bank.dav_radius_km), float(sg_cfg["dav_radius_km"])):
         raise ValueError(

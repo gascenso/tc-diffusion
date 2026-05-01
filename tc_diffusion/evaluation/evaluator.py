@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 from .metrics import (
     DAVComputer,
     PolarBinner,
+    centered_disk_mask,
     cold_cloud_fraction,
     coverage_from_real_radii,
     denorm_bt,
@@ -46,7 +47,7 @@ from ..sampling_guidance import sampling_guidance_summary
 PRIMARY_RAW_AGG_KEYS = (
     "pixel_hist_js",
     "pixel_hist_w1",
-    "cold_cloud_fraction_200K_abs_gap",
+    "cold_cloud_fraction_abs_gap",
     "dav_abs_gap_deg2",
     "eye_contrast_proxy_abs_gap",
     "psd_l2",
@@ -55,12 +56,12 @@ PRIMARY_RAW_AGG_KEYS = (
     "gen_exceedance_rate_total",
 )
 
-REPORT_SCHEMA_VERSION = 13
+REPORT_SCHEMA_VERSION = 14
 PAPER_READY_PIXEL_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.pixel_plausibility.v2"
 PAPER_READY_RADIAL_BT_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_bt_profile.v1"
 PAPER_READY_PSD_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.radial_psd_profile.v1"
 PAPER_READY_DAV_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.dav.v1"
-PAPER_READY_COLD_CLOUD_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.cold_cloud_fraction.v1"
+PAPER_READY_COLD_CLOUD_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.cold_cloud_fraction.v2"
 PAPER_READY_MEMORIZATION_PAIRS_ARTIFACT_SCHEMA = "tc_diffusion.paper_ready.memorization_pairs.v1"
 PER_CLASS_METRICS_CSV_SCHEMA = "tc_diffusion.per_class_metrics.v1"
 EVALUATOR_FD_NEGATIVE_CONTROL_NAMES = ("gaussian_blur", "pixel_shuffle")
@@ -146,6 +147,9 @@ def _default_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ev.setdefault("dav_radius_km", float(phys_cfg.get("dav_radius_km", 300.0)))
     ev.setdefault("dav_pixel_size_km", float(phys_cfg.get("pixel_size_km", 8.0)))
     ev.setdefault("dav_center_region_size", 3)
+    ev.setdefault("cold_cloud_threshold_k", 208.0)
+    ev.setdefault("cold_cloud_radius_km", float(ev.get("dav_radius_km", 300.0)))
+    ev.setdefault("cold_cloud_pixel_size_km", float(ev.get("dav_pixel_size_km", 8.0)))
     evaluator_fd_cfg = dict(ev.get("evaluator_feature_metric", {}))
     evaluator_fd_cfg.setdefault("enabled", "auto")
     evaluator_fd_cfg.setdefault("run_name", "evaluator_cat4plus_mild_rebalanced_s035")
@@ -549,7 +553,7 @@ def _compute_structural_suite(
     metrics = {
         "pixel_hist_js": float(js),
         "pixel_hist_w1": float(w1),
-        "cold_cloud_fraction_200K": {
+        "cold_cloud_fraction": {
             "real_mean": float(real_cold.mean()),
             "real_std": float(real_cold.std()),
             "gen_mean": float(gen_cold.mean()),
@@ -604,6 +608,8 @@ def _build_class_metric_cache(
     psd_bins: int,
     bt_min_k: float,
     bt_max_k: float,
+    cold_threshold_k: float,
+    cold_mask: np.ndarray | None,
 ) -> ClassMetricCache:
     bins = np.linspace(bt_min_k, bt_max_k, 129)
     gen_k_post = np.clip(gen_k_raw, bt_min_k, bt_max_k)
@@ -620,9 +626,9 @@ def _build_class_metric_cache(
     gen_raw_psd_profiles = psd_radial_batch(gen_k_raw, psd_bins)
     gen_post_psd_profiles = psd_radial_batch(gen_k_post, psd_bins)
 
-    real_cold = cold_cloud_fraction(real_k, threshold_k=200.0)
-    gen_raw_cold = cold_cloud_fraction(gen_k_raw, threshold_k=200.0)
-    gen_post_cold = cold_cloud_fraction(gen_k_post, threshold_k=200.0)
+    real_cold = cold_cloud_fraction(real_k, threshold_k=float(cold_threshold_k), mask=cold_mask)
+    gen_raw_cold = cold_cloud_fraction(gen_k_raw, threshold_k=float(cold_threshold_k), mask=cold_mask)
+    gen_post_cold = cold_cloud_fraction(gen_k_post, threshold_k=float(cold_threshold_k), mask=cold_mask)
 
     real_dav = dav_computer.batch(real_k)
     gen_raw_dav = dav_computer.batch(gen_k_raw)
@@ -708,6 +714,8 @@ def _build_class_metric_cache_from_real_cache(
     psd_bins: int,
     bt_min_k: float,
     bt_max_k: float,
+    cold_threshold_k: float,
+    cold_mask: np.ndarray | None,
 ) -> ClassMetricCache:
     bins = np.asarray(real_cache.bins, dtype=np.float64)
     gen_k_raw = np.asarray(gen_k_raw, dtype=np.float32)
@@ -722,8 +730,8 @@ def _build_class_metric_cache_from_real_cache(
     gen_raw_psd_profiles = psd_radial_batch(gen_k_raw, psd_bins)
     gen_post_psd_profiles = psd_radial_batch(gen_k_post, psd_bins)
 
-    gen_raw_cold = cold_cloud_fraction(gen_k_raw, threshold_k=200.0)
-    gen_post_cold = cold_cloud_fraction(gen_k_post, threshold_k=200.0)
+    gen_raw_cold = cold_cloud_fraction(gen_k_raw, threshold_k=float(cold_threshold_k), mask=cold_mask)
+    gen_post_cold = cold_cloud_fraction(gen_k_post, threshold_k=float(cold_threshold_k), mask=cold_mask)
 
     gen_raw_dav = dav_computer.batch(gen_k_raw)
     gen_post_dav = dav_computer.batch(gen_k_post)
@@ -892,7 +900,7 @@ def _compute_class_scalar_summary(
     return {
         "pixel_hist_js": float(js_divergence(rh, gh)),
         "pixel_hist_w1": float(wasserstein1_from_hist(rh, gh, bin_edges=cache.bins)),
-        "cold_cloud_fraction_200K_abs_gap": float(abs(real_cold.mean() - gen_cold.mean())),
+        "cold_cloud_fraction_abs_gap": float(abs(real_cold.mean() - gen_cold.mean())),
         "dav_abs_gap_deg2": float(abs(real_dav.mean() - gen_dav.mean())),
         "eye_contrast_proxy_abs_gap": float(abs(real_eye.mean() - gen_eye.mean())),
         "psd_l2": float(((real_psd.mean(axis=0) - gen_psd.mean(axis=0)) ** 2).mean()),
@@ -1311,6 +1319,8 @@ def _write_paper_ready_cold_cloud_fraction_npz(
     *,
     class_caches: Dict[int, ClassMetricCache],
     threshold_k: float,
+    radius_km: float,
+    pixel_size_km: float,
 ) -> Dict[str, Any]:
     if not class_caches:
         return {}
@@ -1345,6 +1355,8 @@ def _write_paper_ready_cold_cloud_fraction_npz(
         class_ids=np.asarray(class_ids, dtype=np.int32),
         class_labels=np.asarray([class_labels[c] for c in class_ids]),
         cold_threshold_k=np.asarray([float(threshold_k)], dtype=np.float64),
+        cold_radius_km=np.asarray([float(radius_km)], dtype=np.float64),
+        cold_pixel_size_km=np.asarray([float(pixel_size_km)], dtype=np.float64),
         real_mean_fraction=np.asarray(real_mean_rows, dtype=np.float64),
         gen_mean_fraction=np.asarray(gen_mean_rows, dtype=np.float64),
         cold_abs_gap_fraction=np.asarray(gap_rows, dtype=np.float64),
@@ -1356,10 +1368,13 @@ def _write_paper_ready_cold_cloud_fraction_npz(
 
     return {
         "schema": PAPER_READY_COLD_CLOUD_ARTIFACT_SCHEMA,
-        "metric_variant": "raw",
+        "metric_variant": "bt_lt_threshold_center_disk",
         "metric_name": "cold_abs_gap_fraction",
         "metric_units": {"cold_abs_gap_fraction": "fraction", "cold_mean": "fraction"},
         "threshold_k": float(threshold_k),
+        "radius_km": float(radius_km),
+        "pixel_size_km": float(pixel_size_km),
+        "region": "center_disk",
         "class_ids": [int(c) for c in class_ids],
         "class_labels": {str(c): class_labels[c] for c in class_ids},
         "per_image_fraction": {
@@ -1930,7 +1945,7 @@ def _compute_class_normalization_scalar_summary(cache: ClassMetricCache) -> Dict
     return {
         "pixel_hist_js": float(js_divergence(rh, gh)),
         "pixel_hist_w1": float(wasserstein1_from_hist(rh, gh, bin_edges=cache.bins)),
-        "cold_cloud_fraction_200K_abs_gap": float(abs(real_cold.mean() - gen_cold.mean())),
+        "cold_cloud_fraction_abs_gap": float(abs(real_cold.mean() - gen_cold.mean())),
         "dav_abs_gap_deg2": float(abs(real_dav.mean() - gen_dav.mean())),
         "eye_contrast_proxy_abs_gap": float(abs(real_eye.mean() - gen_eye.mean())),
         "psd_l2": float(((real_psd.mean(axis=0) - gen_psd.mean(axis=0)) ** 2).mean()),
@@ -1978,7 +1993,7 @@ def _compute_real_vs_real_class_summary(
     return {
         "pixel_hist_js": float(js_divergence(left_mass, right_mass)),
         "pixel_hist_w1": float(wasserstein1_from_hist(left_mass, right_mass, bin_edges=cache.bins)),
-        "cold_cloud_fraction_200K_abs_gap": float(abs(left_cold.mean() - right_cold.mean())),
+        "cold_cloud_fraction_abs_gap": float(abs(left_cold.mean() - right_cold.mean())),
         "dav_abs_gap_deg2": float(abs(left_dav.mean() - right_dav.mean())),
         "eye_contrast_proxy_abs_gap": float(abs(left_eye.mean() - right_eye.mean())),
         "psd_l2": float(((left_psd.mean(axis=0) - right_psd.mean(axis=0)) ** 2).mean()),
@@ -2792,6 +2807,9 @@ class TCEvaluator:
         dav_radius_km = float(ev.get("dav_radius_km", 300.0))
         dav_pixel_size_km = float(ev.get("dav_pixel_size_km", 8.0))
         dav_center_region_size = int(ev.get("dav_center_region_size", 3))
+        cold_cloud_threshold_k = float(ev.get("cold_cloud_threshold_k", 208.0))
+        cold_cloud_radius_km = float(ev.get("cold_cloud_radius_km", dav_radius_km))
+        cold_cloud_pixel_size_km = float(ev.get("cold_cloud_pixel_size_km", dav_pixel_size_km))
         if dav_radius_km <= 0.0:
             raise ValueError(f"evaluation.dav_radius_km must be > 0, got {dav_radius_km}")
         if dav_pixel_size_km <= 0.0:
@@ -2801,6 +2819,12 @@ class TCEvaluator:
                 "evaluation.dav_center_region_size must be a positive odd integer, "
                 f"got {dav_center_region_size}"
             )
+        if cold_cloud_pixel_size_km <= 0.0:
+            raise ValueError(
+                f"evaluation.cold_cloud_pixel_size_km must be > 0, got {cold_cloud_pixel_size_km}"
+            )
+        if cold_cloud_radius_km <= 0.0:
+            raise ValueError(f"evaluation.cold_cloud_radius_km must be > 0, got {cold_cloud_radius_km}")
 
         evaluator_fd_cfg = dict(ev.get("evaluator_feature_metric", {}))
         evaluator_fd_enabled, evaluator_fd_enable_mode = _resolve_auto_bool(
@@ -3296,6 +3320,12 @@ class TCEvaluator:
             radius_km=dav_radius_km,
             center_region_size=dav_center_region_size,
         )
+        cold_cloud_mask = centered_disk_mask(
+            image_size,
+            image_size,
+            pixel_size_km=cold_cloud_pixel_size_km,
+            radius_km=cold_cloud_radius_km,
+        )
 
         class_caches: Dict[int, ClassMetricCache] = {}
         per_class_metrics = {}
@@ -3366,6 +3396,8 @@ class TCEvaluator:
                 psd_bins=int(ev["psd_bins"]),
                 bt_min_k=bt_min_k,
                 bt_max_k=bt_max_k,
+                cold_threshold_k=cold_cloud_threshold_k,
+                cold_mask=cold_cloud_mask,
             )
             if metric_norm_controls_active:
                 draw_n = (
@@ -3400,6 +3432,8 @@ class TCEvaluator:
                         psd_bins=int(ev["psd_bins"]),
                         bt_min_k=bt_min_k,
                         bt_max_k=bt_max_k,
+                        cold_threshold_k=cold_cloud_threshold_k,
+                        cold_mask=cold_cloud_mask,
                     )
                     if feature_extractor is not None and control_name in metric_control_evaluator_embeddings:
                         metric_control_evaluator_embeddings[control_name][c] = feature_extractor.encode_bt_k(control_k)
@@ -3874,7 +3908,9 @@ class TCEvaluator:
             cold_manifest = _write_paper_ready_cold_cloud_fraction_npz(
                 cold_artifact_path,
                 class_caches=class_caches,
-                threshold_k=200.0,
+                threshold_k=cold_cloud_threshold_k,
+                radius_km=cold_cloud_radius_km,
+                pixel_size_km=cold_cloud_pixel_size_km,
             )
             if cold_manifest:
                 paper_ready_manifest["cold_cloud_fraction"] = {
@@ -3938,6 +3974,13 @@ class TCEvaluator:
                 "radius_km": dav_radius_km,
                 "pixel_size_km": dav_pixel_size_km,
                 "center_region_size": dav_center_region_size,
+            },
+            "cold_cloud_config": {
+                "threshold_k": cold_cloud_threshold_k,
+                "radius_km": cold_cloud_radius_km,
+                "pixel_size_km": cold_cloud_pixel_size_km,
+                "region": "center_disk",
+                "mask_pixel_count": int(np.sum(cold_cloud_mask)),
             },
             "aggregate_primary_raw": aggregate_primary_raw,
             "aggregate_primary_raw_ci": aggregate_primary_raw_ci,

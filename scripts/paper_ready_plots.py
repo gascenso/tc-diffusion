@@ -188,6 +188,8 @@ class ColdCloudPanel:
     class_id: int
     label: str
     threshold_k: float
+    radius_km: float | None
+    pixel_size_km: float | None
     real_values: np.ndarray
     gen_values: np.ndarray
     real_mean_fraction: float
@@ -1439,6 +1441,8 @@ def _build_cold_cloud_panel(
     threshold_k: float,
     real_values: np.ndarray,
     gen_values: np.ndarray,
+    radius_km: float | None = None,
+    pixel_size_km: float | None = None,
     abs_gap_fraction: float | None = None,
 ) -> ColdCloudPanel:
     real_values = _ensure_1d_array(real_values, field_name=f"per_class.{class_id}.real_cold_fraction_values")
@@ -1449,6 +1453,8 @@ def _build_cold_cloud_panel(
         class_id=class_id,
         label=label,
         threshold_k=float(threshold_k),
+        radius_km=None if radius_km is None else float(radius_km),
+        pixel_size_km=None if pixel_size_km is None else float(pixel_size_km),
         real_values=np.asarray(real_values, dtype=np.float64),
         gen_values=np.asarray(gen_values, dtype=np.float64),
         real_mean_fraction=float(np.mean(real_values)),
@@ -1477,6 +1483,16 @@ def _load_cold_cloud_panels_from_npz_artifact(
             else np.asarray([], dtype=str)
         )
         threshold_arr = _ensure_1d_array(data["cold_threshold_k"], field_name="cold_threshold_k")
+        radius_arr = (
+            _ensure_1d_array(data["cold_radius_km"], field_name="cold_radius_km")
+            if "cold_radius_km" in data.files
+            else None
+        )
+        pixel_size_arr = (
+            _ensure_1d_array(data["cold_pixel_size_km"], field_name="cold_pixel_size_km")
+            if "cold_pixel_size_km" in data.files
+            else None
+        )
         real_mean_rows = _ensure_1d_array(data["real_mean_fraction"], field_name="real_mean_fraction")
         gen_mean_rows = _ensure_1d_array(data["gen_mean_fraction"], field_name="gen_mean_fraction")
         gap_rows = (
@@ -1490,6 +1506,16 @@ def _load_cold_cloud_panels_from_npz_artifact(
         gen_class_offsets = _ensure_offsets_array(data["gen_class_offsets"], field_name="gen_class_offsets")
 
     threshold_k = float(threshold_arr[0])
+    radius_km = (
+        float(radius_arr[0])
+        if radius_arr is not None
+        else (float(manifest["radius_km"]) if manifest.get("radius_km") is not None else None)
+    )
+    pixel_size_km = (
+        float(pixel_size_arr[0])
+        if pixel_size_arr is not None
+        else (float(manifest["pixel_size_km"]) if manifest.get("pixel_size_km") is not None else None)
+    )
     n_classes = class_ids.size
     if class_labels_arr.size not in {0, n_classes}:
         raise ValueError(f"Artifact {artifact_path} has {class_labels_arr.size} labels for {n_classes} classes.")
@@ -1527,6 +1553,8 @@ def _load_cold_cloud_panels_from_npz_artifact(
             threshold_k=threshold_k,
             real_values=real_flat[real_start:real_stop],
             gen_values=gen_flat[gen_start:gen_stop],
+            radius_km=radius_km,
+            pixel_size_km=pixel_size_km,
             abs_gap_fraction=float(gap_rows[idx]) if gap_rows is not None else None,
         )
     return panels
@@ -1851,6 +1879,7 @@ def _validate_cold_cloud_reports(reports: list[LoadedReport]) -> None:
     ref = reports[0]
     class_ids = sorted(ref.panels.keys())
     ref_threshold = float(ref.panels[class_ids[0]].threshold_k)
+    ref_radius = ref.panels[class_ids[0]].radius_km
     for other in reports[1:]:
         if other.split != ref.split:
             raise ValueError(
@@ -1869,6 +1898,14 @@ def _validate_cold_cloud_reports(reports: list[LoadedReport]) -> None:
             raise ValueError(
                 "All plotted reports must use the same cold-cloud threshold. "
                 f"Found {ref_threshold} K and {other_threshold} K."
+            )
+        other_radius = other.panels[class_ids[0]].radius_km
+        if (ref_radius is None) != (other_radius is None):
+            raise ValueError("All plotted reports must either include or omit cold-cloud radius metadata.")
+        if ref_radius is not None and other_radius is not None and not np.isclose(other_radius, ref_radius):
+            raise ValueError(
+                "All plotted reports must use the same cold-cloud radius. "
+                f"Found {ref_radius} km and {other_radius} km."
             )
         for class_id in class_ids:
             ref_panel = ref.panels[class_id]
@@ -3953,6 +3990,7 @@ def _plot_cold_cloud_reports(
 
     y_top = y_max * 1.14 if y_max > 0.0 else 1.0
     threshold_k = float(ref.panels[class_ids[0]].threshold_k)
+    radius_km = ref.panels[class_ids[0]].radius_km
 
     fig, axes = plt.subplots(2, 3, figsize=(14.4, 8.0), sharex=True, sharey=True)
     flat_axes = axes.ravel()
@@ -4046,7 +4084,12 @@ def _plot_cold_cloud_reports(
         handlelength=2.7,
         columnspacing=1.6,
     )
-    fig.supxlabel(f"Cold-cloud fraction [% pixels < {threshold_k:.0f} K]", y=0.055)
+    region_label = (
+        f" within {radius_km:.0f} km"
+        if radius_km is not None and np.isfinite(float(radius_km))
+        else ""
+    )
+    fig.supxlabel(f"Cold-cloud fraction [% pixels < {threshold_k:.0f} K{region_label}]", y=0.055)
     fig.supylabel("Density [1/pp]", x=0.04)
     fig.text(
         0.5,

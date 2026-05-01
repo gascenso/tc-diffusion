@@ -575,12 +575,63 @@ def radial_profile_batch(
     return mean_prof, azstd_prof
 
 
-def cold_cloud_fraction(imgs_k: np.ndarray, threshold_k: float = 200.0) -> np.ndarray:
+def centered_disk_mask(
+    H: int,
+    W: int,
+    *,
+    pixel_size_km: float,
+    radius_km: float,
+) -> np.ndarray:
+    """Boolean mask for pixels inside a storm-centered disk."""
+    H = int(H)
+    W = int(W)
+    pixel_size_km = float(pixel_size_km)
+    radius_km = float(radius_km)
+    if H <= 0 or W <= 0:
+        raise ValueError(f"Image dimensions must be positive, got H={H}, W={W}.")
+    if pixel_size_km <= 0.0:
+        raise ValueError(f"pixel_size_km must be > 0, got {pixel_size_km}.")
+    if radius_km <= 0.0:
+        raise ValueError(f"radius_km must be > 0, got {radius_km}.")
+
+    yy, xx = np.mgrid[0:H, 0:W]
+    cy = (H - 1) / 2.0
+    cx = (W - 1) / 2.0
+    radius_px = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    mask = (radius_px * pixel_size_km) <= radius_km
+    if not np.any(mask):
+        raise ValueError(
+            "Centered disk mask selects no pixels. "
+            f"Got H={H}, W={W}, pixel_size_km={pixel_size_km}, radius_km={radius_km}."
+        )
+    return mask
+
+
+def cold_cloud_fraction(
+    imgs_k: np.ndarray,
+    threshold_k: float = 200.0,
+    *,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
     """
     imgs_k: (N,H,W) in Kelvin
-    returns (N,) fraction of pixels colder than threshold
+    returns (N,) fraction of selected pixels colder than threshold
     """
-    return np.mean(imgs_k < float(threshold_k), axis=(1, 2)).astype(np.float32)
+    arr = np.asarray(imgs_k, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim != 3:
+        raise ValueError(f"cold_cloud_fraction expects shape (N,H,W) or (H,W), got {arr.shape}.")
+    cold = arr < float(threshold_k)
+    if mask is None:
+        return np.mean(cold, axis=(1, 2)).astype(np.float32)
+
+    mask_arr = np.asarray(mask, dtype=bool)
+    if mask_arr.shape != arr.shape[1:]:
+        raise ValueError(f"Cold-cloud mask shape {mask_arr.shape} does not match image shape {arr.shape[1:]}.")
+    if not np.any(mask_arr):
+        raise ValueError("Cold-cloud mask selects no pixels.")
+    return np.mean(cold[:, mask_arr], axis=1).astype(np.float32)
 
 
 def eye_contrast_proxy(mean_profile_k: np.ndarray, inner_frac: float = 0.12, ring_frac: float = 0.20) -> np.ndarray:

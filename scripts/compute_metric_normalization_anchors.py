@@ -36,7 +36,7 @@ from tc_diffusion.evaluation.evaluator import (
     _sample_real_images_for_negative_control,
     _select_real_by_class,
 )
-from tc_diffusion.evaluation.metrics import DAVComputer, PolarBinner
+from tc_diffusion.evaluation.metrics import DAVComputer, PolarBinner, centered_disk_mask
 from tc_diffusion.evaluator.features import EvaluatorEmbeddingExtractor
 from tc_diffusion.sample_bank import (
     SampleBank,
@@ -46,12 +46,12 @@ from tc_diffusion.sample_bank import (
 )
 
 
-ANCHOR_SCHEMA = "tc_diffusion.metric_normalization_ranges.v2"
+ANCHOR_SCHEMA = "tc_diffusion.metric_normalization_ranges.v3"
 RANGE_DIRECTIONS = {
     "pixel_hist_w1": "lower",
     "dav_abs_gap_deg2": "lower",
     "radial_profile_mae_k": "lower",
-    "cold_cloud_fraction_200K_abs_gap": "lower",
+    "cold_cloud_fraction_abs_gap": "lower",
     "psd_l2": "lower",
     "eye_contrast_proxy_abs_gap": "lower",
     "evaluator_fd": "lower",
@@ -307,6 +307,9 @@ def main() -> None:
     bt_max_k = float(data_cfg["bt_max_k"])
     image_size = int(data_cfg.get("image_size", 256))
     num_classes = int(cfg["conditioning"]["num_ss_classes"])
+    cold_cloud_threshold_k = float(ev.get("cold_cloud_threshold_k", 208.0))
+    cold_cloud_radius_km = float(ev.get("cold_cloud_radius_km", ev.get("dav_radius_km", 300.0)))
+    cold_cloud_pixel_size_km = float(ev.get("cold_cloud_pixel_size_km", ev.get("dav_pixel_size_km", 8.0)))
 
     norm_cfg = dict(ev.get("metric_normalization", {}))
     seed = int(args.seed if args.seed is not None else norm_cfg.get("seed", ev.get("seed", 123)))
@@ -405,6 +408,12 @@ def main() -> None:
         radius_km=float(ev.get("dav_radius_km", 300.0)),
         center_region_size=int(ev.get("dav_center_region_size", 3)),
     )
+    cold_cloud_mask = centered_disk_mask(
+        image_size,
+        image_size,
+        pixel_size_km=cold_cloud_pixel_size_km,
+        radius_km=cold_cloud_radius_km,
+    )
 
     class_caches = {}
     metric_control_caches: Dict[str, Dict[int, Any]] = {name: {} for name in controls}
@@ -441,6 +450,8 @@ def main() -> None:
             psd_bins=int(ev["psd_bins"]),
             bt_min_k=bt_min_k,
             bt_max_k=bt_max_k,
+            cold_threshold_k=cold_cloud_threshold_k,
+            cold_mask=cold_cloud_mask,
         )
         class_caches[class_id] = cache
 
@@ -467,6 +478,8 @@ def main() -> None:
                 psd_bins=int(ev["psd_bins"]),
                 bt_min_k=bt_min_k,
                 bt_max_k=bt_max_k,
+                cold_threshold_k=cold_cloud_threshold_k,
+                cold_mask=cold_cloud_mask,
             )
             if feature_extractor is not None:
                 metric_control_embeddings[control_name][class_id] = feature_extractor.encode_bt_k(control_k)
@@ -655,6 +668,13 @@ def main() -> None:
             str(c): int(generated_counts_by_class[c]) for c in sorted(generated_counts_by_class)
         },
         "generated_source": generated_source,
+        "cold_cloud_config": {
+            "threshold_k": float(cold_cloud_threshold_k),
+            "radius_km": float(cold_cloud_radius_km),
+            "pixel_size_km": float(cold_cloud_pixel_size_km),
+            "region": "center_disk",
+            "mask_pixel_count": int(np.sum(cold_cloud_mask)),
+        },
         "evaluator_feature_metric": {
             "included": feature_extractor is not None,
             "run_name": str(evaluator_fd_cfg.get("run_name", "evaluator_cat4plus_mild_rebalanced_s035")),
