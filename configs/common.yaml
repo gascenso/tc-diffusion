@@ -85,22 +85,38 @@ sampling_guidance:
   target_split: "train"
   cache_path: null
   build_batch_size: 16
-  neighbor_k: 64
-  guide_start_step_frac: 0.65
-  step_size: 0.01
-  band_width_sigma: 1.0
-  radial_weight: 1.0
-  dav_weight: 1.0
-  hist_weight: 1.0
+  neighbor_k: 96
+  target_mode: "random_neighbor"  # "neighbor_mean" | "nearest" | "random_neighbor"
+  guide_start_step_frac: 0.35
+  guide_stop_step_frac: 1.0
+  schedule: "cosine"
+  step_size: 0.015
+  inner_steps: 1
+  band_width_sigma: 0.5
+  target_pull_weight: 0.35
+  radial_weight: 0.7
+  dav_weight: 0.15
+  hist_weight: 0.35
+  cold_weight: 0.4
+  eye_weight: 0.2
+  psd_weight: 0.35
   radial_bins: 64
   dav_radius_km: 300.0
   pixel_size_km: 8.0
   dav_center_region_size: 3
   hist_bins: 32
   hist_softness_k: 2.5
+  cold_threshold_k: 200.0
+  cold_softness_k: 2.5
+  eye_inner_frac: 0.12
+  eye_ring_frac: 0.20
+  psd_bins: 96
   sigma_floor_radial_k: 2.0
-  sigma_floor_dav_deg2: 100.0
-  sigma_floor_hist_cdf: 0.02
+  sigma_floor_dav_deg2: 75.0
+  sigma_floor_hist_cdf: 0.01
+  sigma_floor_cold_fraction: 0.002
+  sigma_floor_eye_k: 1.0
+  sigma_floor_psd_log10: 0.10
 
 training:
   seed: 42              # authoritative seed for data order, RNG streams, and resumable training
@@ -157,6 +173,9 @@ evaluation:
   dav_radius_km: 300.0
   dav_pixel_size_km: 8.0
   dav_center_region_size: 3
+  cold_cloud_threshold_k: 208.0
+  cold_cloud_radius_km: 300.0
+  cold_cloud_pixel_size_km: 8.0
   bootstrap_reps: 500
   bootstrap_reps_full_test: 0  # full-test eval uses all real test samples/class; disable expensive CI bootstrap by default
   bootstrap_ci_level: 0.95
